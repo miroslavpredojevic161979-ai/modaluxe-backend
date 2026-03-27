@@ -12,6 +12,7 @@
   "type": "commonjs",
   "dependencies": {
     "bcrypt": "^6.0.0",
+    "cloudinary": "^1.41.3",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
@@ -19,6 +20,7 @@
     "jsonwebtoken": "^9.0.3",
     "mailparser": "^3.9.3",
     "multer": "^2.0.2",
+    "multer-storage-cloudinary": "^4.0.0",
     "node-cron": "^4.2.1",
     "nodemailer": "^8.0.1",
     "pdfkit": "^0.17.2",

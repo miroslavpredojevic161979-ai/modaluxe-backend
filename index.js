@@ -60,13 +60,21 @@ pool.query(`
   );
 `).catch((err) => console.log("Greška kod tablice categories:", err.message));
 
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, 'uploads/');
-  },
-  filename: function (req, file, cb) {
-    cb(null, Date.now() + path.extname(file.originalname));
-  },
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+const storage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'modaluxe_slike',
+    resource_type: 'auto'
+  }
 });
 
 const fileFilter = (req, file, cb) => {
@@ -838,13 +846,9 @@ app.use('/uploads', (req, res, next) => {
 
 app.post('/upload', authGuard, upload.single('image'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Nema fajla za upload' });
-  const filename = req.file.filename;
-  if (filename.toLowerCase().endsWith('.pdf')) {
-    const token = crypto.createHmac('sha256', INVOICE_SECRET).update(filename).digest('hex');
-    res.json({ imageUrl: `${req.protocol}://${req.get('host')}/racun/${filename}?token=${token}` });
-  } else {
-    res.json({ imageUrl: `${req.protocol}://${req.get('host')}/uploads/${filename}` });
-  }
+  
+  // Cloudinary nam odmah daje gotov, siguran link za sliku!
+  res.json({ imageUrl: req.file.path });
 });
 
 app.post('/create-checkout-session', async (req, res) => {

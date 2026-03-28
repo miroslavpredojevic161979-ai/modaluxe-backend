@@ -478,47 +478,149 @@ const generateStornoPDFInvoice = (orderData, originalInvoiceNumber, stornoInvoic
     
     const d = new Date();
     const dateStr = d.toLocaleDateString('hr-HR');
+    const timeStr = d.toLocaleTimeString('hr-HR');
+    
     const items = parseJsonSafe(orderData.items, []);
     const disc = parseJsonSafe(orderData.discount, { amount: 0 });
     
-    // Računanje povrata bez dostave
+    // Izračun: Samo artikli (bez dostave)
     let itemsTotal = 0;
-    items.forEach(item => {
-      itemsTotal += (Number(item.price) || 0) * (item.qty || item.quantity || 1);
+    items.forEach(item => { 
+        itemsTotal += Number(item.price) * (item.qty || item.quantity || 1); 
     });
-    const finalRefund = itemsTotal - (Number(disc.amount) || 0);
+    const finalRefund = itemsTotal - Number(disc.amount);
+    
+    // NASLOV
+    doc.fontSize(16).font('Helvetica-Bold').fillColor('#000000').text('KISFALUBA', { align: 'center' });
+    doc.moveDown(2);
+    doc.fontSize(10).font('Helvetica');
+    doc.text(fixText(`Postovani/a ${orderData.name},`));
+    doc.moveDown(0.5);
+    doc.text(fixText(`Obavjestavamo Vas da je Vas racun br. ${originalInvoiceNumber} storniran (povrat robe/sredstava).`));
+    doc.moveDown(1.5);
+    doc.font('Helvetica-Bold').fontSize(11).text(fixText('Detalji stornirane narudzbe'));
+    doc.moveDown(0.5);
+    
+    // PRVA TABLICA
+    let startY = doc.y;
+    const drawTable1Row = (y, col1, col2, col3, isHeader = false) => {
+      const rowHeight = 25;
+      doc.rect(40, y, 510, rowHeight).fillAndStroke(isHeader ? '#fafafa' : '#ffffff', '#dddddd');
+      doc.moveTo(350, y).lineTo(350, y + rowHeight).stroke('#dddddd');
+      doc.moveTo(430, y).lineTo(430, y + rowHeight).stroke('#dddddd');
+      doc.fillColor('#000000').font(isHeader ? 'Helvetica-Bold' : 'Helvetica').fontSize(9);
+      doc.text(col1, 50, y + 8, { width: 290 });
+      doc.text(col2, 350, y + 8, { width: 80, align: 'center' });
+      doc.text(col3, 430, y + 8, { width: 110, align: 'right', lineBreak: false }); 
+      return y + rowHeight;
+    };
 
-    doc.fontSize(16).font('Helvetica-Bold').fillColor('#e53e3e').text('KISFALUBA - STORNO RACUN', { align: 'center' });
+    startY = drawTable1Row(startY, 'Artikl', fixText('Kolicina'), 'Cijena (EUR)', true);
+    
+    items.forEach((item) => {
+      const name = fixText(`${item.brand ? item.brand + ' ' : ''}${item.name} (${(item.variantKey && item.variantKey.split('|')[0]) || 'Std'})`);
+      const qty = item.qty || item.quantity || 1;
+      const price = Number(item.price).toFixed(2);
+      startY = drawTable1Row(startY, name, `-${qty}`, `-${price} EUR`, false);
+    });
+
+    doc.y = startY + 10;
+    if (disc && disc.amount > 0) {
+        doc.font('Helvetica-Bold').fontSize(9).fillColor('#e53e3e').text(`Storniran popust: +${Number(disc.amount).toFixed(2)} EUR`, 300, doc.y, { width: 250, align: 'right' });
+        doc.y += 5;
+    }
+    doc.font('Helvetica-Bold').fontSize(10).fillColor('#e53e3e').text(`UKUPNI STORNO: -${finalRefund.toFixed(2)} EUR`, 300, doc.y, { width: 250, align: 'right' });
+    doc.font('Helvetica').fontSize(8).fillColor('#666666').text(fixText('Napomena: Usluga dostave se ne stornira.'), 300, doc.y, { width: 250, align: 'right' });
+    doc.fillColor('#000000');
     doc.moveDown(2);
     
-    doc.fontSize(10).font('Helvetica-Bold').fillColor('#000000').text('PRODAVATELJ: KISFALUBA j.d.o.o.');
-    doc.font('Helvetica').text('OIB: 82125639708');
-    doc.moveDown();
-    doc.font('Helvetica-Bold').text('KUPAC: ' + fixText(orderData.name));
+    // PODACI O KUPCU
+    doc.font('Helvetica-Bold').fontSize(11).text(fixText('Podaci kupca'), 40, doc.y);
+    doc.moveTo(40, doc.y + 2).lineTo(550, doc.y + 2).strokeColor('#dddddd').stroke();
+    doc.moveDown(0.5);
+    doc.font('Helvetica').fontSize(9);
+    doc.text(fixText(orderData.name || ''));
+    doc.text(fixText(orderData.address || ''));
+    doc.text(`Telefon: ${fixText(orderData.phone || '')}`);
+    doc.text(`E-mail: ${fixText(orderData.email || '')}`);
+    doc.moveDown(3);
+    
+    // GLAVNI STORNO RAČUN
+    doc.font('Helvetica-Bold').fontSize(14).fillColor('#e53e3e').text(fixText('STORNO RACUN'), { align: 'center' });
+    doc.fillColor('#000000');
+    doc.moveDown(1.5);
+    
+    let currentY = doc.y;
+    doc.font('Helvetica-Bold').fontSize(9).text('KISFALUBA j.d.o.o.', 40, currentY);
+    doc.font('Helvetica').text('Zagorska ulica 40, 31300 Branjina, Republika Hrvatska');
+    doc.text('OIB: 82125639708 | MBS: 5990572');
+    doc.text('Trgovacki sud u Osijeku');
+    doc.text('Temeljni kapital: 10,00 EUR, uplacen u cijelosti');
+    doc.moveDown(1.5);
+    
+    currentY = doc.y;
+    doc.font('Helvetica-Bold').text(fixText('Broj storno racuna:'), 40, currentY);
+    doc.font('Helvetica').text(stornoInvoiceNumber, 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Vezano za racun br:', 40, currentY);
+    doc.font('Helvetica').text(originalInvoiceNumber, 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Datum storna:', 40, currentY);
+    doc.font('Helvetica').text(dateStr, 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Vrijeme storna:', 40, currentY);
+    doc.font('Helvetica').text(timeStr, 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Mjesto izdavanja:', 40, currentY);
+    doc.font('Helvetica').text('Branjina, Republika Hrvatska', 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Kupac:', 40, currentY);
+    doc.font('Helvetica').text(fixText(orderData.name), 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Adresa kupca:', 40, currentY);
+    doc.font('Helvetica').text(fixText(orderData.address), 150, currentY);
     doc.moveDown(2);
+    
+    // DRUGA TABLICA
+    let t2Y = doc.y;
+    const drawTable2Row = (y, col1, col2, col3, col4, col5, isHeader = false) => {
+      const h = 25;
+      doc.rect(40, y, 510, h).fillAndStroke(isHeader ? '#fafafa' : '#ffffff', '#dddddd');
+      doc.moveTo(100, y).lineTo(100, y + h).stroke('#dddddd');
+      doc.moveTo(310, y).lineTo(310, y + h).stroke('#dddddd');
+      doc.moveTo(370, y).lineTo(370, y + h).stroke('#dddddd');
+      doc.moveTo(460, y).lineTo(460, y + h).stroke('#dddddd');
+      
+      doc.fillColor('#000000').font(isHeader ? 'Helvetica-Bold' : 'Helvetica').fontSize(9);
+      doc.text(col1, 40, y + 8, { width: 60, align: 'center' });
+      doc.text(col2, 110, y + 8, { width: 190 });
+      doc.text(col3, 310, y + 8, { width: 60, align: 'center' });
+      doc.text(col4, 370, y + 8, { width: 80, align: 'right' }); 
+      doc.text(col5, 460, y + 8, { width: 80, align: 'right' }); 
+      return y + h;
+    };
 
-    doc.text(`Storno za racun br: ${originalInvoiceNumber}`);
-    doc.text(`Datum: ${dateStr}`);
-    doc.moveDown();
-
-    let y = doc.y;
-    doc.rect(40, y, 510, 20).fill('#f0f0f0').stroke('#dddddd');
-    doc.fillColor('#000000').text('Artikl', 45, y + 5);
-    doc.text('Iznos (EUR)', 450, y + 5, { align: 'right', width: 90 });
-    y += 20;
-
-    items.forEach(item => {
-      doc.rect(40, y, 510, 20).stroke('#dddddd');
-      doc.text(fixText(item.name), 45, y + 5);
-      doc.text(`-${(Number(item.price) * (item.qty || 1)).toFixed(2)}`, 450, y + 5, { align: 'right', width: 90 });
-      y += 20;
+    t2Y = drawTable2Row(t2Y, 'Redni broj', 'Opis proizvoda', fixText('Kolicina'), 'Jedinicna cijena (EUR)', 'Ukupno (EUR)', true);
+    
+    items.forEach((item, index) => {
+      const name = fixText(`${item.brand ? item.brand + ' ' : ''}${item.name} (${(item.variantKey && item.variantKey.split('|')[0]) || 'Std'})`);
+      const qty = item.qty || item.quantity || 1;
+      const price = Number(item.price);
+      const total = price * qty;
+      t2Y = drawTable2Row(t2Y, (index + 1).toString(), name, `-${qty}`, `-${price.toFixed(2)}`, `-${total.toFixed(2)}`, false);
     });
 
-    doc.y = y + 20;
-    doc.fontSize(12).fillColor('#e53e3e').text(`UKUPNO ZA POVRAT: -${finalRefund.toFixed(2)} EUR`, { align: 'right' });
-    doc.fontSize(8).fillColor('#666666').text('Napomena: Usluga dostave se ne stornira.', { align: 'center' });
-
+    // UKUPNO NA DNU
+    doc.y = t2Y + 10;
+    doc.font('Helvetica-Bold').fontSize(10).fillColor('#e53e3e').text(`Ukupan iznos storna: -${finalRefund.toFixed(2)} EUR`, 300, doc.y, { width: 250, align: 'right' });
+    doc.moveDown(3);
+    
+    // ZAKONSKE NAPOMENE (PDV i pečat)
+    doc.font('Helvetica').fontSize(8).fillColor('#666666');
+    doc.text(fixText('Drustvo nije u sustavu poreza na dodanu vrijednost (PDV).'), { align: 'center' });
+    doc.text(fixText('Ovaj storno racun izdan je u elektronickom obliku i vrijedi bez potpisa i pecata.'), { align: 'center' });
     doc.end();
+    
     stream.on('finish', () => resolve(filePath));
     stream.on('error', reject);
   });

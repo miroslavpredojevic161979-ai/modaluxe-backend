@@ -731,7 +731,6 @@ const generateUraStornoPDF = (inv, filePath) => {
   });
 };
 
-app.use(cors());
 
 // STRIPE WEBHOOK
 app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {

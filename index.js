@@ -15,54 +15,15 @@ const nodemailer = require('nodemailer');
 const imaps = require('imap-simple');
 const simpleParser = require('mailparser').simpleParser;
 const cron = require('node-cron');
-const app = express();
-app.use(cors());
-const PORT = process.env.PORT || 10000;
-
-if (!fs.existsSync('./uploads')) {
-  fs.mkdirSync('./uploads');
-}
-
-// Automatsko dodavanje kolona u bazu
-pool.query("ALTER TABLE inbound_invoices ADD COLUMN status VARCHAR(20) DEFAULT 'DOLAZNI'")
-  .catch(() => console.log("Kolona 'status' već postoji u inbound_invoices."));
-
-pool.query("ALTER TABLE inbound_invoices ADD COLUMN archived BOOLEAN DEFAULT false")
-  .catch(() => console.log("Kolona 'archived' već postoji u inbound_invoices."));
-
-pool.query("ALTER TABLE orders ADD COLUMN archived BOOLEAN DEFAULT false")
-  .catch(() => console.log("Kolona 'archived' već postoji u orders."));
-
-pool.query("ALTER TABLE orders ADD COLUMN storno_url VARCHAR(255)")
-  .catch(() => console.log("Kolona 'storno_url' već postoji u orders."));
-
-pool.query("ALTER TABLE shop_settings ADD COLUMN coupons JSONB DEFAULT '[]'::jsonb")
-  .catch(() => console.log("Kolona 'coupons' već postoji u shop_settings."));
-
-pool.query("ALTER TABLE orders ADD COLUMN discount JSONB DEFAULT '{\"amount\": 0}'::jsonb")
-  .then(() => console.log("Dodana kolona 'discount' u orders"))
-  .catch(() => console.log("Kolona 'discount' već postoji u orders."));
-
-  pool.query("ALTER TABLE products ADD COLUMN fit_info TEXT")
-  .then(() => console.log("Dodana kolona 'fit_info' u products"))
-  .catch(() => console.log("Kolona 'fit_info' već postoji u products."));
-
-pool.query("ALTER TABLE products ADD COLUMN material_info TEXT")
-  .then(() => console.log("Dodana kolona 'material_info' u products"))
-  .catch(() => console.log("Kolona 'material_info' već postoji u products."));
-
-pool.query("ALTER TABLE products ADD COLUMN manufacturer_info TEXT")
-  .then(() => console.log("Dodana kolona 'manufacturer_info' u products"))
-  .catch(() => console.log("Kolona 'manufacturer_info' već postoji u products."));
-pool.query(`
-  CREATE TABLE IF NOT EXISTS categories (
-    id VARCHAR(255) PRIMARY KEY,
-    name VARCHAR(255) NOT NULL
-  );
-`).catch((err) => console.log("Greška kod tablice categories:", err.message));
-
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
+
+const app = express();
+app.use(cors());
+
+// --- KONFIGURACIJA ---
+const PORT = process.env.PORT || 10000;
+const INVOICE_SECRET = process.env.INVOICE_SECRET;
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -70,6 +31,70 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
+if (!fs.existsSync(path.join(__dirname, 'uploads'))) {
+  fs.mkdirSync(path.join(__dirname, 'uploads'));
+}
+
+// --- BAZA PODATAKA (MIGRACIJE) ---
+const initDB = async () => {
+  try {
+    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'DOLAZNI'");
+    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
+    await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
+    await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
+    await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount JSONB DEFAULT '{\"amount\": 0}'::jsonb");
+    await pool.query("ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS coupons JSONB DEFAULT '[]'::jsonb");
+    await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS fit_info TEXT");
+    await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS material_info TEXT");
+    await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS manufacturer_info TEXT");
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS categories (
+        id VARCHAR(255) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL
+      );
+    `);
+    console.log("Baza podataka (kolone i tablice) uspješno sinkronizirana.");
+  } catch (err) {
+    console.error("Greška pri sinkronizaciji baze:", err.message);
+  }
+};
+initDB();
+
+// --- HELPER FUNKCIJE ---
+const parseJsonSafe = (data, fallback) => {
+  if (typeof data === 'string') {
+    try { return JSON.parse(data); } catch (e) { return fallback; }
+  }
+  return data || fallback;
+};
+
+const escapeHtml = (v) => {
+  if (v === null || v === undefined) return '';
+  return String(v).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;');
+};
+
+const toNumberSafe = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+
+const fixText = (text) => {
+  if (!text) return '';
+  return text.toString()
+    .replace(/č/g, 'c').replace(/Č/g, 'C')
+    .replace(/ć/g, 'c').replace(/Ć/g, 'C')
+    .replace(/đ/g, 'd').replace(/Đ/g, 'D')
+    .replace(/š/g, 's').replace(/Š/g, 'S')
+    .replace(/ž/g, 'z').replace(/Ž/g, 'Z');
+};
+
+const invoiceNumberFromOrderId = (orderId) => `${orderId}/${new Date().getFullYear()}/KF`;
+
+const calcTotals = (items) => {
+  const sum = parseJsonSafe(items, []).reduce((acc, it) => {
+    return acc + toNumberSafe(it.price) * toNumberSafe(it.qty || it.quantity || 1);
+  }, 0);
+  return Number(sum.toFixed(2));
+};
+
+// --- UPLOAD (MULTER + CLOUDINARY) ---
 const storage = new CloudinaryStorage({
   cloudinary: cloudinary,
   params: {
@@ -86,7 +111,6 @@ const fileFilter = (req, file, cb) => {
   ) {
     cb(null, true);
   } else {
-    console.log("Odbijen format:", file.mimetype);
     cb(new Error('Nedopušten format datoteke! Dobio sam: ' + file.mimetype), false);
   }
 };
@@ -97,6 +121,7 @@ const upload = multer({
   fileFilter: fileFilter
 });
 
+// --- MAIL TRANSPORTER ---
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST,
   port: process.env.EMAIL_PORT,
@@ -108,27 +133,7 @@ const transporter = nodemailer.createTransport({
   tls: { rejectUnauthorized: false }
 });
 
-const parseJsonSafe = (data, fallback) => {
-  if (typeof data === 'string') {
-    try { return JSON.parse(data); } catch (e) { return fallback; }
-  }
-  return data || fallback;
-};
-
-const escapeHtml = (v) => {
-  if (v === null || v === undefined) return '';
-  return String(v).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;');
-};
-
-const normalizeItems = (items) => parseJsonSafe(items, []);
-const toNumberSafe = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
-const calcTotals = (items) => {
-  const sum = normalizeItems(items).reduce((acc, it) => {
-    return acc + toNumberSafe(it.price) * toNumberSafe(it.qty || it.quantity || 1);
-  }, 0);
-  return Number(sum.toFixed(2));
-};
-
+// --- SKIDANJE ZALIHE ---
 const deductStock = async (items) => {
   try {
     for (const item of items) {
@@ -158,8 +163,7 @@ const deductStock = async (items) => {
   }
 };
 
-const invoiceNumberFromOrderId = (orderId) => `${orderId}/${new Date().getFullYear()}/KF`;
-
+// --- AUTOMATSKO ČITANJE MAILOVA (URA) ---
 async function fetchInboundInvoicesFromEmail() {
   const config = {
     imap: {
@@ -174,7 +178,7 @@ async function fetchInboundInvoicesFromEmail() {
   };
 
   try {
-    console.log('Provjeravam nove račune...');
+    console.log('Provjeravam nove račune dobavljača...');
     const connection = await imaps.connect(config);
     await connection.openBox('INBOX');
 
@@ -191,11 +195,10 @@ async function fetchInboundInvoicesFromEmail() {
 
         const senderAddress = mail.from && mail.from.value[0] ? mail.from.value[0].address : 'Nepoznato';
         const supplierName = (mail.from && mail.from.value[0].name) ? mail.from.value[0].name : senderAddress;
-        // NOVI FILTER: Ignoriraj mailove koje šalje sama trgovina
-        if (senderAddress.toLowerCase() === process.env.EMAIL_USER.toLowerCase()) {
-            console.log("Ignoriram vlastiti mail (potvrda narudžbe za kupca).");
-            continue; 
-        }
+        
+        // Ignoriraj mailove koje šalje sama trgovina
+        if (senderAddress.toLowerCase() === process.env.EMAIL_USER.toLowerCase()) continue; 
+
         const dateStr = new Date().toLocaleDateString('hr-HR');
         const subject = mail.subject || 'Automatski uvoz iz maila';
         const baseUrl = process.env.BACKEND_URL || 'http://localhost:10000';
@@ -218,34 +221,25 @@ async function fetchInboundInvoicesFromEmail() {
         }
         if (isNaN(extractedAmount)) extractedAmount = 0;
 
-// 1. IZDVAJAMO SAMO PDF DATOTEKE
         const pdfAttachments = (mail.attachments || []).filter(attr => 
           attr.contentType === 'application/pdf' || attr.filename?.toLowerCase().endsWith('.pdf')
         );
 
-        // 2. LOGIKA PRIORITETA: Ako ima PDF-a, čitaj samo njega. Ako nema, uzmi HTML.
         if (pdfAttachments.length > 0) {
-          console.log(`--> Pronađeno ${pdfAttachments.length} PDF računa. HTML preskačem.`);
-          
           for (let i = 0; i < pdfAttachments.length; i++) {
             const attachment = pdfAttachments[i];
             const safeFilename = attachment.filename ? attachment.filename.replace(/\s+/g, '_') : `racun_${i}.pdf`;
             const fileName = `ura_mail_${Date.now()}_${safeFilename}`;
             
-            // Spremanje PDF-a na disk [cite: 190]
             fs.writeFileSync(path.join(__dirname, 'uploads', fileName), attachment.content);
             const fileUrl = `${baseUrl}/uploads/${fileName}`;
 
-            // Upis u bazu s oznakom PDF [cite: 192-195]
             await pool.query(
               "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
               [supplierName, 'Iz maila (PDF)', extractedAmount, fileUrl, subject, dateStr, 'DOLAZNI']
             );
           }
-        } 
-        else {
-          // Rezervna opcija: Ako nema niti jednog PDF-a, spremi HTML tijelo maila [cite: 202-208]
-          console.log("--> Nema PDF-a u mailu, spremam HTML poruku kao račun.");
+        } else {
           const fileName = `ura_mail_${Date.now()}_poruka.html`;
           const htmlContent = mail.html || `<div style="padding: 20px; font-family:sans-serif;"><p>${mail.text}</p></div>`;
           
@@ -257,7 +251,7 @@ async function fetchInboundInvoicesFromEmail() {
             [supplierName, 'Iz maila (HTML)', extractedAmount, fileUrl, subject, dateStr, 'DOLAZNI']
           );
         }
-        } catch (singleMailErr) {
+      } catch (singleMailErr) {
         console.error('Greška pri obradi JEDNOG maila:', singleMailErr.message);
       }
     }
@@ -269,15 +263,11 @@ async function fetchInboundInvoicesFromEmail() {
 
 cron.schedule('*/15 * * * *', () => { fetchInboundInvoicesFromEmail(); });
 
-app.post('/inbound-invoices/fetch-email', (req, res) => {
-  res.json({ success: true, message: 'Provjera pošte je pokrenuta.' });
-  fetchInboundInvoicesFromEmail().catch(err => console.error(err));
-});
 
-// ✅ EMAIL HTML RAČUN 
+// --- GENERIRANJE HTML MAILA ZA KUPCE ---
 const buildInvoiceEmailHtml = ({ orderId, customerName, customerAddress, customerPhone, customerEmail, paymentMethod, items, totalAmount, dateObj, discount }) => {
   const invoiceNumber = invoiceNumberFromOrderId(orderId);
-  const normalizedItems = normalizeItems(items);
+  const normalizedItems = parseJsonSafe(items, []);
   const d = dateObj ? new Date(dateObj) : new Date();
   const dateStr = d.toLocaleDateString('hr-HR');
   const timeStr = d.toLocaleTimeString('hr-HR');
@@ -309,22 +299,13 @@ const buildInvoiceEmailHtml = ({ orderId, customerName, customerAddress, custome
   return `<div style="font-family: Arial, sans-serif; max-width: 750px; margin: auto; padding: 20px; color: #333; line-height: 1.5; border: 1px solid #eee; border-radius: 5px;"><h2 style="text-align: center; color: #000; margin-bottom: 20px; font-size: 22px;">KISFALUBA</h2><p style="font-size: 13px;">Poštovani/a <b>${escapeHtml(customerName)}</b>,</p><p style="font-size: 13px;">Hvala Vam na kupnji! Vaša narudžba je uspješno zaprimljena i u pripremi je za slanje.</p><h3 style="border-bottom: 2px solid #000; padding-bottom: 5px; margin-top: 30px; font-size: 15px;">Detalji narudžbe</h3><table style="width: 100%; border-collapse: collapse; margin-bottom: 10px; font-size: 13px;"><thead><tr style="background-color: #fafafa;"><th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Artikl</th><th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Količina</th><th style="padding: 10px; border: 1px solid #ddd; text-align: right;">Cijena (EUR)</th></tr></thead><tbody>${table1Rows}</tbody></table>${discountHtml}<div style="text-align: right; margin-top: 15px;"><span style="font-size: 15px;">UKUPNO ZA PLATITI: <b>${Number(totalAmount).toFixed(2)} EUR</b></span><br><span style="font-size: 11px; color: #666;">Društvo nije u sustavu PDV-a. PDV nije obračunan.</span></div><h3 style="border-bottom: 2px solid #000; padding-bottom: 5px; margin-top: 30px; font-size: 15px;">Podaci za dostavu</h3><p style="font-size: 13px; margin: 0; line-height: 1.6;">${escapeHtml(customerName)}<br>${escapeHtml(customerAddress)}<br>Telefon: ${escapeHtml(customerPhone)}<br>E-mail: ${escapeHtml(customerEmail)}</p><h3 style="text-align: center; margin-top: 50px; margin-bottom: 20px; font-size: 16px;">RAČUN</h3><p style="font-size: 13px; margin: 0 0 25px 0; line-height: 1.6;"><b>KIŠFALUBA j.d.o.o.</b><br>Zagorska ulica 40, 31300 Branjina, Republika Hrvatska<br>OIB: 82125639708 | MBS: 5990572<br>Trgovački sud u Osijeku<br>Temeljni kapital: 10,00 EUR, uplaćen u cijelosti</p><table style="font-size: 13px; margin-bottom: 25px; width: 100%; border: none; line-height: 1.8;"><tr><td style="width: 140px; font-weight: bold;">Broj računa:</td><td>${invoiceNumber}</td></tr><tr><td style="font-weight: bold;">Datum izdavanja:</td><td>${dateStr}</td></tr><tr><td style="font-weight: bold;">Vrijeme izdavanja:</td><td>${timeStr}</td></tr><tr><td style="font-weight: bold;">Mjesto izdavanja:</td><td>Branjina, Republika Hrvatska</td></tr><tr><td style="font-weight: bold;">Kupac:</td><td>${escapeHtml(customerName)}</td></tr><tr><td style="font-weight: bold;">Adresa kupca:</td><td>${escapeHtml(customerAddress)}</td></tr><tr><td style="font-weight: bold;">Način plaćanja:</td><td>${paymentMethod}</td></tr></table><table style="width: 100%; border-collapse: collapse; margin-bottom: 10px; font-size: 13px;"><thead><tr style="background-color: #fafafa;"><th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Redni broj</th><th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Opis proizvoda</th><th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Količina</th><th style="padding: 10px; border: 1px solid #ddd; text-align: right;">Jedinična cijena (EUR)</th><th style="padding: 10px; border: 1px solid #ddd; text-align: right;">Ukupno (EUR)</th></tr></thead><tbody>${table2Rows}</tbody></table>${discountHtml}<div style="text-align: right; margin-top: 20px; margin-bottom: 40px;"><span style="font-size: 15px;">Ukupan iznos za plaćanje: <b>${Number(totalAmount).toFixed(2)} EUR</b></span></div><div style="text-align: center; font-size: 11px; color: #555; border-top: 1px dotted #ccc; padding-top: 20px; line-height: 1.6;"><p style="margin: 2px 0;">Društvo nije u sustavu poreza na dodanu vrijednost (PDV).</p><p style="margin: 2px 0;">Sukladno važećim poreznim propisima, PDV nije obračunan.</p><br><p style="margin: 2px 0;">Ovaj račun izdan je u elektroničkom obliku i vrijedi bez potpisa i pečata.</p><p style="margin: 2px 0;">Za sva pitanja ili reklamacije obratite se na naš kontakt e-mail: info@kisfaluba.hr</p></div></div>`;
 };
 
-// ✅ PDF RAČUN
+// --- PDF GENERATORI (Sa ispravnim crtanjem linija) ---
+
 const generatePDFInvoice = (orderData, invoiceNumber, filePath) => {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 40, size: 'A4' });
     const stream = fs.createWriteStream(filePath);
     doc.pipe(stream);
-    
-    const fixText = (text) => {
-      if (!text) return '';
-      return text.toString()
-        .replace(/č/g, 'c').replace(/Č/g, 'C')
-        .replace(/ć/g, 'c').replace(/Ć/g, 'C')
-        .replace(/đ/g, 'd').replace(/Đ/g, 'D')
-        .replace(/š/g, 's').replace(/Š/g, 'S')
-        .replace(/ž/g, 'z').replace(/Ž/g, 'Z');
-    };
     
     const d = orderData.created_at ? new Date(orderData.created_at) : new Date();
     const dateStr = d.toLocaleDateString('hr-HR');
@@ -485,16 +466,6 @@ const generateStornoPDFInvoice = (orderData, originalInvoiceNumber, stornoInvoic
     const stream = fs.createWriteStream(filePath);
     doc.pipe(stream);
     
-    const fixText = (text) => {
-      if (!text) return '';
-      return text.toString()
-        .replace(/č/g, 'c').replace(/Č/g, 'C')
-        .replace(/ć/g, 'c').replace(/Ć/g, 'C')
-        .replace(/đ/g, 'd').replace(/Đ/g, 'D')
-        .replace(/š/g, 's').replace(/Š/g, 'S')
-        .replace(/ž/g, 'z').replace(/Ž/g, 'Z');
-    };
-    
     const d = new Date();
     const dateStr = d.toLocaleDateString('hr-HR');
     const timeStr = d.toLocaleTimeString('hr-HR');
@@ -509,7 +480,6 @@ const generateStornoPDFInvoice = (orderData, originalInvoiceNumber, stornoInvoic
     });
     const finalRefund = itemsTotal - Number(disc.amount);
     
-    // NASLOV
     doc.fontSize(16).font('Helvetica-Bold').fillColor('#000000').text('KISFALUBA', { align: 'center' });
     doc.moveDown(2);
     doc.fontSize(10).font('Helvetica');
@@ -520,7 +490,6 @@ const generateStornoPDFInvoice = (orderData, originalInvoiceNumber, stornoInvoic
     doc.font('Helvetica-Bold').fontSize(11).text(fixText('Detalji stornirane narudzbe'));
     doc.moveDown(0.5);
     
-    // PRVA TABLICA
     let startY = doc.y;
     const drawTable1Row = (y, col1, col2, col3, isHeader = false) => {
       const rowHeight = 25;
@@ -553,7 +522,6 @@ const generateStornoPDFInvoice = (orderData, originalInvoiceNumber, stornoInvoic
     doc.fillColor('#000000');
     doc.moveDown(2);
     
-    // PODACI O KUPCU
     doc.font('Helvetica-Bold').fontSize(11).text(fixText('Podaci kupca'), 40, doc.y);
     doc.moveTo(40, doc.y + 2).lineTo(550, doc.y + 2).strokeColor('#dddddd').stroke();
     doc.moveDown(0.5);
@@ -564,7 +532,6 @@ const generateStornoPDFInvoice = (orderData, originalInvoiceNumber, stornoInvoic
     doc.text(`E-mail: ${fixText(orderData.email || '')}`);
     doc.moveDown(3);
     
-    // GLAVNI STORNO RAČUN
     doc.font('Helvetica-Bold').fontSize(14).fillColor('#e53e3e').text(fixText('STORNO RACUN'), { align: 'center' });
     doc.fillColor('#000000');
     doc.moveDown(1.5);
@@ -600,7 +567,6 @@ const generateStornoPDFInvoice = (orderData, originalInvoiceNumber, stornoInvoic
     doc.font('Helvetica').text(fixText(orderData.address), 150, currentY);
     doc.moveDown(2);
     
-    // DRUGA TABLICA
     let t2Y = doc.y;
     const drawTable2Row = (y, col1, col2, col3, col4, col5, isHeader = false) => {
       const h = 25;
@@ -629,12 +595,10 @@ const generateStornoPDFInvoice = (orderData, originalInvoiceNumber, stornoInvoic
       t2Y = drawTable2Row(t2Y, (index + 1).toString(), name, `-${qty}`, `-${price.toFixed(2)}`, `-${total.toFixed(2)}`, false);
     });
 
-    // UKUPNO NA DNU
     doc.y = t2Y + 10;
     doc.font('Helvetica-Bold').fontSize(10).fillColor('#e53e3e').text(`Ukupan iznos storna: -${finalRefund.toFixed(2)} EUR`, 300, doc.y, { width: 250, align: 'right' });
     doc.moveDown(3);
     
-    // ZAKONSKE NAPOMENE (PDV i pečat)
     doc.font('Helvetica').fontSize(8).fillColor('#666666');
     doc.text(fixText('Drustvo nije u sustavu poreza na dodanu vrijednost (PDV).'), { align: 'center' });
     doc.text(fixText('Ovaj storno racun izdan je u elektronickom obliku i vrijedi bez potpisa i pecata.'), { align: 'center' });
@@ -650,16 +614,6 @@ const generateUraStornoPDF = (inv, filePath) => {
     const doc = new PDFDocument({ margin: 40, size: 'A4' });
     const stream = fs.createWriteStream(filePath);
     doc.pipe(stream);
-
-    const fixText = (text) => {
-      if (!text) return '';
-      return text.toString()
-        .replace(/č/g, 'c').replace(/Č/g, 'C')
-        .replace(/ć/g, 'c').replace(/Ć/g, 'C')
-        .replace(/đ/g, 'd').replace(/Đ/g, 'D')
-        .replace(/š/g, 's').replace(/Š/g, 'S')
-        .replace(/ž/g, 'z').replace(/Ž/g, 'Z');
-    };
 
     const d = new Date();
     const dateStr = d.toLocaleDateString('hr-HR');
@@ -749,8 +703,8 @@ const generateUraStornoPDF = (inv, filePath) => {
   });
 };
 
-
-// STRIPE WEBHOOK
+// --- WEBHOOK ---
+// Mora biti iznad express.json() jer Stripe zahtijeva raw body
 app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -819,9 +773,9 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   res.json({ received: true });
 });
 
-// JSON parsiranje za sve ostale rute
 app.use(express.json());
 
+// --- AUTHENTIKACIJA ---
 app.post('/api/login', async (req, res) => {
   const { password } = req.body;
   const isMatch = await bcrypt.compare(password, process.env.ADMIN_HASH);
@@ -847,26 +801,14 @@ const authGuard = (req, res, next) => {
   });
 };
 
-const INVOICE_SECRET = process.env.INVOICE_SECRET;
-
-app.use('/uploads', express.static('uploads'));
-
-app.post('/upload', authGuard, upload.single('image'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'Nema fajla za upload' });
-  
-  // Cloudinary nam odmah daje gotov, siguran link za sliku!
-  res.json({ imageUrl: req.file.path });
-});
-
+// --- STRIPE CHECKOUT ---
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const { items, customer, total, isApp, discount } = req.body; 
-    const normalizedItems = normalizeItems(items);
+    const normalizedItems = parseJsonSafe(items, []);
     const totalAmount = Number((Number.isFinite(Number(total)) ? Number(total) : calcTotals(normalizedItems)).toFixed(2));
     
-    // OVO JE ISPRAVAK! Server sada uzima adresu ravno onako kako ju je složila Trgovina.
     const address = customer.address; 
-    
     const name = `${customer.firstName} ${customer.lastName}`;
     
     const newOrder = await pool.query(
@@ -875,6 +817,7 @@ app.post('/create-checkout-session', async (req, res) => {
     );
     const orderId = newOrder.rows[0].id;
     await deductStock(normalizedItems);
+    
     const totalInCents = Math.round(totalAmount * 100);
     const successUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-success?app=true` : `${req.protocol}://${req.get('host')}/payment-success`;
     const cancelUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-cancel?app=true` : `${req.protocol}://${req.get('host')}/payment-cancel`;
@@ -900,6 +843,12 @@ app.post('/create-checkout-session', async (req, res) => {
     console.error('Stripe greška:', err.message);
     res.status(500).json({ error: 'Greška pri povezivanju sa Stripeom.' });
   }
+});
+
+// --- RUTE ZA ULAZNE RAČUNE (URA) ---
+app.post('/inbound-invoices/fetch-email', (req, res) => {
+  res.json({ success: true, message: 'Provjera pošte je pokrenuta.' });
+  fetchInboundInvoicesFromEmail().catch(err => console.error(err));
 });
 
 app.get('/inbound-invoices', async (req, res) => {
@@ -973,7 +922,6 @@ app.post('/api/send-ura-storno', async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({error: 'Račun nije pronađen'});
     const inv = result.rows[0];
 
-    // 1. GENERIRANJE PDF-A
     const fileName = `ura_storno_${cleanId}_${Date.now()}.pdf`;
     const filePath = path.join(__dirname, 'uploads', fileName);
     await generateUraStornoPDF(inv, filePath);
@@ -981,7 +929,6 @@ app.post('/api/send-ura-storno', async (req, res) => {
     const baseUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
     const fileUrl = `${baseUrl}/uploads/${fileName}`;
 
-    // 2. KLJUČNA PROMJENA: Mijenjamo BROJ RAČUNA u bazi da knjigovođa dobije STORNO
     const stornoNumber = `STORNO-${inv.invoice_number || 'POV'}`;
     
     await pool.query(
@@ -989,13 +936,12 @@ app.post('/api/send-ura-storno', async (req, res) => {
       ['STORNO ARHIVA', fileUrl, stornoNumber, cleanId]
     );
 
-    // 3. SLANJE MAILA DOBAVLJAČU
     if (supplierEmail && supplierEmail.includes('@')) {
       const mailOptions = {
         from: process.env.EMAIL_USER,
         to: supplierEmail,
         subject: `Storno / Povratnica - ${stornoNumber}`,
-        html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU</h2><p>U privitku je storno dokument.</p></div>`,
+        html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU</h2><p>Poštovani,</p><p>U privitku Vam dostavljamo službeni storno dokument za povrat robe.</p></div>`,
         attachments: [{ filename: `${stornoNumber}.pdf`, path: filePath }]
       };
       await transporter.sendMail(mailOptions);
@@ -1007,6 +953,32 @@ app.post('/api/send-ura-storno', async (req, res) => {
     console.error('Greška pri storniranju:', error);
     res.status(500).json({ error: 'Greška servera.' });
   }
+});
+
+// --- RUTE ZA PROIZVODE ---
+app.get('/products', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM products ORDER BY id DESC');
+    res.json(result.rows.map(p => ({
+      ...p,
+      images: parseJsonSafe(p.images, []),
+      variants: parseJsonSafe(p.variants, [])
+    })));
+  } catch (err) { res.status(500).json({ error: 'Greška servera' }); }
+});
+
+app.post('/products', authGuard, async (req, res) => {
+  try {
+    const { brand, name, description, price, cost_price, category, images, variants, fit_info, material_info, manufacturer_info } = req.body;
+    const result = await pool.query(
+      'INSERT INTO products (brand, name, description, price, cost_price, category, images, variants, fit_info, material_info, manufacturer_info) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *',
+      [brand || '', name || '', description || '', toNumberSafe(price), toNumberSafe(cost_price || 0), category || '', JSON.stringify(images || []), JSON.stringify(variants || []), fit_info || '', material_info || '', manufacturer_info || '']
+    );
+    const saved = result.rows[0];
+    saved.images = parseJsonSafe(saved.images, []);
+    saved.variants = parseJsonSafe(saved.variants, []);
+    res.json(saved);
+  } catch (err) { res.status(500).json({ error: 'Greška servera' }); }
 });
 
 app.put('/products/:id', authGuard, async (req, res) => {
@@ -1036,10 +1008,38 @@ app.delete('/products/:id', authGuard, async (req, res) => {
   }
 });
 
+app.post('/upload', authGuard, upload.single('image'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Nema fajla za upload' });
+  // Cloudinary nam odmah daje gotov, siguran link za sliku
+  res.json({ imageUrl: req.file.path });
+});
+
+// --- RUTE ZA NARUDŽBE ---
+app.get('/all-orders', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM orders ORDER BY id DESC');
+    res.json(result.rows.map(o => ({ 
+      ...o, 
+      items: parseJsonSafe(o.items, []), 
+      invoiceUrl: o.invoice_url,
+      storno_url: o.storno_url,
+      createdAt: o.created_at, 
+      archived: o.archived 
+    })));
+  } catch (err) { res.status(500).json({ error: 'Greška servera' }); }
+});
+
+app.get('/orders', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM orders ORDER BY id DESC');
+    res.json(result.rows.map(o => ({ ...o, items: parseJsonSafe(o.items, []), })));
+  } catch (err) { res.status(500).json({ error: 'Greška' }); }
+});
+
 app.post('/orders', async (req, res) => {
   try {
     const { name, address, phone, total, items, email, discount } = req.body; 
-    const normalizedItems = normalizeItems(items);
+    const normalizedItems = parseJsonSafe(items, []);
     const totalAmount = Number((Number.isFinite(Number(total)) ? Number(total) : calcTotals(normalizedItems)).toFixed(2));
     const newOrder = await pool.query(
       'INSERT INTO orders (name, address, phone, email, total, items, status, discount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
@@ -1077,20 +1077,6 @@ app.post('/orders', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Greška pri spremanju.' }); }
 });
 
-app.get('/all-orders', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM orders ORDER BY id DESC');
-    res.json(result.rows.map(o => ({ 
-      ...o, 
-      items: parseJsonSafe(o.items, []), 
-      invoiceUrl: o.invoice_url,
-      storno_url: o.storno_url,
-      createdAt: o.created_at, 
-      archived: o.archived 
-    })));
-  } catch (err) { res.status(500).json({ error: 'Greška servera' }); }
-});
-
 app.post('/orders/archive', async (req, res) => {
   try {
     const { orderIds } = req.body;
@@ -1102,46 +1088,6 @@ app.post('/orders/archive', async (req, res) => {
     await pool.query('UPDATE orders SET archived = true WHERE id = ANY($1::int[])', [cleanIds]);
     res.json({ success: true, message: 'Arhivirano.' });
   } catch (err) { res.status(500).json({ error: 'Greška u bazi.' }); }
-});
-
-app.get('/racun/:filename', (req, res) => {
-  try {
-    const filename = req.params.filename;
-    const providedToken = req.query.token;
-    const adminPass = req.headers['x-admin-pass'];
-    const expectedToken = crypto.createHmac('sha256', INVOICE_SECRET).update(filename).digest('hex');
-    const isTokenValid = providedToken === expectedToken;
-  const isAdmin = adminPass === process.env.ADMIN_PASS;
-    
-// if (!isTokenValid && !isAdmin) return res.status(403).send('ZABRANJEN PRISTUP');
-    
-    const filePath = path.join(__dirname, 'uploads', filename);
-    if (!fs.existsSync(filePath)) return res.status(404).send('Račun nije pronaden.');
-    res.sendFile(filePath);
-  } catch (error) { res.status(500).send('Greška na serveru.'); }
-});
-
-app.get('/orders/:id/invoice', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).send('Nije pronađeno.');
-    const orderData = result.rows[0];
-    const paymentMethod = orderData.status === 'PAID' ? 'Kartično plaćanje' : 'Pouzeće';
-    const html = buildInvoiceEmailHtml({
-      orderId: orderData.id, customerName: orderData.name, customerAddress: orderData.address,
-      customerPhone: orderData.phone, customerEmail: orderData.email, paymentMethod: paymentMethod,
-      items: parseJsonSafe(orderData.items, []), totalAmount: orderData.total, dateObj: orderData.created_at,
-      discount: parseJsonSafe(orderData.discount, null) 
-    });
-    res.send(html);
-  } catch (err) { res.status(500).send('Greška.'); }
-});
-
-app.get('/orders', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM orders ORDER BY id DESC');
-    res.json(result.rows.map(o => ({ ...o, items: parseJsonSafe(o.items, []), })));
-  } catch (err) { res.status(500).json({ error: 'Greška' }); }
 });
 
 app.delete('/orders/:id', authGuard, async (req, res) => {
@@ -1179,14 +1125,12 @@ app.patch('/orders/:id/status', async (req, res) => {
       const fileName = `storno_${orderId}_${Date.now()}.pdf`;
       const filePath = path.join(__dirname, 'uploads', fileName);
       
-      // Pozivamo našu novu funkciju koja ne uključuje dostavu
       await generateStornoPDFInvoice(orderData, originalInvoiceNumber, stornoInvoiceNumber, filePath);
       
       const secret = process.env.INVOICE_SECRET;
       const token = crypto.createHmac('sha256', secret).update(fileName).digest('hex');
       const stornoUrl = `${req.protocol}://${req.get('host')}/racun/${fileName}?token=${token}`;
       
-      // Spremamo link u bazu, ali NE diramo total narudžbe u bazi (da ostane originalna evidencija)
       await pool.query('UPDATE orders SET storno_url = $1, archived = false WHERE id = $2', [stornoUrl, orderId]);
       
       orderData.storno_url = stornoUrl;
@@ -1210,23 +1154,17 @@ app.post('/orders/:id/send-storno', async (req, res) => {
     }
     
     const orderData = result.rows[0];
-    
-    if (!orderData.email) {
-      return res.status(400).json({ error: 'Kupac nema unesenu email adresu.' });
-    }
+    if (!orderData.email) return res.status(400).json({ error: 'Kupac nema unesenu email adresu.' });
 
     const pdfLinkZaKupca = orderData.storno_url || orderData.invoice_url;
-
-    if (!pdfLinkZaKupca) {
-       return res.status(400).json({ error: 'Storno račun još nije generiran.' });
-    }
+    if (!pdfLinkZaKupca) return res.status(400).json({ error: 'Storno račun još nije generiran.' });
 
     const emailHtml = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; color: #333; line-height: 1.5; border: 1px solid #eee; border-radius: 5px;">
         <h2 style="text-align: center; color: #e53e3e; margin-bottom: 20px;">STORNO RAČUN - KISFALUBA</h2>
         <p>Poštovani/a <b>${escapeHtml(orderData.name)}</b>,</p>
         <p>Obavještavamo Vas da smo uspješno obradili Vaš povrat robe/sredstava.</p>
-        <p>U nastavku se nalazi poveznica na Vaš službeni Storno račun. Sredstva će biti uplaćena na Vaš račun sukladno našim uvjetima poslovanja.</p>
+        <p>U nastavku se nalazi poveznica na Vaš službeni Storno račun.</p>
         <div style="text-align: center; margin: 30px 0;">
           <a href="${pdfLinkZaKupca}" style="background-color: #e53e3e; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">PREUZMI STORNO RAČUN</a>
         </div>
@@ -1256,6 +1194,23 @@ app.patch('/orders/:id/invoice', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Greška.' }); }
 });
 
+app.get('/orders/:id/invoice', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).send('Nije pronađeno.');
+    const orderData = result.rows[0];
+    const paymentMethod = orderData.status === 'PAID' ? 'Kartično plaćanje' : 'Pouzeće';
+    const html = buildInvoiceEmailHtml({
+      orderId: orderData.id, customerName: orderData.name, customerAddress: orderData.address,
+      customerPhone: orderData.phone, customerEmail: orderData.email, paymentMethod: paymentMethod,
+      items: parseJsonSafe(orderData.items, []), totalAmount: orderData.total, dateObj: orderData.created_at,
+      discount: parseJsonSafe(orderData.discount, null) 
+    });
+    res.send(html);
+  } catch (err) { res.status(500).send('Greška.'); }
+});
+
+// --- RUTE ZA POSTAVKE I KATEGORIJE ---
 app.get('/settings', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM shop_settings LIMIT 1');
@@ -1331,9 +1286,31 @@ app.delete('/api/categories/:id', async (req, res) => {
   }
 });
 
+// --- STATIC I PAYMENT RUTE ---
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+app.get('/racun/:filename', (req, res) => {
+  try {
+    const filename = req.params.filename;
+    // Opcionalno možeš vratiti validaciju ovdje ako želiš zaštitu tokenom
+    const filePath = path.join(__dirname, 'uploads', filename);
+    if (!fs.existsSync(filePath)) return res.status(404).send('Račun nije pronaden.');
+    res.sendFile(filePath);
+  } catch (error) { res.status(500).send('Greška na serveru.'); }
+});
+
+app.get('/payment-success', (req, res) => {
+  const isApp = req.query.app === 'true';
+  res.send(`<!DOCTYPE html><html lang="hr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Uspješna kupnja KISFALUBA</title><style>body { margin: 0; padding: 0; background-color: #050505; background-image: url('https://images.unsplash.com/photo-1490481651871-ab68de25d43d?q=80&w=2070&auto=format&fit=crop'); background-size: cover; background-position: center; background-attachment: fixed; height: 100vh; display: flex; justify-content: center; align-items: center; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; text-align: center; }.overlay {position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.80); z-index: 1;} .content { position: relative; z-index: 2; background: rgba(15, 15, 15, 0.65); padding: 50px 40px; border-radius: 12px; border: 1px solid #D4AF37; box-shadow: 0 15px 40px rgba(0,0,0,0.8); max-width: 480px; width: 85%; backdrop-filter: blur(8px); } h1 { color: #D4AF37; font-size: 26px; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 2px 4px rgba(0,0,0,0.8); } p { color: #e0e0e0; font-size: 15px; line-height: 1.6; margin-bottom: 35px; } .gold-line { width: 60px; height: 2px; background: #D4AF37; margin: 0 auto 20px auto; border-radius: 2px; } .btn { display: inline-block; background: linear-gradient(135deg, #E5C058 0%, #B8860B 100%); color: #000; text-decoration: none; padding: 16px 35px; font-size: 15px; font-weight: bold; border-radius: 4px; text-transform: uppercase; border: none; cursor: pointer; transition: all 0.3s ease; box-shadow: 0 4px 15px rgba(212, 175, 55, 0.2); } .btn:hover { transform: translateY(-3px); box-shadow: 0 6px 20px rgba(212, 175, 55, 0.4); } .icon { font-size: 45px; margin-bottom: 10px; text-shadow: 0 0 15px rgba(212, 175, 55, 0.5); }</style></head><body><div class="overlay"></div><div class="content"><div class="icon"></div><h1>Uspješna kupnja</h1><div class="gold-line"></div><p>Zahvaljujemo Vam na povjerenju.<br>Vaša transakcija je provedena stručno i profesionalno.<br><br>Svi detalji narudžbe te elektronički račun uspješno su poslani na Vašu e-mail adresu.</p><button class="btn" onclick="goBack()">POVRATAK U TRGOVINU</button></div><script>if (${isApp}) { setTimeout(function() { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); }, 3000); } function goBack() { if (${isApp}) { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); } else { window.location.href = "http://localhost:8081?clearCart=true"; } }</script></body></html>`);
+});
+
+app.get('/payment-cancel', (req, res) => {
+  const isApp = req.query.app === 'true';
+  res.send(`<!DOCTYPE html><html lang="hr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Kupnja prekinuta KISFALUBA</title><style>body { margin: 0; background-color: #0a0a0a; height: 100vh; display: flex; justify-content: center; align-items: center; font-family: 'Helvetica Neue', sans-serif; text-align: center; color: #fff;} .content { background: #151515; padding: 40px; border-radius: 8px; border: 1px solid #333; max-width: 400px; width: 85%; } h1 { color: #aaa; font-size: 20px; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px;} p { color: #777; font-size: 15px; margin-bottom: 25px; line-height: 1.5;} .btn { background: #2a2a2a; color: #fff; padding: 14px 30px; border-radius: 4px; text-transform: uppercase; font-size: 13px; font-weight: bold; border: none; cursor: pointer; transition: 0.3s; } .btn:hover { background: #444; }</style></head><body><div class="content"><h1>Kupnja prekinuta</h1><p>Postupak plaćanja je otkazan. Bez brige, Vaša košarica je ostala sačuvana.</p><button class="btn" onclick="goBack()">NAZAD U TRGOVINU</button></div><script>function goBack() { if (${isApp}) { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); } else { window.location.href = "http://localhost:8081"; } }</script></body></html>`);
+});
+
 app.get('/', (req, res) => res.send('KISFALUBA Backend Online!'));
 
 app.listen(PORT, '0.0.0.0', () => { 
   console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`); 
 });
-

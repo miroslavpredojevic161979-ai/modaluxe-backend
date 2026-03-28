@@ -16,6 +16,7 @@ const imaps = require('imap-simple');
 const simpleParser = require('mailparser').simpleParser;
 const cron = require('node-cron');
 const app = express();
+app.use(cors());
 const PORT = process.env.PORT || 10000;
 
 if (!fs.existsSync('./uploads')) {

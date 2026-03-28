@@ -970,71 +970,43 @@ app.post('/api/send-ura-storno', async (req, res) => {
   try {
     const cleanId = String(id).split('-')[0];
     const result = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [cleanId]);
-    if (result.rows.length === 0) return res.status(404).json({error: 'Račun nije nađen'});
+    if (result.rows.length === 0) return res.status(404).json({error: 'Račun nije pronađen'});
     const inv = result.rows[0];
 
-    // 1. GENERIRANJE NOVE POVRATNICE (PDF s minusom)
-    const fileName = `DOKUMENT_STORNO_${cleanId}_${Date.now()}.pdf`;
+    // 1. GENERIRANJE PDF-A
+    const fileName = `ura_storno_${cleanId}_${Date.now()}.pdf`;
     const filePath = path.join(__dirname, 'uploads', fileName);
     await generateUraStornoPDF(inv, filePath);
 
-    const baseUrl = process.env.BACKEND_URL || 'https://modaluxe-backend.onrender.com';
+    const baseUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
     const fileUrl = `${baseUrl}/uploads/${fileName}`;
 
-    // 2. KLJUČNA PROMJENA: Mijenjamo BROJ RAČUNA, LINK i šaljemo u ARHIVU 
-    // Dodajemo "STORNO-" ispred broja računa kako bi knjigovođa odmah znao o čemu se radi
+    // 2. KLJUČNA PROMJENA: Mijenjamo BROJ RAČUNA u bazi da knjigovođa dobije STORNO
     const stornoNumber = `STORNO-${inv.invoice_number || 'POV'}`;
     
     await pool.query(
-      `UPDATE inbound_invoices 
-       SET status = 'STORNO ARHIVA', 
-           file_url = $1, 
-           invoice_number = $2, 
-           archived = true, 
-           note = 'Povratnica generirana i arhivirana' 
-       WHERE id = $3`, 
-      [fileUrl, stornoNumber, cleanId]
+      'UPDATE inbound_invoices SET status = $1, file_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
+      ['STORNO ARHIVA', fileUrl, stornoNumber, cleanId]
     );
 
-    // 3. SLANJE DOBAVLJAČU (Sada šaljemo isključivo ovaj NOVI PDF) [cite: 1, 841-844]
+    // 3. SLANJE MAILA DOBAVLJAČU
     if (supplierEmail && supplierEmail.includes('@')) {
-      await transporter.sendMail({
+      const mailOptions = {
         from: process.env.EMAIL_USER,
         to: supplierEmail,
-        subject: `[STORNO] Povratnica robe - ${stornoNumber}`,
-        html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O STORNO DOKUMENTU</h2><p>U privitku Vam dostavljamo službenu povratnicu.</p></div>`,
+        subject: `Storno / Povratnica - ${stornoNumber}`,
+        html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU</h2><p>U privitku je storno dokument.</p></div>`,
         attachments: [{ filename: `${stornoNumber}.pdf`, path: filePath }]
-      });
+      };
+      await transporter.sendMail(mailOptions);
     }
 
-    // Vraćamo novi link Admin panelu da se gumb odmah osvježi
-    res.json({ success: true, message: 'Storno uspješno arhiviran i poslan!', fileUrl: fileUrl });
+    res.json({ success: true, message: 'Storno uspješno generiran i poslan!', fileUrl: fileUrl });
 
   } catch (error) {
     console.error('Greška pri storniranju:', error);
-    res.status(500).json({ error: 'Greška servera pri generiranju storna.' });
+    res.status(500).json({ error: 'Greška servera.' });
   }
-});
-
-app.get('/products', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM products ORDER BY id DESC');
-    res.json(result.rows.map(p => ({ ...p, images: parseJsonSafe(p.images, []), variants: parseJsonSafe(p.variants, []) })));
-  } catch (err) { res.status(500).json({ error: 'Greška servera' }); }
-});
-
-app.post('/products', authGuard, async (req, res) => {
-  try {
-    const { brand, name, description, price, cost_price, category, images, variants, fit_info, material_info, manufacturer_info } = req.body;
-    const result = await pool.query(
-      'INSERT INTO products (brand, name, description, price, cost_price, category, images, variants, fit_info, material_info, manufacturer_info) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *',
-      [brand || '', name || '', description || '', toNumberSafe(price), toNumberSafe(cost_price || 0), category || '', JSON.stringify(images || []), JSON.stringify(variants || []), fit_info || '', material_info || '', manufacturer_info || '']
-    );
-    const saved = result.rows[0];
-    saved.images = parseJsonSafe(saved.images, []);
-    saved.variants = parseJsonSafe(saved.variants, []);
-    res.json(saved);
-  } catch (err) { res.status(500).json({ error: 'Greška servera' }); }
 });
 
 app.put('/products/:id', authGuard, async (req, res) => {

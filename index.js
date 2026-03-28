@@ -218,34 +218,47 @@ async function fetchInboundInvoicesFromEmail() {
         }
         if (isNaN(extractedAmount)) extractedAmount = 0;
 
-        if (mail.attachments && mail.attachments.length > 0) {
-          for (let i = 0; i < mail.attachments.length; i++) {
-            const attachment = mail.attachments[i];
+// 1. IZDVAJAMO SAMO PDF DATOTEKE
+        const pdfAttachments = (mail.attachments || []).filter(attr => 
+          attr.contentType === 'application/pdf' || attr.filename?.toLowerCase().endsWith('.pdf')
+        );
+
+        // 2. LOGIKA PRIORITETA: Ako ima PDF-a, čitaj samo njega. Ako nema, uzmi HTML.
+        if (pdfAttachments.length > 0) {
+          console.log(`--> Pronađeno ${pdfAttachments.length} PDF računa. HTML preskačem.`);
+          
+          for (let i = 0; i < pdfAttachments.length; i++) {
+            const attachment = pdfAttachments[i];
             const safeFilename = attachment.filename ? attachment.filename.replace(/\s+/g, '_') : `racun_${i}.pdf`;
             const fileName = `ura_mail_${Date.now()}_${safeFilename}`;
             
+            // Spremanje PDF-a na disk [cite: 190]
             fs.writeFileSync(path.join(__dirname, 'uploads', fileName), attachment.content);
             const fileUrl = `${baseUrl}/uploads/${fileName}`;
 
+            // Upis u bazu s oznakom PDF [cite: 192-195]
             await pool.query(
               "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
-              [supplierName, 'Iz maila', extractedAmount, fileUrl, subject, dateStr, 'DOLAZNI']
+              [supplierName, 'Iz maila (PDF)', extractedAmount, fileUrl, subject, dateStr, 'DOLAZNI']
             );
           }
         } 
         else {
+          // Rezervna opcija: Ako nema niti jednog PDF-a, spremi HTML tijelo maila [cite: 202-208]
+          console.log("--> Nema PDF-a u mailu, spremam HTML poruku kao račun.");
           const fileName = `ura_mail_${Date.now()}_poruka.html`;
           const htmlContent = mail.html || `<div style="padding: 20px; font-family:sans-serif;"><p>${mail.text}</p></div>`;
+          
           fs.writeFileSync(path.join(__dirname, 'uploads', fileName), htmlContent);
           const fileUrl = `${baseUrl}/uploads/${fileName}`;
 
           await pool.query(
             "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
-            [supplierName, 'Iz maila', extractedAmount, fileUrl, subject, dateStr, 'DOLAZNI']
+            [supplierName, 'Iz maila (HTML)', extractedAmount, fileUrl, subject, dateStr, 'DOLAZNI']
           );
         }
-      } catch (singleMailErr) {
-        console.error('Greška:', singleMailErr.message);
+        } catch (singleMailErr) {
+        console.error('Greška pri obradi JEDNOG maila:', singleMailErr.message);
       }
     }
     connection.end();

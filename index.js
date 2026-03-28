@@ -964,7 +964,7 @@ app.post('/api/send-ura-storno', async (req, res) => {
     const filePath = path.join(__dirname, 'uploads', fileName);
     await generateUraStornoPDF(inv, filePath);
 
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    const baseUrl = process.env.BACKEND_URL || 'https://modaluxe-backend.onrender.com';
     const fileUrl = `${baseUrl}/uploads/${fileName}`;
 
     const htmlContent = `

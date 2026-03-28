@@ -191,6 +191,11 @@ async function fetchInboundInvoicesFromEmail() {
 
         const senderAddress = mail.from && mail.from.value[0] ? mail.from.value[0].address : 'Nepoznato';
         const supplierName = (mail.from && mail.from.value[0].name) ? mail.from.value[0].name : senderAddress;
+        // NOVI FILTER: Ignoriraj mailove koje šalje sama trgovina
+        if (senderAddress.toLowerCase() === process.env.EMAIL_USER.toLowerCase()) {
+            console.log("Ignoriram vlastiti mail (potvrda narudžbe za kupca).");
+            continue; 
+        }
         const dateStr = new Date().toLocaleDateString('hr-HR');
         const subject = mail.subject || 'Automatski uvoz iz maila';
         const baseUrl = process.env.BACKEND_URL || 'http://localhost:10000';

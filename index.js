@@ -970,46 +970,48 @@ app.post('/api/send-ura-storno', async (req, res) => {
   try {
     const cleanId = String(id).split('-')[0];
     const result = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [cleanId]);
-    if (result.rows.length === 0) return res.status(404).json({error: 'Račun nije pronađen'});
+    if (result.rows.length === 0) return res.status(404).json({error: 'Račun nije nađen'});
     const inv = result.rows[0];
 
-    const fileName = `ura_storno_${cleanId}_${Date.now()}.pdf`;
+    // 1. GENERIRANJE NOVE POVRATNICE (PDF s minusom)
+    const fileName = `DOKUMENT_STORNO_${cleanId}_${Date.now()}.pdf`;
     const filePath = path.join(__dirname, 'uploads', fileName);
-
-    // 1. GENERIRAJ PDF (Ovo se događa prvo i mora proći)
     await generateUraStornoPDF(inv, filePath);
 
     const baseUrl = process.env.BACKEND_URL || 'https://modaluxe-backend.onrender.com';
     const fileUrl = `${baseUrl}/uploads/${fileName}`;
 
-    // 2. AŽURIRAJ BAZU ODMAH (Sada link u Adminu MORA raditi, poslao mail ili ne!)
+    // 2. KLJUČNA PROMJENA: Mijenjamo BROJ RAČUNA, LINK i šaljemo u ARHIVU 
+    // Dodajemo "STORNO-" ispred broja računa kako bi knjigovođa odmah znao o čemu se radi
+    const stornoNumber = `STORNO-${inv.invoice_number || 'POV'}`;
+    
     await pool.query(
-      'UPDATE inbound_invoices SET status = $1, file_url = $2, archived = false WHERE id = $3', 
-      ['STORNO ARHIVA', fileUrl, cleanId]
+      `UPDATE inbound_invoices 
+       SET status = 'STORNO ARHIVA', 
+           file_url = $1, 
+           invoice_number = $2, 
+           archived = true, 
+           note = 'Povratnica generirana i arhivirana' 
+       WHERE id = $3`, 
+      [fileUrl, stornoNumber, cleanId]
     );
 
-    // 3. POKUŠAJ POSLATI MAIL (Ali bez "await" - neka ide u pozadini)
+    // 3. SLANJE DOBAVLJAČU (Sada šaljemo isključivo ovaj NOVI PDF) [cite: 1, 841-844]
     if (supplierEmail && supplierEmail.includes('@')) {
-      const mailOptions = {
+      await transporter.sendMail({
         from: process.env.EMAIL_USER,
         to: supplierEmail,
-        subject: `Storno / Povratnica - ${inv.invoice_number || 'Obavijest'}`,
-        html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU ROBE</h2><p>U privitku je storno dokument.</p></div>`,
-        attachments: [{ 
-          filename: `Storno_Povratnica_${(inv.supplier || 'Dobavljac').replace(/\s+/g, '_')}.pdf`, 
-          path: filePath 
-        }]
-      };
-      
-      // Šaljemo mail bez blokiranja - ako ne uspije, PDF je svejedno spremljen!
-      transporter.sendMail(mailOptions).catch(e => console.error("X Mail nije poslan:", e.message));
+        subject: `[STORNO] Povratnica robe - ${stornoNumber}`,
+        html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O STORNO DOKUMENTU</h2><p>U privitku Vam dostavljamo službenu povratnicu.</p></div>`,
+        attachments: [{ filename: `${stornoNumber}.pdf`, path: filePath }]
+      });
     }
 
-    // VRATI USPJEH - Admin panel će odmah vidjeti gumb za PDF
-    res.json({ success: true, message: 'PDF generiran i spremljen!', fileUrl: fileUrl });
+    // Vraćamo novi link Admin panelu da se gumb odmah osvježi
+    res.json({ success: true, message: 'Storno uspješno arhiviran i poslan!', fileUrl: fileUrl });
 
   } catch (error) {
-    console.error('Kritična greška:', error);
+    console.error('Greška pri storniranju:', error);
     res.status(500).json({ error: 'Greška servera pri generiranju storna.' });
   }
 });

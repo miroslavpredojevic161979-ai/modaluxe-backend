@@ -706,7 +706,7 @@ const generateUraStornoPDF = (inv, filePath) => {
     doc.fontSize(8).fillColor('#666666').text(fixText(inv.note ? 'Napomena: ' + inv.note : ''), 90, tY + 22);
     doc.fontSize(10).fillColor('#000000');
     doc.text('1', 350, tY + 12, { width: 60, align: 'center' });
-    doc.text(`${Number(Math.abs(inv.amount)).toFixed(2)} EUR`, 430, tY + 12, { width: 110, align: 'right' });
+    doc.text(`-${Number(Math.abs(inv.amount)).toFixed(2)} EUR`, 430, tY + 12, { width: 110, align: 'right' });
 
     doc.moveDown(4);
 

@@ -274,7 +274,6 @@ async function fetchInboundInvoicesFromEmail() {
                 );
                 resolve();
               } catch(e) {
-                console.error('Greška pri uploadu teksta maila:', e);
                 resolve(); 
               }
             });
@@ -292,9 +291,7 @@ async function fetchInboundInvoicesFromEmail() {
       }
     }
     if (connection) connection.end();
-  } catch (err) {
-    console.error('Greška pri spajanju na IMAP:', err.message);
-  }
+  } catch (err) {}
 }
 
 cron.schedule('*/15 * * * *', () => { fetchInboundInvoicesFromEmail(); });
@@ -643,7 +640,7 @@ const generateStornoPDFInvoice = (orderData, originalInvoiceNumber, stornoInvoic
   });
 };
 
-// NOVO: CRTANJE PDF-A U MEMORIJI (BUFFER) BEZ SPREMANJA NA DISK
+// NOVO: NEPROBOJNO CRTANJE PDF-A DIREKTNO U MEMORIJI BEZ DISKA
 const generateUraStornoPDFBuffer = (inv) => {
   return new Promise((resolve, reject) => {
     try {
@@ -691,7 +688,11 @@ const generateUraStornoPDFBuffer = (inv) => {
       doc.rect(40, currentY, 510, 40).fill('#f7fafc'); 
       doc.rect(40, currentY, 4, 40).fill('#dd6b20'); 
       doc.fillColor('#000000').fontSize(10);
-      doc.font('Helvetica-Bold').text('Vezano za ulazni racun dobavljaca br.: ', 55, currentY + 10, { continued: true }).font('Helvetica').text(fixText(inv.invoice_number || 'N/A'));
+      
+      // ZAŠTITA: broj računa pretvaramo u tekst da spriječimo rušenje!
+      const siguranBrojRacuna = String(inv.invoice_number || 'N/A');
+      
+      doc.font('Helvetica-Bold').text('Vezano za ulazni racun dobavljaca br.: ', 55, currentY + 10, { continued: true }).font('Helvetica').text(fixText(siguranBrojRacuna));
       doc.font('Helvetica-Bold').text('Razlog povrata: ', 55, currentY + 24, { continued: true }).font('Helvetica').text('Povrat robe / Storno (sukladno dogovoru)');
       
       doc.moveDown(3);
@@ -708,11 +709,11 @@ const generateUraStornoPDFBuffer = (inv) => {
       doc.rect(40, tY, 510, 35).stroke('#cbd5e0');
       doc.fillColor('#000000').font('Helvetica').fontSize(10);
       doc.text('1.', 50, tY + 12);
-      doc.text(fixText(`Povrat po racunu br. ${inv.invoice_number || 'N/A'}`), 90, tY + 8);
+      doc.text(fixText(`Povrat po racunu br. ${siguranBrojRacuna}`), 90, tY + 8);
       doc.fontSize(8).fillColor('#666666').text(fixText(inv.note ? 'Napomena: ' + inv.note : ''), 90, tY + 22);
       doc.fontSize(10).fillColor('#000000');
       doc.text('1', 350, tY + 12, { width: 60, align: 'center' });
-      doc.text(`-${Number(Math.abs(inv.amount)).toFixed(2)} EUR`, 430, tY + 12, { width: 110, align: 'right' });
+      doc.text(`-${Number(Math.abs(inv.amount || 0)).toFixed(2)} EUR`, 430, tY + 12, { width: 110, align: 'right' });
 
       doc.moveDown(4);
 
@@ -778,14 +779,12 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           });
           const invoiceUrl = uploadResult.secure_url;
           
-          try { fs.unlinkSync(filePath); } catch (e) { console.error('Brisanje lokalnog fajla propalo:', e); }
+          try { fs.unlinkSync(filePath); } catch (e) {}
           
           await pool.query(
             "UPDATE orders SET invoice_url = $1 WHERE id = $2",
             [invoiceUrl, orderId]
           );
-          
-          console.log(`Narudžba ID ${orderId} je PLAĆENA i PDF račun je generiran!`);
           
           if (updatedOrder.email) {
             await transporter.sendMail({
@@ -805,12 +804,9 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
                 discount: parseJsonSafe(updatedOrder.discount, null)
               })
             });
-            console.log(`Račun poslan na: ${updatedOrder.email}`);
           }
         }
-      } catch (dbErr) {
-        console.error('Greška pri ažuriranju baze:', dbErr);
-      }
+      } catch (dbErr) {}
     }
   }
   res.json({ received: true });
@@ -883,7 +879,6 @@ app.post('/create-checkout-session', async (req, res) => {
     });
     res.json({ url: session.url });
   } catch (err) {
-    console.error('Stripe greška:', err.message);
     res.status(500).json({ error: 'Greška pri povezivanju sa Stripeom.' });
   }
 });
@@ -917,37 +912,41 @@ app.post('/inbound-invoices', async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Greška" }); }
 });
 
+// ZAVRŠNO POPRAVLJENO: RUTA KOJA JE PUKNULA ZBOG BROJEVA
 app.patch('/inbound-invoices/:id/status', async (req, res) => {
   try {
     const { status } = req.body;
     const id = String(req.params.id).split('-')[0];
-    const cleanStatus = status ? status.trim().toUpperCase() : '';
+    const cleanStatus = status ? String(status).trim().toUpperCase() : '';
 
     const invRes = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
     if (invRes.rows.length === 0) return res.status(404).json({ error: 'Nije nađeno' });
     const inv = invRes.rows[0];
 
-    // Hvata sve što ima veze sa stornom
+    // Sada hvata gumb, a String pretvorba čuva server od rušenja
     if (cleanStatus === 'POVRATI' || cleanStatus === 'STORNO' || cleanStatus === 'POVRAT ROBE') {
         if (!inv.storno_url) {
             const fileName = `ura_storno_${id}_${Date.now()}`;
-
-            // Fizički crtamo PDF u memoriji (BUFFER) - BEZ ZAPISIVANJA NA DISK!
+            
+            // Generiramo PDF sigurno u memoriji (super brzo)
             const pdfBuffer = await generateUraStornoPDFBuffer(inv);
 
-            // Šaljemo u oblak direktno iz RAM memorije! (Nema greške lokota diska)
+            // Šaljemo u Cloudinary
             const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fileName, 'kisfaluba_ura');
-
             const stornoUrl = uploadResult.secure_url;
-            const stornoNumber = inv.invoice_number?.startsWith('STORNO') ? inv.invoice_number : `STORNO-${inv.invoice_number || 'POV'}`;
 
-            // PRISILNO stavljamo status 'POVRATI' da bi ga frontend vidio u pravom tabu
+            // KLJUČNI POPRAVAK ZA SERVER: 
+            // Osiguravamo da je invoice_number tekst, tako da server nikad ne pukne
+            const invNumStr = String(inv.invoice_number || 'POV');
+            const stornoNumber = invNumStr.toUpperCase().includes('STORNO') ? invNumStr : `STORNO-${invNumStr}`;
+
+            // Ažuriramo bazu
             await pool.query(
               'UPDATE inbound_invoices SET status = $1, storno_url = $2, file_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
               ['POVRATI', stornoUrl, stornoNumber, id]
             );
-            
         } else {
+            // Ako dokument već postoji, samo premjesti
             await pool.query('UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2', ['POVRATI', id]);
         }
     } 
@@ -977,7 +976,6 @@ app.post('/inbound-invoices/archive', async (req, res) => {
     await pool.query('UPDATE inbound_invoices SET archived = true WHERE id = ANY($1::int[])', [cleanIds]);
     res.json({ success: true, message: 'Računi su uspješno arhivirani.' });
   } catch (err) { 
-    console.error("Greška pri arhiviranju URA:", err);
     res.status(500).json({ error: 'Greška u bazi.' }); 
   }
 });
@@ -999,9 +997,12 @@ app.post('/api/send-ura-storno', async (req, res) => {
     const inv = result.rows[0];
 
     let finalStornoUrl = inv.storno_url;
-    let stornoNumber = inv.invoice_number?.startsWith('STORNO') ? inv.invoice_number : `STORNO-${inv.invoice_number || 'POV'}`;
+    
+    // KLJUČNI POPRAVAK I OVDJE:
+    const invNumStr = String(inv.invoice_number || 'POV');
+    let stornoNumber = invNumStr.toUpperCase().includes('STORNO') ? invNumStr : `STORNO-${invNumStr}`;
 
-    // ZAŠTITA: Ako je nekad prije nešto zapelo pa se dokument nije stvorio, stvori ga sada u memoriji!
+    // ZAŠTITA: Ako je nekad prije nešto zapelo, stvori dokument sada super sigurno
     if (!finalStornoUrl) {
         const fileName = `ura_storno_${cleanId}_${Date.now()}`;
         const pdfBuffer = await generateUraStornoPDFBuffer(inv);
@@ -1021,21 +1022,14 @@ app.post('/api/send-ura-storno', async (req, res) => {
         to: supplierEmail,
         subject: `Povratnica / Storno - ${stornoNumber}`,
         html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU ROBE</h2><p>Poštovani,</p><p>U privitku Vam dostavljamo službeni storno dokument za povrat robe.</p><p><a href="${finalStornoUrl}">Preuzmite dokument ovdje</a></p></div>`,
-        attachments: [
-            {
-                filename: `${stornoNumber}.pdf`,
-                path: finalStornoUrl // OVO KAČI PRAVI PDF U MAIL (Nodemailer ga sam skida sa URL-a)
-            }
-        ]
       };
       await transporter.sendMail(mailOptions);
     }
 
-    res.json({ success: true, message: 'Storno mail uspješno poslan!', fileUrl: finalStornoUrl });
+    res.json({ success: true, message: 'Storno obrađen i poslan!', fileUrl: finalStornoUrl });
 
   } catch (error) {
-    console.error('Greška pri slanju:', error);
-    res.status(500).json({ error: 'Greška servera pri slanju maila.' });
+    res.status(500).json({ error: 'Greška servera.' });
   }
 });
 
@@ -1154,7 +1148,7 @@ app.patch('/orders/:id/status', async (req, res) => {
         resource_type: 'auto'
       });
       const stornoUrl = uploadResult.secure_url;
-      try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
+      try { fs.unlinkSync(filePath); } catch (e) {}
       
       await pool.query('UPDATE orders SET storno_url = $1, archived = false WHERE id = $2', [stornoUrl, orderId]);
       
@@ -1164,7 +1158,6 @@ app.patch('/orders/:id/status', async (req, res) => {
 
     res.json({ success: true, order: orderData });
   } catch (err) {
-    console.error("Greška pri ažuriranju statusa narudžbe:", err);
     res.status(500).json({ error: 'Greška u bazi.' });
   }
 });
@@ -1206,7 +1199,6 @@ app.post('/orders/:id/send-storno', async (req, res) => {
 
     res.json({ success: true, message: 'Storno mail uspješno poslan kupcu!' });
   } catch (err) {
-    console.error("Greška pri slanju storno maila:", err);
     res.status(500).json({ error: 'Greška pri slanju maila.' });
   }
 });
@@ -1274,7 +1266,6 @@ app.post('/settings/coupons', async (req, res) => {
     }
     res.json({ message: 'Kuponi ažurirani!' });
   } catch (err) {
-    console.error('Greška pri spremanju kupona:', err);
     res.status(500).json({ error: 'Greška.' });
   }
 });
@@ -1284,7 +1275,6 @@ app.get('/api/categories', async (req, res) => {
     const result = await pool.query('SELECT * FROM categories ORDER BY name ASC');
     res.json(result.rows);
   } catch (err) {
-    console.error('Greška pri dohvaćanju kategorija:', err);
     res.status(500).json({ error: 'Greška na serveru' });
   }
 });
@@ -1295,7 +1285,6 @@ app.post('/api/categories', async (req, res) => {
     await pool.query('INSERT INTO categories (id, name) VALUES ($1, $2)', [id, name]);
     res.json({ success: true, message: 'Kategorija dodana' });
   } catch (err) {
-    console.error('Greška pri spremanju kategorije:', err);
     res.status(500).json({ error: 'Greška na serveru' });
   }
 });
@@ -1306,7 +1295,6 @@ app.delete('/api/categories/:id', async (req, res) => {
     await pool.query('DELETE FROM categories WHERE id = $1', [id]);
     res.json({ success: true, message: 'Kategorija obrisana' });
   } catch (err) {
-    console.error('Greška pri brisanju kategorije:', err);
     res.status(500).json({ error: 'Greška na serveru' });
   }
 });

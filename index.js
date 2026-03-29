@@ -120,6 +120,19 @@ const upload = multer({
   limits: { fileSize: 5 * 1024 * 1024 }, 
   fileFilter: fileFilter
 });
+// Pomoćna funkcija za upload datoteka iz maila direktno na Cloudinary
+const uploadBufferToCloudinary = (buffer, filename, resourceType = 'auto') => {
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      { folder: 'kisfaluba_ura', public_id: filename, resource_type: resourceType },
+      (error, result) => {
+        if (error) return reject(error);
+        resolve(result);
+      }
+    );
+    uploadStream.end(buffer);
+  });
+};
 
 // --- MAIL TRANSPORTER ---
 const transporter = nodemailer.createTransport({
@@ -221,34 +234,34 @@ async function fetchInboundInvoicesFromEmail() {
         }
         if (isNaN(extractedAmount)) extractedAmount = 0;
 
-        const pdfAttachments = (mail.attachments || []).filter(attr => 
+   const pdfAttachments = (mail.attachments || []).filter(attr => 
           attr.contentType === 'application/pdf' || attr.filename?.toLowerCase().endsWith('.pdf')
         );
 
         if (pdfAttachments.length > 0) {
           for (let i = 0; i < pdfAttachments.length; i++) {
             const attachment = pdfAttachments[i];
-            const safeFilename = attachment.filename ? attachment.filename.replace(/\s+/g, '_') : `racun_${i}.pdf`;
-            const fileName = `ura_mail_${Date.now()}_${safeFilename}`;
+            const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').replace('.pdf', '') : `racun_${i}`;
+            const fName = `ura_pdf_${Date.now()}_${safeName}`;
             
-            fs.writeFileSync(path.join(__dirname, 'uploads', fileName), attachment.content);
-            const fileUrl = `${baseUrl}/uploads/${fileName}`;
-
+            // NOVO: Upload direktno na Cloudinary
+            const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'auto');
+            
             await pool.query(
               "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
-              [supplierName, 'Iz maila (PDF)', extractedAmount, fileUrl, subject, dateStr, 'DOLAZNI']
+              [supplierName, 'Iz maila (PDF)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
             );
           }
         } else {
-          const fileName = `ura_mail_${Date.now()}_poruka.html`;
+          // NOVO: Upload HTML teksta na Cloudinary kao sirovi fajl
+          const fName = `ura_html_${Date.now()}.html`;
           const htmlContent = mail.html || `<div style="padding: 20px; font-family:sans-serif;"><p>${mail.text}</p></div>`;
           
-          fs.writeFileSync(path.join(__dirname, 'uploads', fileName), htmlContent);
-          const fileUrl = `${baseUrl}/uploads/${fileName}`;
-
+          const uploadResult = await uploadBufferToCloudinary(Buffer.from(htmlContent, 'utf-8'), fName, 'raw');
+          
           await pool.query(
             "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
-            [supplierName, 'Iz maila (HTML)', extractedAmount, fileUrl, subject, dateStr, 'DOLAZNI']
+            [supplierName, 'Iz maila (HTML)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
           );
         }
       } catch (singleMailErr) {
@@ -922,30 +935,41 @@ app.post('/api/send-ura-storno', async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({error: 'Račun nije pronađen'});
     const inv = result.rows[0];
 
-    const fileName = `ura_storno_${cleanId}_${Date.now()}.pdf`;
-    const filePath = path.join(__dirname, 'uploads', fileName);
-    await generateUraStornoPDF(inv, filePath);
+  // 1. Generiraj PDF lokalno (privremeno za slanje maila)
+    const fileName = `ura_storno_${cleanId}_${Date.now()}`;
+    const fPath = path.join(__dirname, 'uploads', `${fileName}.pdf`);
+    await generateUraStornoPDF(inv, fPath);
 
-    const baseUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
-    const fileUrl = `${baseUrl}/uploads/${fileName}`;
+    // 2. NOVO: Pošalji generirani PDF na Cloudinary za trajno čuvanje
+    const uploadResult = await cloudinary.uploader.upload(fPath, {
+      folder: 'kisfaluba_ura',
+      resource_type: 'auto',
+      public_id: fileName
+    });
 
+    const fileUrl = uploadResult.secure_url;
     const stornoNumber = `STORNO-${inv.invoice_number || 'POV'}`;
     
+    // 3. Ažuriraj bazu s Cloudinary linkom
     await pool.query(
       'UPDATE inbound_invoices SET status = $1, file_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
       ['STORNO ARHIVA', fileUrl, stornoNumber, cleanId]
     );
 
+    // 4. Pošalji mail dobavljaču s lokalnim fajlom
     if (supplierEmail && supplierEmail.includes('@')) {
       const mailOptions = {
         from: process.env.EMAIL_USER,
         to: supplierEmail,
         subject: `Storno / Povratnica - ${stornoNumber}`,
         html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU</h2><p>Poštovani,</p><p>U privitku Vam dostavljamo službeni storno dokument za povrat robe.</p></div>`,
-        attachments: [{ filename: `${stornoNumber}.pdf`, path: filePath }]
+        attachments: [{ filename: `${stornoNumber}.pdf`, path: fPath }]
       };
       await transporter.sendMail(mailOptions);
     }
+
+    // 5. Obriši privremeni lokalni fajl da ne zauzima prostor na serveru
+    try { fs.unlinkSync(fPath); } catch (e) { console.error("Brisanje temp fajla nije uspjelo:", e); }
 
     res.json({ success: true, message: 'Storno uspješno generiran i poslan!', fileUrl: fileUrl });
 

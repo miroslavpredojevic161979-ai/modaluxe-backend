@@ -77,7 +77,7 @@ const toNumberSafe = (v) => { const n = Number(v); return Number.isFinite(n) ? n
 
 const fixText = (text) => {
   if (!text) return '';
-  return text.toString()
+  return String(text)
     .replace(/č/g, 'c').replace(/Č/g, 'C')
     .replace(/ć/g, 'c').replace(/Ć/g, 'C')
     .replace(/đ/g, 'd').replace(/Đ/g, 'D')
@@ -128,7 +128,7 @@ const uploadBufferToCloudinary = (buffer, filename, resourceType = 'auto') => {
       { 
         folder: 'kisfaluba_ura', 
         public_id: filename, 
-        resource_type: resourceType
+        resource_type: resourceType // Koristimo format kakav je zatražen
       },
       (error, result) => {
         if (error) return reject(error);
@@ -237,24 +237,29 @@ async function fetchInboundInvoicesFromEmail() {
         }
         if (isNaN(extractedAmount)) extractedAmount = 0;
 
-        const pdfAttachments = (mail.attachments || []).filter(attr => 
-          attr.contentType === 'application/pdf' || attr.filename?.toLowerCase().endsWith('.pdf')
+        // POPRAVAK: Sada traži i PDF i SLIKE (JPG, PNG) koje je poslao dobavljač
+        const validAttachments = (mail.attachments || []).filter(attr => 
+          attr.contentType === 'application/pdf' || 
+          attr.contentType?.startsWith('image/') ||
+          attr.filename?.toLowerCase().match(/\.(pdf|jpg|jpeg|png)$/)
         );
 
-        if (pdfAttachments.length > 0) {
-          for (let i = 0; i < pdfAttachments.length; i++) {
-            const attachment = pdfAttachments[i];
-            const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').replace('.pdf', '') : `racun_${i}`;
-            const fName = `ura_pdf_${Date.now()}_${safeName}`;
+        if (validAttachments.length > 0) {
+          for (let i = 0; i < validAttachments.length; i++) {
+            const attachment = validAttachments[i];
+            const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').split('.')[0] : `racun_${i}`;
+            const fName = `ura_doc_${Date.now()}_${safeName}`;
             
-            const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'image');
+            // Šaljemo prilog točno onakav kakav jest (auto format) bez prepravljanja!
+            const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'auto');
             
             await pool.query(
               "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
-              [supplierName, 'Iz maila (PDF)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
+              [supplierName, 'Iz maila (Original)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
             );
           }
         } else {
+          // Ako je mail u potpunosti BEZ priloga (samo čisti tekst), tek onda crtamo PDF
           const fName = `ura_tekst_${Date.now()}`; 
           
           await new Promise((resolve, reject) => {
@@ -265,7 +270,7 @@ async function fetchInboundInvoicesFromEmail() {
             doc.on('end', async () => {
               try {
                 const pdfBuffer = Buffer.concat(chunks);
-                const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image');
+                const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image'); // Ovdje je 'image' ok jer ga mi stvaramo
                 
                 await pool.query(
                   "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
@@ -333,7 +338,7 @@ const buildInvoiceEmailHtml = ({ orderId, customerName, customerAddress, custome
   return `<div style="font-family: Arial, sans-serif; max-width: 750px; margin: auto; padding: 20px; color: #333; line-height: 1.5; border: 1px solid #eee; border-radius: 5px;"><h2 style="text-align: center; color: #000; margin-bottom: 20px; font-size: 22px;">KISFALUBA</h2><p style="font-size: 13px;">Poštovani/a <b>${escapeHtml(customerName)}</b>,</p><p style="font-size: 13px;">Hvala Vam na kupnji! Vaša narudžba je uspješno zaprimljena i u pripremi je za slanje.</p><h3 style="border-bottom: 2px solid #000; padding-bottom: 5px; margin-top: 30px; font-size: 15px;">Detalji narudžbe</h3><table style="width: 100%; border-collapse: collapse; margin-bottom: 10px; font-size: 13px;"><thead><tr style="background-color: #fafafa;"><th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Artikl</th><th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Količina</th><th style="padding: 10px; border: 1px solid #ddd; text-align: right;">Cijena (EUR)</th></tr></thead><tbody>${table1Rows}</tbody></table>${discountHtml}<div style="text-align: right; margin-top: 15px;"><span style="font-size: 15px;">UKUPNO ZA PLATITI: <b>${Number(totalAmount).toFixed(2)} EUR</b></span><br><span style="font-size: 11px; color: #666;">Društvo nije u sustavu PDV-a. PDV nije obračunan.</span></div><h3 style="border-bottom: 2px solid #000; padding-bottom: 5px; margin-top: 30px; font-size: 15px;">Podaci za dostavu</h3><p style="font-size: 13px; margin: 0; line-height: 1.6;">${escapeHtml(customerName)}<br>${escapeHtml(customerAddress)}<br>Telefon: ${escapeHtml(customerPhone)}<br>E-mail: ${escapeHtml(customerEmail)}</p><h3 style="text-align: center; margin-top: 50px; margin-bottom: 20px; font-size: 16px;">RAČUN</h3><p style="font-size: 13px; margin: 0 0 25px 0; line-height: 1.6;"><b>KIŠFALUBA j.d.o.o.</b><br>Zagorska ulica 40, 31300 Branjina, Republika Hrvatska<br>OIB: 82125639708 | MBS: 5990572<br>Trgovački sud u Osijeku<br>Temeljni kapital: 10,00 EUR, uplaćen u cijelosti</p><table style="font-size: 13px; margin-bottom: 25px; width: 100%; border: none; line-height: 1.8;"><tr><td style="width: 140px; font-weight: bold;">Broj računa:</td><td>${invoiceNumber}</td></tr><tr><td style="font-weight: bold;">Datum izdavanja:</td><td>${dateStr}</td></tr><tr><td style="font-weight: bold;">Vrijeme izdavanja:</td><td>${timeStr}</td></tr><tr><td style="font-weight: bold;">Mjesto izdavanja:</td><td>Branjina, Republika Hrvatska</td></tr><tr><td style="font-weight: bold;">Kupac:</td><td>${escapeHtml(customerName)}</td></tr><tr><td style="font-weight: bold;">Adresa kupca:</td><td>${escapeHtml(customerAddress)}</td></tr><tr><td style="font-weight: bold;">Način plaćanja:</td><td>${paymentMethod}</td></tr></table><table style="width: 100%; border-collapse: collapse; margin-bottom: 10px; font-size: 13px;"><thead><tr style="background-color: #fafafa;"><th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Redni broj</th><th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Opis proizvoda</th><th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Količina</th><th style="padding: 10px; border: 1px solid #ddd; text-align: right;">Jedinična cijena (EUR)</th><th style="padding: 10px; border: 1px solid #ddd; text-align: right;">Ukupno (EUR)</th></tr></thead><tbody>${table2Rows}</tbody></table>${discountHtml}<div style="text-align: right; margin-top: 20px; margin-bottom: 40px;"><span style="font-size: 15px;">Ukupan iznos za plaćanje: <b>${Number(totalAmount).toFixed(2)} EUR</b></span></div><div style="text-align: center; font-size: 11px; color: #555; border-top: 1px dotted #ccc; padding-top: 20px; line-height: 1.6;"><p style="margin: 2px 0;">Društvo nije u sustavu poreza na dodanu vrijednost (PDV).</p><p style="margin: 2px 0;">Sukladno važećim poreznim propisima, PDV nije obračunan.</p><br><p style="margin: 2px 0;">Ovaj račun izdan je u elektroničkom obliku i vrijedi bez potpisa i pečata.</p><p style="margin: 2px 0;">Za sva pitanja ili reklamacije obratite se na naš kontakt e-mail: info@kisfaluba.hr</p></div></div>`;
 };
 
-// --- PDF GENERATORI ---
+// --- PDF GENERATORI (ZA NARUDŽBE KUPACA I KREIRANJE STORNA) ---
 
 const generatePDFInvoice = (orderData, invoiceNumber, filePath) => {
   return new Promise((resolve, reject) => {
@@ -706,7 +711,7 @@ const generateUraStornoPDF = (inv, filePath) => {
     doc.fontSize(8).fillColor('#666666').text(fixText(inv.note ? 'Napomena: ' + inv.note : ''), 90, tY + 22);
     doc.fontSize(10).fillColor('#000000');
     doc.text('1', 350, tY + 12, { width: 60, align: 'center' });
-    doc.text(`-${Number(Math.abs(inv.amount)).toFixed(2)} EUR`, 430, tY + 12, { width: 110, align: 'right' });
+    doc.text(`-${Number(Math.abs(inv.amount || 0)).toFixed(2)} EUR`, 430, tY + 12, { width: 110, align: 'right' });
 
     doc.moveDown(4);
 
@@ -912,8 +917,8 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
 
     if (status === 'ARHIVIRANI' || status === 'STORNO ARHIVA') {
         await pool.query('UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2', [status, id]);
-    } else if (status === 'POVRATI') {
-        await pool.query('UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2', [status, id]);
+    } else if (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') {
+        await pool.query('UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2', ['POVRATI', id]);
     } else {
         await pool.query('UPDATE inbound_invoices SET status = $1 WHERE id = $2', [status, id]);
     }
@@ -969,10 +974,15 @@ app.post('/api/send-ura-storno', async (req, res) => {
     });
 
     const fileUrl = uploadResult.secure_url;
-    const stornoNumber = `STORNO-${inv.invoice_number || 'POV'}`;
+    
+    let siguranBrojRacuna = 'POV';
+    if (inv.invoice_number) {
+        siguranBrojRacuna = String(inv.invoice_number).trim();
+    }
+    const stornoNumber = siguranBrojRacuna.toUpperCase().includes('STORNO') ? siguranBrojRacuna : `STORNO-${siguranBrojRacuna}`;
     
     await pool.query(
-      'UPDATE inbound_invoices SET status = $1, file_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
+      'UPDATE inbound_invoices SET status = $1, storno_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
       ['STORNO ARHIVA', fileUrl, stornoNumber, cleanId]
     );
 

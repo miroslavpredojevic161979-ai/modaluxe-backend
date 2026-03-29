@@ -128,7 +128,7 @@ const uploadBufferToCloudinary = (buffer, filename, resourceType = 'auto') => {
       { 
         folder: 'kisfaluba_ura', 
         public_id: filename, 
-        resource_type: resourceType
+        resource_type: resourceType // Ovdje se sada uvijek šalje 'auto' za PDF-ove
       },
       (error, result) => {
         if (error) return reject(error);
@@ -214,6 +214,7 @@ async function fetchInboundInvoicesFromEmail() {
         const senderAddress = mail.from && mail.from.value[0] ? mail.from.value[0].address : 'Nepoznato';
         const supplierName = (mail.from && mail.from.value[0].name) ? mail.from.value[0].name : senderAddress;
         
+        // Blokiramo ulaz mailova koje webshop sam sebi pošalje
         if (senderAddress.toLowerCase() === process.env.EMAIL_USER.toLowerCase()) continue; 
 
         const dateStr = new Date().toLocaleDateString('hr-HR');
@@ -247,7 +248,8 @@ async function fetchInboundInvoicesFromEmail() {
             const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').replace('.pdf', '') : `racun_${i}`;
             const fName = `ura_pdf_${Date.now()}_${safeName}`;
             
-            const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'image');
+            // OVDJE JE POPRAVLJENO ('auto' umjesto 'image')
+            const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'auto');
             
             await pool.query(
               "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
@@ -265,7 +267,8 @@ async function fetchInboundInvoicesFromEmail() {
             doc.on('end', async () => {
               try {
                 const pdfBuffer = Buffer.concat(chunks);
-                const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image');
+                // OVDJE JE POPRAVLJENO ('auto' umjesto 'image')
+                const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'auto');
                 
                 await pool.query(
                   "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
@@ -765,9 +768,10 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           
           await generatePDFInvoice(updatedOrder, invoiceNumber, filePath);
           
+          // OVDJE JE POPRAVLJENO ('auto' umjesto 'image')
           const uploadResult = await cloudinary.uploader.upload(filePath, {
             folder: 'kisfaluba_racuni',
-            resource_type: 'image'
+            resource_type: 'auto'
           });
           const invoiceUrl = uploadResult.secure_url;
           
@@ -962,9 +966,10 @@ app.post('/api/send-ura-storno', async (req, res) => {
     const fPath = path.join(__dirname, 'uploads', `${fileName}.pdf`);
     await generateUraStornoPDF(inv, fPath);
 
+    // OVDJE JE POPRAVLJENO ('auto' umjesto 'image')
     const uploadResult = await cloudinary.uploader.upload(fPath, {
       folder: 'kisfaluba_ura',
-      resource_type: 'image',
+      resource_type: 'auto',
       public_id: fileName
     });
 
@@ -1056,13 +1061,15 @@ app.post('/upload', authGuard, upload.single('image'), (req, res) => {
 });
 
 // --- RUTE ZA NARUDŽBE ---
+
+// OVDJE JE POPRAVLJENO DA KNJIGOVOĐA UVIJEK VIDI STORNO AKO POSTOJI
 app.get('/all-orders', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM orders ORDER BY id DESC');
     res.json(result.rows.map(o => ({ 
       ...o, 
       items: parseJsonSafe(o.items, []), 
-      invoiceUrl: o.invoice_url,
+      invoiceUrl: (o.status === 'REFUND' && o.storno_url) ? o.storno_url : o.invoice_url,
       storno_url: o.storno_url,
       createdAt: o.created_at, 
       archived: o.archived 
@@ -1096,9 +1103,10 @@ app.post('/orders', async (req, res) => {
     
     await generatePDFInvoice(orderData, invoiceNumber, filePath);
     
+    // OVDJE JE POPRAVLJENO ('auto' umjesto 'image')
     const uploadResult = await cloudinary.uploader.upload(filePath, {
       folder: 'kisfaluba_racuni',
-      resource_type: 'image'
+      resource_type: 'auto'
     });
     const invoiceUrl = uploadResult.secure_url;
     try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
@@ -1173,9 +1181,10 @@ app.patch('/orders/:id/status', async (req, res) => {
       
       await generateStornoPDFInvoice(orderData, originalInvoiceNumber, stornoInvoiceNumber, filePath);
       
+      // OVDJE JE POPRAVLJENO ('auto' umjesto 'image')
       const uploadResult = await cloudinary.uploader.upload(filePath, {
         folder: 'kisfaluba_storno',
-        resource_type: 'image'
+        resource_type: 'auto'
       });
       const stornoUrl = uploadResult.secure_url;
       try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
@@ -1358,17 +1367,6 @@ app.get('/payment-cancel', (req, res) => {
 });
 
 app.get('/', (req, res) => res.send('KISFALUBA Backend Online!'));
-
-// --- PRIVREMENA METLA ZA BRISANJE SVEGA ---
-app.get('/brisanje-baze', async (req, res) => {
-  try {
-    await pool.query('DELETE FROM orders');
-    await pool.query('DELETE FROM inbound_invoices');
-    res.send('<h1>Sve narudžbe i ulazni računi su uspješno obrisani! 🧹</h1><p>Sada se vrati u VS Code, OBRISI ovaj kod i napravi novi Deploy kako ti nitko na internetu ne bi mogao obrisati bazu.</p>');
-  } catch (err) { 
-    res.status(500).send('Greška pri brisanju: ' + err.message); 
-  }
-});
 
 app.listen(PORT, '0.0.0.0', () => { 
   console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`); 

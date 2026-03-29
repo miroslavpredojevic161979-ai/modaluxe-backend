@@ -128,8 +128,7 @@ const uploadBufferToCloudinary = (buffer, filename, resourceType = 'auto') => {
       { 
         folder: 'kisfaluba_ura', 
         public_id: filename, 
-        resource_type: resourceType,
-        flags: "attachment:false" // Ovo osigurava da se otvori u pregledniku
+        resource_type: resourceType
       },
       (error, result) => {
         if (error) return reject(error);
@@ -250,7 +249,7 @@ async function fetchInboundInvoicesFromEmail() {
             const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').replace('.pdf', '') : `racun_${i}`;
             const fName = `ura_pdf_${Date.now()}_${safeName}`;
             
-            // POPRAVLJENO: Koristimo attachment.content i tip 'image' za PDF
+            // Upload PDF-a
             const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'image');
             
             await pool.query(
@@ -259,7 +258,7 @@ async function fetchInboundInvoicesFromEmail() {
             );
           }
         } else {
-          // POPRAVLJENO: HTML bez .html ekstenzije i s 'auto' tipom
+          // Upload HTML teksta
           const fName = `ura_html_${Date.now()}`; 
           const htmlContent = mail.html || `<div style="padding: 20px; font-family:sans-serif;"><p>${mail.text}</p></div>`;
           
@@ -750,11 +749,9 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           
           await generatePDFInvoice(updatedOrder, invoiceNumber, filePath);
           
-          // POPRAVLJENO: Slanje na Cloudinary umjesto kreiranja lokalnog linka
           const uploadResult = await cloudinary.uploader.upload(filePath, {
             folder: 'kisfaluba_racuni',
-            resource_type: 'image',
-            flags: 'attachment:false'
+            resource_type: 'image'
           });
           const invoiceUrl = uploadResult.secure_url;
           
@@ -949,12 +946,10 @@ app.post('/api/send-ura-storno', async (req, res) => {
     const fPath = path.join(__dirname, 'uploads', `${fileName}.pdf`);
     await generateUraStornoPDF(inv, fPath);
 
-    // POPRAVLJENO: URA Storno isto ide kao image i bez forced downloada
     const uploadResult = await cloudinary.uploader.upload(fPath, {
       folder: 'kisfaluba_ura',
       resource_type: 'image',
-      public_id: fileName,
-      flags: "attachment:false"
+      public_id: fileName
     });
 
     const fileUrl = uploadResult.secure_url;
@@ -1085,11 +1080,9 @@ app.post('/orders', async (req, res) => {
     
     await generatePDFInvoice(orderData, invoiceNumber, filePath);
     
-    // POPRAVLJENO: Narudžbe (Pouzeće) idu direktno na Cloudinary
     const uploadResult = await cloudinary.uploader.upload(filePath, {
       folder: 'kisfaluba_racuni',
-      resource_type: 'image',
-      flags: 'attachment:false'
+      resource_type: 'image'
     });
     const invoiceUrl = uploadResult.secure_url;
     try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
@@ -1164,11 +1157,9 @@ app.patch('/orders/:id/status', async (req, res) => {
       
       await generateStornoPDFInvoice(orderData, originalInvoiceNumber, stornoInvoiceNumber, filePath);
       
-      // POPRAVLJENO: Storno za kupca ide na Cloudinary
       const uploadResult = await cloudinary.uploader.upload(filePath, {
         folder: 'kisfaluba_storno',
-        resource_type: 'image',
-        flags: 'attachment:false'
+        resource_type: 'image'
       });
       const stornoUrl = uploadResult.secure_url;
       try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }

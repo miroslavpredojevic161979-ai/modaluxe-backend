@@ -209,7 +209,6 @@ async function fetchInboundInvoicesFromEmail() {
     for (let item of messages) {
       try {
         const all = item.parts.find(part => part.which === '');
-        // POPRAVLJEN BUG: Više nema idHeader + all.body što je kvarilo PDF zapise!
         const mail = await simpleParser(all.body);
 
         const senderAddress = mail.from && mail.from.value[0] ? mail.from.value[0].address : 'Nepoznato';
@@ -239,7 +238,6 @@ async function fetchInboundInvoicesFromEmail() {
         }
         if (isNaN(extractedAmount)) extractedAmount = 0;
 
-        // Trazimo SVE vrste privitaka koji lice na racun (PDF, JPG, PNG)
         const validAttachments = (mail.attachments || []).filter(attr => 
           attr.contentType === 'application/pdf' || 
           attr.contentType?.startsWith('image/') ||
@@ -252,7 +250,6 @@ async function fetchInboundInvoicesFromEmail() {
             const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').split('.')[0] : `racun_${i}`;
             const fName = `ura_doc_${Date.now()}_${safeName}`;
             
-            // Format PDF će pretvoriti čak i slike iz maila u PDF kako bi ih knjigovođa lako isprintao!
             const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'kisfaluba_ura');
             
             await pool.query(
@@ -890,15 +887,13 @@ app.post('/create-checkout-session', async (req, res) => {
 
 // --- RUTE ZA ULAZNE RAČUNE (URA) ---
 
-// POPRAVLJENO: Knjigovođa ovdje sada sigurno dobiva Storno URL ako postoji!
+// POPRAVLJENO: Pametni linkovi koji rješavaju problem s aplikacijom
 app.get('/inbound-invoices', async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM inbound_invoices ORDER BY id DESC");
     const mapped = result.rows.map(inv => {
-      // Ako je račun storniran, frontend gumb automatski dobiva link od Povratnice
-      if ((inv.status === 'STORNO ARHIVA' || inv.status === 'STORNO') && inv.storno_url) {
-        inv.file_url = inv.storno_url; 
-      }
+      // Umjesto Cloudinary linka, šaljemo "Pametni link" na tvoj server
+      inv.file_url = `https://modaluxe-backend.onrender.com/api/ura-pdf/${inv.id}`;
       return inv;
     });
     res.json(mapped);
@@ -987,7 +982,6 @@ app.post('/api/send-ura-storno', async (req, res) => {
     const stornoUrl = uploadResult.secure_url;
     const stornoNumber = `STORNO-${inv.invoice_number || 'POV'}`;
     
-    // POPRAVLJENO: Pravi se zapis u kolonu storno_url, pa sustav zna što pokazati knjigovođi
     await pool.query(
       'UPDATE inbound_invoices SET status = $1, storno_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
       ['STORNO ARHIVA', stornoUrl, stornoNumber, cleanId]
@@ -1073,13 +1067,16 @@ app.post('/upload', authGuard, upload.single('image'), (req, res) => {
 });
 
 // --- RUTE ZA NARUDŽBE KUPACA ---
+
+// POPRAVLJENO: Pametni linkovi za izlazne račune
 app.get('/all-orders', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM orders ORDER BY id DESC');
     res.json(result.rows.map(o => ({ 
       ...o, 
       items: parseJsonSafe(o.items, []), 
-      invoiceUrl: (o.status === 'REFUND' && o.storno_url) ? o.storno_url : o.invoice_url,
+      // Pametni link za kupce i knjigovođu
+      invoiceUrl: `https://modaluxe-backend.onrender.com/api/order-pdf/${o.id}`,
       storno_url: o.storno_url,
       createdAt: o.created_at, 
       archived: o.archived 
@@ -1306,6 +1303,39 @@ app.get('/payment-success', (req, res) => {
 app.get('/payment-cancel', (req, res) => {
   const isApp = req.query.app === 'true';
   res.send(`<!DOCTYPE html><html lang="hr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Kupnja prekinuta KISFALUBA</title><style>body { margin: 0; background-color: #0a0a0a; height: 100vh; display: flex; justify-content: center; align-items: center; font-family: 'Helvetica Neue', sans-serif; text-align: center; color: #fff;} .content { background: #151515; padding: 40px; border-radius: 8px; border: 1px solid #333; max-width: 400px; width: 85%; } h1 { color: #aaa; font-size: 20px; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px;} p { color: #777; font-size: 15px; margin-bottom: 25px; line-height: 1.5;} .btn { background: #2a2a2a; color: #fff; padding: 14px 30px; border-radius: 4px; text-transform: uppercase; font-size: 13px; font-weight: bold; border: none; cursor: pointer; transition: 0.3s; } .btn:hover { background: #444; }</style></head><body><div class="content"><h1>Kupnja prekinuta</h1><p>Postupak plaćanja je otkazan. Bez brige, Vaša košarica je ostala sačuvana.</p><button class="btn" onclick="goBack()">NAZAD U TRGOVINU</button></div><script>function goBack() { if (${isApp}) { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); } else { window.location.href = "http://localhost:8081"; } }</script></body></html>`);
+});
+
+// --- PAMETNI LINKOVI (REDIREKCIJE) - RJEŠAVAJU PROBLEM STARIH MAILOVA KNJIGOVOĐI ---
+app.get('/api/ura-pdf/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT file_url, storno_url FROM inbound_invoices WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).send('Račun nije pronađen.');
+    const inv = result.rows[0];
+    // Ako postoji storno povratnica, OBAVEZNO preusmjeri na nju!
+    if (inv.storno_url) {
+        res.redirect(inv.storno_url);
+    } else if (inv.file_url) {
+        res.redirect(inv.file_url);
+    } else {
+        res.status(404).send('Nema dokumenta.');
+    }
+  } catch (err) { res.status(500).send('Greška servera.'); }
+});
+
+app.get('/api/order-pdf/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT invoice_url, storno_url FROM orders WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).send('Narudžba nije pronađena.');
+    const o = result.rows[0];
+    // Ako postoji storno račun kupca, OBAVEZNO preusmjeri na njega!
+    if (o.storno_url) {
+        res.redirect(o.storno_url);
+    } else if (o.invoice_url) {
+        res.redirect(o.invoice_url);
+    } else {
+        res.status(404).send('Nema dokumenta.');
+    }
+  } catch (err) { res.status(500).send('Greška servera.'); }
 });
 
 app.get('/', (req, res) => res.send('KISFALUBA Backend Online!'));

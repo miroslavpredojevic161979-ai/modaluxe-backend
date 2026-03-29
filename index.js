@@ -219,8 +219,7 @@ async function fetchInboundInvoicesFromEmail() {
 
         const dateStr = new Date().toLocaleDateString('hr-HR');
         const subject = mail.subject || 'Automatski uvoz iz maila';
-        const baseUrl = process.env.BACKEND_URL || 'http://localhost:10000';
-
+        
         let extractedAmount = 0;
         const textToSearch = (mail.text || '') + ' ' + (mail.html || '');
         
@@ -258,16 +257,38 @@ async function fetchInboundInvoicesFromEmail() {
             );
           }
         } else {
-          // Upload HTML teksta
-          const fName = `ura_html_${Date.now()}`; 
-          const htmlContent = mail.html || `<div style="padding: 20px; font-family:sans-serif;"><p>${mail.text}</p></div>`;
+          // NOVO: Pretvaramo tekst maila u PDF kako bi se normalno otvarao u aplikaciji
+          const fName = `ura_tekst_${Date.now()}`; 
           
-          const uploadResult = await uploadBufferToCloudinary(Buffer.from(htmlContent, 'utf-8'), fName, 'auto');
-          
-          await pool.query(
-            "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
-            [supplierName, 'Iz maila (HTML)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
-          );
+          await new Promise((resolve, reject) => {
+            const chunks = [];
+            const doc = new PDFDocument({ margin: 40, size: 'A4' });
+            
+            doc.on('data', chunk => chunks.push(chunk));
+            doc.on('end', async () => {
+              try {
+                const pdfBuffer = Buffer.concat(chunks);
+                const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image');
+                
+                await pool.query(
+                  "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
+                  [supplierName, 'Iz maila (Tekst)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
+                );
+                resolve();
+              } catch(e) {
+                console.error('Greška pri uploadu teksta maila:', e);
+                resolve(); // Idemo dalje čak i ako pukne
+              }
+            });
+            
+            // Crtamo PDF
+            doc.fontSize(14).font('Helvetica-Bold').fillColor('#dd6b20').text('Sadržaj e-maila (Nema originalnog PDF privitka)', { align: 'center' });
+            doc.moveDown(2);
+            doc.fillColor('#000000');
+            const content = mail.text || subject || 'Ovaj e-mail nema tekstualni sadržaj.';
+            doc.fontSize(10).font('Helvetica').text(fixText(content));
+            doc.end();
+          });
         }
       } catch (singleMailErr) {
         console.error('Greška pri obradi JEDNOG maila:', singleMailErr.message);

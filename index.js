@@ -120,11 +120,17 @@ const upload = multer({
   limits: { fileSize: 5 * 1024 * 1024 }, 
   fileFilter: fileFilter
 });
+
 // Pomoćna funkcija za upload datoteka iz maila direktno na Cloudinary
 const uploadBufferToCloudinary = (buffer, filename, resourceType = 'auto') => {
   return new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
-      { folder: 'kisfaluba_ura', public_id: filename, resource_type: resourceType },
+      { 
+        folder: 'kisfaluba_ura', 
+        public_id: filename, 
+        resource_type: resourceType,
+        flags: "attachment:false" // Ovo osigurava da se otvori u pregledniku
+      },
       (error, result) => {
         if (error) return reject(error);
         resolve(result);
@@ -234,7 +240,7 @@ async function fetchInboundInvoicesFromEmail() {
         }
         if (isNaN(extractedAmount)) extractedAmount = 0;
 
-   const pdfAttachments = (mail.attachments || []).filter(attr => 
+        const pdfAttachments = (mail.attachments || []).filter(attr => 
           attr.contentType === 'application/pdf' || attr.filename?.toLowerCase().endsWith('.pdf')
         );
 
@@ -244,8 +250,8 @@ async function fetchInboundInvoicesFromEmail() {
             const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').replace('.pdf', '') : `racun_${i}`;
             const fName = `ura_pdf_${Date.now()}_${safeName}`;
             
-            // NOVO: Upload direktno na Cloudinary
-            const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'auto');
+            // POPRAVLJENO: Koristimo attachment.content i tip 'image' za PDF
+            const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'image');
             
             await pool.query(
               "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
@@ -253,11 +259,11 @@ async function fetchInboundInvoicesFromEmail() {
             );
           }
         } else {
-          // NOVO: Upload HTML teksta na Cloudinary kao sirovi fajl
-          const fName = `ura_html_${Date.now()}.html`;
+          // POPRAVLJENO: HTML bez .html ekstenzije i s 'auto' tipom
+          const fName = `ura_html_${Date.now()}`; 
           const htmlContent = mail.html || `<div style="padding: 20px; font-family:sans-serif;"><p>${mail.text}</p></div>`;
           
-          const uploadResult = await uploadBufferToCloudinary(Buffer.from(htmlContent, 'utf-8'), fName, 'raw');
+          const uploadResult = await uploadBufferToCloudinary(Buffer.from(htmlContent, 'utf-8'), fName, 'auto');
           
           await pool.query(
             "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
@@ -268,14 +274,13 @@ async function fetchInboundInvoicesFromEmail() {
         console.error('Greška pri obradi JEDNOG maila:', singleMailErr.message);
       }
     }
-    connection.end();
+    if (connection) connection.end();
   } catch (err) {
     console.error('Greška pri spajanju na IMAP:', err.message);
   }
 }
 
 cron.schedule('*/15 * * * *', () => { fetchInboundInvoicesFromEmail(); });
-
 
 // --- GENERIRANJE HTML MAILA ZA KUPCE ---
 const buildInvoiceEmailHtml = ({ orderId, customerName, customerAddress, customerPhone, customerEmail, paymentMethod, items, totalAmount, dateObj, discount }) => {
@@ -312,7 +317,7 @@ const buildInvoiceEmailHtml = ({ orderId, customerName, customerAddress, custome
   return `<div style="font-family: Arial, sans-serif; max-width: 750px; margin: auto; padding: 20px; color: #333; line-height: 1.5; border: 1px solid #eee; border-radius: 5px;"><h2 style="text-align: center; color: #000; margin-bottom: 20px; font-size: 22px;">KISFALUBA</h2><p style="font-size: 13px;">Poštovani/a <b>${escapeHtml(customerName)}</b>,</p><p style="font-size: 13px;">Hvala Vam na kupnji! Vaša narudžba je uspješno zaprimljena i u pripremi je za slanje.</p><h3 style="border-bottom: 2px solid #000; padding-bottom: 5px; margin-top: 30px; font-size: 15px;">Detalji narudžbe</h3><table style="width: 100%; border-collapse: collapse; margin-bottom: 10px; font-size: 13px;"><thead><tr style="background-color: #fafafa;"><th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Artikl</th><th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Količina</th><th style="padding: 10px; border: 1px solid #ddd; text-align: right;">Cijena (EUR)</th></tr></thead><tbody>${table1Rows}</tbody></table>${discountHtml}<div style="text-align: right; margin-top: 15px;"><span style="font-size: 15px;">UKUPNO ZA PLATITI: <b>${Number(totalAmount).toFixed(2)} EUR</b></span><br><span style="font-size: 11px; color: #666;">Društvo nije u sustavu PDV-a. PDV nije obračunan.</span></div><h3 style="border-bottom: 2px solid #000; padding-bottom: 5px; margin-top: 30px; font-size: 15px;">Podaci za dostavu</h3><p style="font-size: 13px; margin: 0; line-height: 1.6;">${escapeHtml(customerName)}<br>${escapeHtml(customerAddress)}<br>Telefon: ${escapeHtml(customerPhone)}<br>E-mail: ${escapeHtml(customerEmail)}</p><h3 style="text-align: center; margin-top: 50px; margin-bottom: 20px; font-size: 16px;">RAČUN</h3><p style="font-size: 13px; margin: 0 0 25px 0; line-height: 1.6;"><b>KIŠFALUBA j.d.o.o.</b><br>Zagorska ulica 40, 31300 Branjina, Republika Hrvatska<br>OIB: 82125639708 | MBS: 5990572<br>Trgovački sud u Osijeku<br>Temeljni kapital: 10,00 EUR, uplaćen u cijelosti</p><table style="font-size: 13px; margin-bottom: 25px; width: 100%; border: none; line-height: 1.8;"><tr><td style="width: 140px; font-weight: bold;">Broj računa:</td><td>${invoiceNumber}</td></tr><tr><td style="font-weight: bold;">Datum izdavanja:</td><td>${dateStr}</td></tr><tr><td style="font-weight: bold;">Vrijeme izdavanja:</td><td>${timeStr}</td></tr><tr><td style="font-weight: bold;">Mjesto izdavanja:</td><td>Branjina, Republika Hrvatska</td></tr><tr><td style="font-weight: bold;">Kupac:</td><td>${escapeHtml(customerName)}</td></tr><tr><td style="font-weight: bold;">Adresa kupca:</td><td>${escapeHtml(customerAddress)}</td></tr><tr><td style="font-weight: bold;">Način plaćanja:</td><td>${paymentMethod}</td></tr></table><table style="width: 100%; border-collapse: collapse; margin-bottom: 10px; font-size: 13px;"><thead><tr style="background-color: #fafafa;"><th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Redni broj</th><th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Opis proizvoda</th><th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Količina</th><th style="padding: 10px; border: 1px solid #ddd; text-align: right;">Jedinična cijena (EUR)</th><th style="padding: 10px; border: 1px solid #ddd; text-align: right;">Ukupno (EUR)</th></tr></thead><tbody>${table2Rows}</tbody></table>${discountHtml}<div style="text-align: right; margin-top: 20px; margin-bottom: 40px;"><span style="font-size: 15px;">Ukupan iznos za plaćanje: <b>${Number(totalAmount).toFixed(2)} EUR</b></span></div><div style="text-align: center; font-size: 11px; color: #555; border-top: 1px dotted #ccc; padding-top: 20px; line-height: 1.6;"><p style="margin: 2px 0;">Društvo nije u sustavu poreza na dodanu vrijednost (PDV).</p><p style="margin: 2px 0;">Sukladno važećim poreznim propisima, PDV nije obračunan.</p><br><p style="margin: 2px 0;">Ovaj račun izdan je u elektroničkom obliku i vrijedi bez potpisa i pečata.</p><p style="margin: 2px 0;">Za sva pitanja ili reklamacije obratite se na naš kontakt e-mail: info@kisfaluba.hr</p></div></div>`;
 };
 
-// --- PDF GENERATORI (Sa ispravnim crtanjem linija) ---
+// --- PDF GENERATORI ---
 
 const generatePDFInvoice = (orderData, invoiceNumber, filePath) => {
   return new Promise((resolve, reject) => {
@@ -717,7 +722,6 @@ const generateUraStornoPDF = (inv, filePath) => {
 };
 
 // --- WEBHOOK ---
-// Mora biti iznad express.json() jer Stripe zahtijeva raw body
 app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -746,9 +750,15 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           
           await generatePDFInvoice(updatedOrder, invoiceNumber, filePath);
           
-          const secret = process.env.INVOICE_SECRET;
-          const token = crypto.createHmac('sha256', secret).update(fileName).digest('hex');
-          const invoiceUrl = `${req.protocol}://${req.get('host')}/racun/${fileName}?token=${token}`;
+          // POPRAVLJENO: Slanje na Cloudinary umjesto kreiranja lokalnog linka
+          const uploadResult = await cloudinary.uploader.upload(filePath, {
+            folder: 'kisfaluba_racuni',
+            resource_type: 'image',
+            flags: 'attachment:false'
+          });
+          const invoiceUrl = uploadResult.secure_url;
+          
+          try { fs.unlinkSync(filePath); } catch (e) { console.error('Brisanje lokalnog fajla propalo:', e); }
           
           await pool.query(
             "UPDATE orders SET invoice_url = $1 WHERE id = $2",
@@ -935,28 +945,26 @@ app.post('/api/send-ura-storno', async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({error: 'Račun nije pronađen'});
     const inv = result.rows[0];
 
-  // 1. Generiraj PDF lokalno (privremeno za slanje maila)
     const fileName = `ura_storno_${cleanId}_${Date.now()}`;
     const fPath = path.join(__dirname, 'uploads', `${fileName}.pdf`);
     await generateUraStornoPDF(inv, fPath);
 
-    // 2. NOVO: Pošalji generirani PDF na Cloudinary za trajno čuvanje
+    // POPRAVLJENO: URA Storno isto ide kao image i bez forced downloada
     const uploadResult = await cloudinary.uploader.upload(fPath, {
       folder: 'kisfaluba_ura',
-      resource_type: 'auto',
-      public_id: fileName
+      resource_type: 'image',
+      public_id: fileName,
+      flags: "attachment:false"
     });
 
     const fileUrl = uploadResult.secure_url;
     const stornoNumber = `STORNO-${inv.invoice_number || 'POV'}`;
     
-    // 3. Ažuriraj bazu s Cloudinary linkom
     await pool.query(
       'UPDATE inbound_invoices SET status = $1, file_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
       ['STORNO ARHIVA', fileUrl, stornoNumber, cleanId]
     );
 
-    // 4. Pošalji mail dobavljaču s lokalnim fajlom
     if (supplierEmail && supplierEmail.includes('@')) {
       const mailOptions = {
         from: process.env.EMAIL_USER,
@@ -968,7 +976,6 @@ app.post('/api/send-ura-storno', async (req, res) => {
       await transporter.sendMail(mailOptions);
     }
 
-    // 5. Obriši privremeni lokalni fajl da ne zauzima prostor na serveru
     try { fs.unlinkSync(fPath); } catch (e) { console.error("Brisanje temp fajla nije uspjelo:", e); }
 
     res.json({ success: true, message: 'Storno uspješno generiran i poslan!', fileUrl: fileUrl });
@@ -1034,7 +1041,6 @@ app.delete('/products/:id', authGuard, async (req, res) => {
 
 app.post('/upload', authGuard, upload.single('image'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Nema fajla za upload' });
-  // Cloudinary nam odmah daje gotov, siguran link za sliku
   res.json({ imageUrl: req.file.path });
 });
 
@@ -1072,14 +1078,21 @@ app.post('/orders', async (req, res) => {
     const orderData = newOrder.rows[0];
     const orderId = orderData.id;
     await deductStock(normalizedItems);
+    
     const invoiceNumber = invoiceNumberFromOrderId(orderId);
     const fileName = `racun_${orderId}_${Date.now()}.pdf`;
     const filePath = path.join(__dirname, 'uploads', fileName);
+    
     await generatePDFInvoice(orderData, invoiceNumber, filePath);
     
-    const secret = process.env.INVOICE_SECRET;
-    const token = crypto.createHmac('sha256', secret).update(fileName).digest('hex');
-    const invoiceUrl = `${req.protocol}://${req.get('host')}/racun/${fileName}?token=${token}`;
+    // POPRAVLJENO: Narudžbe (Pouzeće) idu direktno na Cloudinary
+    const uploadResult = await cloudinary.uploader.upload(filePath, {
+      folder: 'kisfaluba_racuni',
+      resource_type: 'image',
+      flags: 'attachment:false'
+    });
+    const invoiceUrl = uploadResult.secure_url;
+    try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
     
     await pool.query('UPDATE orders SET invoice_url = $1 WHERE id = $2', [invoiceUrl, orderId]);
     orderData.invoice_url = invoiceUrl;
@@ -1151,9 +1164,14 @@ app.patch('/orders/:id/status', async (req, res) => {
       
       await generateStornoPDFInvoice(orderData, originalInvoiceNumber, stornoInvoiceNumber, filePath);
       
-      const secret = process.env.INVOICE_SECRET;
-      const token = crypto.createHmac('sha256', secret).update(fileName).digest('hex');
-      const stornoUrl = `${req.protocol}://${req.get('host')}/racun/${fileName}?token=${token}`;
+      // POPRAVLJENO: Storno za kupca ide na Cloudinary
+      const uploadResult = await cloudinary.uploader.upload(filePath, {
+        folder: 'kisfaluba_storno',
+        resource_type: 'image',
+        flags: 'attachment:false'
+      });
+      const stornoUrl = uploadResult.secure_url;
+      try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
       
       await pool.query('UPDATE orders SET storno_url = $1, archived = false WHERE id = $2', [stornoUrl, orderId]);
       
@@ -1316,7 +1334,6 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/racun/:filename', (req, res) => {
   try {
     const filename = req.params.filename;
-    // Opcionalno možeš vratiti validaciju ovdje ako želiš zaštitu tokenom
     const filePath = path.join(__dirname, 'uploads', filename);
     if (!fs.existsSync(filePath)) return res.status(404).send('Račun nije pronaden.');
     res.sendFile(filePath);

@@ -40,6 +40,7 @@ const initDB = async () => {
   try {
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'DOLAZNI'");
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
+    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)"); // NOVA KOLONA ZA URA STORNO
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount JSONB DEFAULT '{\"amount\": 0}'::jsonb");
@@ -53,7 +54,7 @@ const initDB = async () => {
         name VARCHAR(255) NOT NULL
       );
     `);
-    console.log("Baza podataka (kolone i tablice) uspješno sinkronizirana.");
+    console.log("Baza podataka uspješno sinkronizirana (s novim kolonama za Storno).");
   } catch (err) {
     console.error("Greška pri sinkronizaciji baze:", err.message);
   }
@@ -121,14 +122,15 @@ const upload = multer({
   fileFilter: fileFilter
 });
 
-// Pomoćna funkcija za upload datoteka iz maila direktno na Cloudinary
-const uploadBufferToCloudinary = (buffer, filename, resourceType = 'auto') => {
+// SIGURNI CLOUDINARY UPLOAD ZA PDF-ove
+const uploadBufferToCloudinary = (buffer, filename, folder) => {
   return new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
       { 
-        folder: 'kisfaluba_ura', 
+        folder: folder, 
         public_id: filename, 
-        resource_type: resourceType // Ovdje se sada uvijek šalje 'auto' za PDF-ove
+        resource_type: 'image', // Mora biti image da bi Cloudinary dozvolio prikaz!
+        format: 'pdf' // Prisiljavamo ga da bude PDF
       },
       (error, result) => {
         if (error) return reject(error);
@@ -181,7 +183,7 @@ const deductStock = async (items) => {
   }
 };
 
-// --- AUTOMATSKO ČITANJE MAILOVA (URA) ---
+// --- AUTOMATSKO ČITANJE MAILOVA (URA) POPRAVLJENO! ---
 async function fetchInboundInvoicesFromEmail() {
   const config = {
     imap: {
@@ -207,9 +209,8 @@ async function fetchInboundInvoicesFromEmail() {
     for (let item of messages) {
       try {
         const all = item.parts.find(part => part.which === '');
-        const id = item.attributes.uid;
-        const idHeader = "Imap-Id: " + id + "\r\n";
-        const mail = await simpleParser(idHeader + all.body);
+        // POPRAVLJEN BUG: Više nema idHeader + all.body što je kvarilo PDF zapise!
+        const mail = await simpleParser(all.body);
 
         const senderAddress = mail.from && mail.from.value[0] ? mail.from.value[0].address : 'Nepoznato';
         const supplierName = (mail.from && mail.from.value[0].name) ? mail.from.value[0].name : senderAddress;
@@ -238,22 +239,25 @@ async function fetchInboundInvoicesFromEmail() {
         }
         if (isNaN(extractedAmount)) extractedAmount = 0;
 
-        const pdfAttachments = (mail.attachments || []).filter(attr => 
-          attr.contentType === 'application/pdf' || attr.filename?.toLowerCase().endsWith('.pdf')
+        // Trazimo SVE vrste privitaka koji lice na racun (PDF, JPG, PNG)
+        const validAttachments = (mail.attachments || []).filter(attr => 
+          attr.contentType === 'application/pdf' || 
+          attr.contentType?.startsWith('image/') ||
+          attr.filename?.toLowerCase().match(/\.(pdf|jpg|jpeg|png)$/)
         );
 
-        if (pdfAttachments.length > 0) {
-          for (let i = 0; i < pdfAttachments.length; i++) {
-            const attachment = pdfAttachments[i];
-            const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').replace('.pdf', '') : `racun_${i}`;
-            const fName = `ura_pdf_${Date.now()}_${safeName}`;
+        if (validAttachments.length > 0) {
+          for (let i = 0; i < validAttachments.length; i++) {
+            const attachment = validAttachments[i];
+            const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').split('.')[0] : `racun_${i}`;
+            const fName = `ura_doc_${Date.now()}_${safeName}`;
             
-            // OVDJE JE POPRAVLJENO ('auto' umjesto 'image')
-            const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'auto');
+            // Format PDF će pretvoriti čak i slike iz maila u PDF kako bi ih knjigovođa lako isprintao!
+            const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'kisfaluba_ura');
             
             await pool.query(
               "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
-              [supplierName, 'Iz maila (PDF)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
+              [supplierName, 'Dokument iz maila', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
             );
           }
         } else {
@@ -267,8 +271,7 @@ async function fetchInboundInvoicesFromEmail() {
             doc.on('end', async () => {
               try {
                 const pdfBuffer = Buffer.concat(chunks);
-                // OVDJE JE POPRAVLJENO ('auto' umjesto 'image')
-                const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'auto');
+                const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'kisfaluba_ura');
                 
                 await pool.query(
                   "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
@@ -768,10 +771,10 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           
           await generatePDFInvoice(updatedOrder, invoiceNumber, filePath);
           
-          // OVDJE JE POPRAVLJENO ('auto' umjesto 'image')
           const uploadResult = await cloudinary.uploader.upload(filePath, {
             folder: 'kisfaluba_racuni',
-            resource_type: 'auto'
+            resource_type: 'image',
+            format: 'pdf'
           });
           const invoiceUrl = uploadResult.secure_url;
           
@@ -886,16 +889,25 @@ app.post('/create-checkout-session', async (req, res) => {
 });
 
 // --- RUTE ZA ULAZNE RAČUNE (URA) ---
-app.post('/inbound-invoices/fetch-email', (req, res) => {
-  res.json({ success: true, message: 'Provjera pošte je pokrenuta.' });
-  fetchInboundInvoicesFromEmail().catch(err => console.error(err));
-});
 
+// POPRAVLJENO: Knjigovođa ovdje sada sigurno dobiva Storno URL ako postoji!
 app.get('/inbound-invoices', async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM inbound_invoices ORDER BY id DESC");
-    res.json(result.rows);
+    const mapped = result.rows.map(inv => {
+      // Ako je račun storniran, frontend gumb automatski dobiva link od Povratnice
+      if ((inv.status === 'STORNO ARHIVA' || inv.status === 'STORNO') && inv.storno_url) {
+        inv.file_url = inv.storno_url; 
+      }
+      return inv;
+    });
+    res.json(mapped);
   } catch (err) { res.status(500).json({ error: "Greška servera" }); }
+});
+
+app.post('/inbound-invoices/fetch-email', (req, res) => {
+  res.json({ success: true, message: 'Provjera pošte je pokrenuta.' });
+  fetchInboundInvoicesFromEmail().catch(err => console.error(err));
 });
 
 app.post('/inbound-invoices', async (req, res) => {
@@ -966,19 +978,19 @@ app.post('/api/send-ura-storno', async (req, res) => {
     const fPath = path.join(__dirname, 'uploads', `${fileName}.pdf`);
     await generateUraStornoPDF(inv, fPath);
 
-    // OVDJE JE POPRAVLJENO ('auto' umjesto 'image')
     const uploadResult = await cloudinary.uploader.upload(fPath, {
       folder: 'kisfaluba_ura',
-      resource_type: 'auto',
-      public_id: fileName
+      resource_type: 'image',
+      format: 'pdf'
     });
 
-    const fileUrl = uploadResult.secure_url;
+    const stornoUrl = uploadResult.secure_url;
     const stornoNumber = `STORNO-${inv.invoice_number || 'POV'}`;
     
+    // POPRAVLJENO: Pravi se zapis u kolonu storno_url, pa sustav zna što pokazati knjigovođi
     await pool.query(
-      'UPDATE inbound_invoices SET status = $1, file_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
-      ['STORNO ARHIVA', fileUrl, stornoNumber, cleanId]
+      'UPDATE inbound_invoices SET status = $1, storno_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
+      ['STORNO ARHIVA', stornoUrl, stornoNumber, cleanId]
     );
 
     if (supplierEmail && supplierEmail.includes('@')) {
@@ -992,9 +1004,9 @@ app.post('/api/send-ura-storno', async (req, res) => {
       await transporter.sendMail(mailOptions);
     }
 
-    try { fs.unlinkSync(fPath); } catch (e) { console.error("Brisanje temp fajla nije uspjelo:", e); }
+    try { fs.unlinkSync(fPath); } catch (e) { }
 
-    res.json({ success: true, message: 'Storno uspješno generiran i poslan!', fileUrl: fileUrl });
+    res.json({ success: true, message: 'Storno uspješno generiran i poslan!', fileUrl: stornoUrl });
 
   } catch (error) {
     console.error('Greška pri storniranju:', error);
@@ -1060,9 +1072,7 @@ app.post('/upload', authGuard, upload.single('image'), (req, res) => {
   res.json({ imageUrl: req.file.path });
 });
 
-// --- RUTE ZA NARUDŽBE ---
-
-// OVDJE JE POPRAVLJENO DA KNJIGOVOĐA UVIJEK VIDI STORNO AKO POSTOJI
+// --- RUTE ZA NARUDŽBE KUPACA ---
 app.get('/all-orders', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM orders ORDER BY id DESC');
@@ -1082,74 +1092,6 @@ app.get('/orders', async (req, res) => {
     const result = await pool.query('SELECT * FROM orders ORDER BY id DESC');
     res.json(result.rows.map(o => ({ ...o, items: parseJsonSafe(o.items, []), })));
   } catch (err) { res.status(500).json({ error: 'Greška' }); }
-});
-
-app.post('/orders', async (req, res) => {
-  try {
-    const { name, address, phone, total, items, email, discount } = req.body; 
-    const normalizedItems = parseJsonSafe(items, []);
-    const totalAmount = Number((Number.isFinite(Number(total)) ? Number(total) : calcTotals(normalizedItems)).toFixed(2));
-    const newOrder = await pool.query(
-      'INSERT INTO orders (name, address, phone, email, total, items, status, discount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [name || 'Nepoznat', address || '', phone || '', email || '', totalAmount, JSON.stringify(normalizedItems), 'NEW', JSON.stringify(discount || { amount: 0 })]
-    );
-    const orderData = newOrder.rows[0];
-    const orderId = orderData.id;
-    await deductStock(normalizedItems);
-    
-    const invoiceNumber = invoiceNumberFromOrderId(orderId);
-    const fileName = `racun_${orderId}_${Date.now()}.pdf`;
-    const filePath = path.join(__dirname, 'uploads', fileName);
-    
-    await generatePDFInvoice(orderData, invoiceNumber, filePath);
-    
-    // OVDJE JE POPRAVLJENO ('auto' umjesto 'image')
-    const uploadResult = await cloudinary.uploader.upload(filePath, {
-      folder: 'kisfaluba_racuni',
-      resource_type: 'auto'
-    });
-    const invoiceUrl = uploadResult.secure_url;
-    try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
-    
-    await pool.query('UPDATE orders SET invoice_url = $1 WHERE id = $2', [invoiceUrl, orderId]);
-    orderData.invoice_url = invoiceUrl;
-    
-    if (email) {
-      transporter.sendMail({
-        from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
-        to: email,
-        subject: `Račun i potvrda narudžbe KISFALUBA (${invoiceNumber})`,
-        html: buildInvoiceEmailHtml({
-          orderId: orderId, customerName: name, customerAddress: address,
-          customerPhone: phone, customerEmail: email, paymentMethod: 'Pouzeće',
-          items: normalizedItems, totalAmount: totalAmount, dateObj: orderData.created_at,
-          discount: discount 
-        })
-      }).catch(e => console.error('X Greška slanja računa:', e));
-    }
-    res.json({ message: 'Narudžba uspješna!', order: orderData });
-  } catch (err) { res.status(500).json({ error: 'Greška pri spremanju.' }); }
-});
-
-app.post('/orders/archive', async (req, res) => {
-  try {
-    const { orderIds } = req.body;
-    if (!orderIds || !Array.isArray(orderIds) || orderIds.length === 0) return res.json({ success: true, message: 'Nema narudžbi.' });
-    
-    const cleanIds = orderIds.map(id => parseInt(String(id).split('-')[0], 10)).filter(id => !isNaN(id));
-    if(cleanIds.length === 0) return res.json({ success: true });
-
-    await pool.query('UPDATE orders SET archived = true WHERE id = ANY($1::int[])', [cleanIds]);
-    res.json({ success: true, message: 'Arhivirano.' });
-  } catch (err) { res.status(500).json({ error: 'Greška u bazi.' }); }
-});
-
-app.delete('/orders/:id', authGuard, async (req, res) => {
-  try {
-    const id = String(req.params.id).split('-')[0];
-    await pool.query('DELETE FROM orders WHERE id = $1', [id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Greška u bazi.' }); }
 });
 
 app.patch('/orders/:id/status', async (req, res) => {
@@ -1181,10 +1123,10 @@ app.patch('/orders/:id/status', async (req, res) => {
       
       await generateStornoPDFInvoice(orderData, originalInvoiceNumber, stornoInvoiceNumber, filePath);
       
-      // OVDJE JE POPRAVLJENO ('auto' umjesto 'image')
       const uploadResult = await cloudinary.uploader.upload(filePath, {
         folder: 'kisfaluba_storno',
-        resource_type: 'auto'
+        resource_type: 'image',
+        format: 'pdf'
       });
       const stornoUrl = uploadResult.secure_url;
       try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }

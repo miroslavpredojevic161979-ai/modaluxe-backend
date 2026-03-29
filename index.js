@@ -920,13 +920,46 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
     const { status } = req.body;
     const id = String(req.params.id).split('-')[0];
 
-    if (status === 'ARHIVIRANI' || status === 'STORNO ARHIVA') {
+    const invRes = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
+    if (invRes.rows.length === 0) return res.status(404).json({ error: 'Nije nađeno' });
+    const inv = invRes.rows[0];
+
+    // PRO NIVO: Crtamo povratnicu u trenutku kada kliknemo "POVRAT ROBE (STORNO)"
+    if (status === 'POVRATI') {
+        if (!inv.storno_url) {
+            const fileName = `ura_storno_${id}_${Date.now()}`;
+            const fPath = path.join(__dirname, 'uploads', `${fileName}.pdf`);
+
+            // Fizički crtamo PDF
+            await generateUraStornoPDF(inv, fPath);
+
+            // Šaljemo u oblak
+            const uploadResult = await cloudinary.uploader.upload(fPath, {
+              folder: 'kisfaluba_ura',
+              resource_type: 'image',
+              format: 'pdf'
+            });
+
+            const stornoUrl = uploadResult.secure_url;
+            const stornoNumber = `STORNO-${inv.invoice_number || 'POV'}`;
+
+            // Ažuriramo bazu s novim linkom i statusom
+            await pool.query(
+              'UPDATE inbound_invoices SET status = $1, storno_url = $2, file_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
+              [status, stornoUrl, stornoNumber, id]
+            );
+            
+            try { fs.unlinkSync(fPath); } catch(e){}
+        } else {
+            await pool.query('UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2', [status, id]);
+        }
+    } 
+    else if (status === 'ARHIVIRANI' || status === 'STORNO ARHIVA') {
         await pool.query('UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2', [status, id]);
-    } else if (status === 'POVRATI') {
-        await pool.query('UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2', [status, id]);
     } else {
         await pool.query('UPDATE inbound_invoices SET status = $1 WHERE id = $2', [status, id]);
     }
+    
     res.json({ success: true });
   } catch (err) { 
     console.error(err);
@@ -968,52 +1001,26 @@ app.post('/api/send-ura-storno', async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({error: 'Račun nije pronađen'});
     const inv = result.rows[0];
 
-    // OVO JE KLJUČNA ZAŠTITA OD DUPLIKATA:
-    if (inv.status === 'STORNO ARHIVA' || (inv.invoice_number && inv.invoice_number.startsWith('STORNO-'))) {
-        return res.json({ 
-            success: true, 
-            message: 'Ovaj račun je već storniran! Molimo osvježite aplikaciju.', 
-            fileUrl: inv.storno_url || inv.file_url 
-        });
+    // Sustav sada ZNA da dokument mora već postojati
+    if (!inv.storno_url) {
+        return res.status(400).json({ error: 'Storno dokument još nije generiran! Pokušajte osvježiti aplikaciju.' });
     }
-
-    const fileName = `ura_storno_${cleanId}_${Date.now()}`;
-    const fPath = path.join(__dirname, 'uploads', `${fileName}.pdf`);
-    await generateUraStornoPDF(inv, fPath);
-
-    const uploadResult = await cloudinary.uploader.upload(fPath, {
-      folder: 'kisfaluba_ura',
-      resource_type: 'image',
-      format: 'pdf'
-    });
-
-    const stornoUrl = uploadResult.secure_url;
-    const stornoNumber = `STORNO-${inv.invoice_number || 'POV'}`;
-    
-    // ZADRŽAVAMO STATUS 'POVRATI' KAKO RAČUN NE BI POBJEGAO S EKRANA!
-    await pool.query(
-      'UPDATE inbound_invoices SET status = $1, file_url = $2, storno_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
-      ['POVRATI', stornoUrl, stornoNumber, cleanId]
-    );
 
     if (supplierEmail && supplierEmail.includes('@')) {
       const mailOptions = {
         from: process.env.EMAIL_USER,
         to: supplierEmail,
-        subject: `Storno / Povratnica - ${stornoNumber}`,
-        html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU</h2><p>Poštovani,</p><p>U privitku Vam dostavljamo službeni storno dokument za povrat robe.</p></div>`,
-        attachments: [{ filename: `${stornoNumber}.pdf`, path: fPath }]
+        subject: `Povratnica / Storno - ${inv.invoice_number}`,
+        html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU ROBE</h2><p>Poštovani,</p><p>U privitku Vam dostavljamo službeni storno dokument za povrat robe.</p><p><a href="${inv.storno_url}">Preuzmite dokument ovdje</a></p></div>`
       };
       await transporter.sendMail(mailOptions);
     }
 
-    try { fs.unlinkSync(fPath); } catch (e) { }
-
-    res.json({ success: true, message: 'Storno uspješno generiran i poslan!', fileUrl: stornoUrl });
+    res.json({ success: true, message: 'Storno mail uspješno poslan!', fileUrl: inv.storno_url });
 
   } catch (error) {
-    console.error('Greška pri storniranju:', error);
-    res.status(500).json({ error: 'Greška servera.' });
+    console.error('Greška pri slanju:', error);
+    res.status(500).json({ error: 'Greška servera pri slanju maila.' });
   }
 });
 

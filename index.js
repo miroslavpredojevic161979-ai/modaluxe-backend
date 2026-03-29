@@ -129,8 +129,7 @@ const uploadBufferToCloudinary = (buffer, filename, folder) => {
       { 
         folder: folder, 
         public_id: filename, 
-        resource_type: 'image', 
-        format: 'pdf' 
+        resource_type: 'auto' // POPRAVLJENO: auto dozvoljava siguran prolaz PDF-a
       },
       (error, result) => {
         if (error) return reject(error);
@@ -769,8 +768,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           
           const uploadResult = await cloudinary.uploader.upload(filePath, {
             folder: 'kisfaluba_racuni',
-            resource_type: 'image',
-            format: 'pdf'
+            resource_type: 'auto' // POPRAVLJENO
           });
           const invoiceUrl = uploadResult.secure_url;
           
@@ -890,8 +888,6 @@ app.get('/inbound-invoices', async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM inbound_invoices ORDER BY id DESC");
     const mapped = result.rows.map(inv => {
-      // Pametni link: mobitel dobije ovaj URL i njega trajno koristi, a server će preusmjeriti 
-      // na Storno ako on postoji, inače na obični račun.
       inv.file_url = `https://modaluxe-backend.onrender.com/api/ura-pdf/${inv.id}`;
       return inv;
     });
@@ -919,13 +915,14 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
   try {
     const { status } = req.body;
     const id = String(req.params.id).split('-')[0];
+    const cleanStatus = status ? status.trim() : '';
 
     const invRes = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
     if (invRes.rows.length === 0) return res.status(404).json({ error: 'Nije nađeno' });
     const inv = invRes.rows[0];
 
     // PRO NIVO: Crtamo povratnicu u trenutku kada kliknemo "POVRAT ROBE (STORNO)"
-    if (status === 'POVRATI') {
+    if (cleanStatus === 'POVRATI') {
         if (!inv.storno_url) {
             const fileName = `ura_storno_${id}_${Date.now()}`;
             const fPath = path.join(__dirname, 'uploads', `${fileName}.pdf`);
@@ -933,37 +930,36 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
             // Fizički crtamo PDF
             await generateUraStornoPDF(inv, fPath);
 
-            // Šaljemo u oblak
+            // Šaljemo u oblak (POPRAVLJENO: resource_type: auto)
             const uploadResult = await cloudinary.uploader.upload(fPath, {
               folder: 'kisfaluba_ura',
-              resource_type: 'image',
-              format: 'pdf'
+              resource_type: 'auto' 
             });
 
             const stornoUrl = uploadResult.secure_url;
-            const stornoNumber = `STORNO-${inv.invoice_number || 'POV'}`;
+            const stornoNumber = inv.invoice_number?.startsWith('STORNO') ? inv.invoice_number : `STORNO-${inv.invoice_number || 'POV'}`;
 
             // Ažuriramo bazu s novim linkom i statusom
             await pool.query(
               'UPDATE inbound_invoices SET status = $1, storno_url = $2, file_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
-              [status, stornoUrl, stornoNumber, id]
+              [cleanStatus, stornoUrl, stornoNumber, id]
             );
             
             try { fs.unlinkSync(fPath); } catch(e){}
         } else {
-            await pool.query('UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2', [status, id]);
+            await pool.query('UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2', [cleanStatus, id]);
         }
     } 
-    else if (status === 'ARHIVIRANI' || status === 'STORNO ARHIVA') {
-        await pool.query('UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2', [status, id]);
+    else if (cleanStatus === 'ARHIVIRANI' || cleanStatus === 'STORNO ARHIVA') {
+        await pool.query('UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2', [cleanStatus, id]);
     } else {
-        await pool.query('UPDATE inbound_invoices SET status = $1 WHERE id = $2', [status, id]);
+        await pool.query('UPDATE inbound_invoices SET status = $1 WHERE id = $2', [cleanStatus, id]);
     }
     
     res.json({ success: true });
   } catch (err) { 
-    console.error(err);
-    res.status(500).json({ error: 'Greška u bazi.' }); 
+    console.error("GREŠKA U PATCH STATUS:", err);
+    res.status(500).json({ error: 'Greška u bazi: ' + err.message }); 
   }
 });
 
@@ -1136,8 +1132,7 @@ app.patch('/orders/:id/status', async (req, res) => {
       
       const uploadResult = await cloudinary.uploader.upload(filePath, {
         folder: 'kisfaluba_storno',
-        resource_type: 'image',
-        format: 'pdf'
+        resource_type: 'auto' // POPRAVLJENO
       });
       const stornoUrl = uploadResult.secure_url;
       try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }

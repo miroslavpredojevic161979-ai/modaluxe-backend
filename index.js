@@ -40,7 +40,7 @@ const initDB = async () => {
   try {
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'DOLAZNI'");
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
-    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)"); // NOVA KOLONA ZA URA STORNO
+    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount JSONB DEFAULT '{\"amount\": 0}'::jsonb");
@@ -54,7 +54,7 @@ const initDB = async () => {
         name VARCHAR(255) NOT NULL
       );
     `);
-    console.log("Baza podataka uspješno sinkronizirana (s novim kolonama za Storno).");
+    console.log("Baza podataka uspješno sinkronizirana.");
   } catch (err) {
     console.error("Greška pri sinkronizaciji baze:", err.message);
   }
@@ -129,8 +129,8 @@ const uploadBufferToCloudinary = (buffer, filename, folder) => {
       { 
         folder: folder, 
         public_id: filename, 
-        resource_type: 'image', // Mora biti image da bi Cloudinary dozvolio prikaz!
-        format: 'pdf' // Prisiljavamo ga da bude PDF
+        resource_type: 'image', 
+        format: 'pdf' 
       },
       (error, result) => {
         if (error) return reject(error);
@@ -183,7 +183,7 @@ const deductStock = async (items) => {
   }
 };
 
-// --- AUTOMATSKO ČITANJE MAILOVA (URA) POPRAVLJENO! ---
+// --- AUTOMATSKO ČITANJE MAILOVA (URA) ---
 async function fetchInboundInvoicesFromEmail() {
   const config = {
     imap: {
@@ -214,7 +214,6 @@ async function fetchInboundInvoicesFromEmail() {
         const senderAddress = mail.from && mail.from.value[0] ? mail.from.value[0].address : 'Nepoznato';
         const supplierName = (mail.from && mail.from.value[0].name) ? mail.from.value[0].name : senderAddress;
         
-        // Blokiramo ulaz mailova koje webshop sam sebi pošalje
         if (senderAddress.toLowerCase() === process.env.EMAIL_USER.toLowerCase()) continue; 
 
         const dateStr = new Date().toLocaleDateString('hr-HR');
@@ -887,12 +886,12 @@ app.post('/create-checkout-session', async (req, res) => {
 
 // --- RUTE ZA ULAZNE RAČUNE (URA) ---
 
-// POPRAVLJENO: Pametni linkovi koji rješavaju problem s aplikacijom
 app.get('/inbound-invoices', async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM inbound_invoices ORDER BY id DESC");
     const mapped = result.rows.map(inv => {
-      // Umjesto Cloudinary linka, šaljemo "Pametni link" na tvoj server
+      // Pametni link: mobitel dobije ovaj URL i njega trajno koristi, a server će preusmjeriti 
+      // na Storno ako on postoji, inače na obični račun.
       inv.file_url = `https://modaluxe-backend.onrender.com/api/ura-pdf/${inv.id}`;
       return inv;
     });
@@ -969,6 +968,15 @@ app.post('/api/send-ura-storno', async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({error: 'Račun nije pronađen'});
     const inv = result.rows[0];
 
+    // OVO JE KLJUČNA ZAŠTITA OD DUPLIKATA:
+    if (inv.status === 'STORNO ARHIVA' || (inv.invoice_number && inv.invoice_number.startsWith('STORNO-'))) {
+        return res.json({ 
+            success: true, 
+            message: 'Ovaj račun je već storniran! Molimo osvježite aplikaciju.', 
+            fileUrl: inv.storno_url || inv.file_url 
+        });
+    }
+
     const fileName = `ura_storno_${cleanId}_${Date.now()}`;
     const fPath = path.join(__dirname, 'uploads', `${fileName}.pdf`);
     await generateUraStornoPDF(inv, fPath);
@@ -982,9 +990,10 @@ app.post('/api/send-ura-storno', async (req, res) => {
     const stornoUrl = uploadResult.secure_url;
     const stornoNumber = `STORNO-${inv.invoice_number || 'POV'}`;
     
+    // ZADRŽAVAMO STATUS 'POVRATI' KAKO RAČUN NE BI POBJEGAO S EKRANA!
     await pool.query(
-      'UPDATE inbound_invoices SET status = $1, storno_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
-      ['STORNO ARHIVA', stornoUrl, stornoNumber, cleanId]
+      'UPDATE inbound_invoices SET status = $1, file_url = $2, storno_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
+      ['POVRATI', stornoUrl, stornoNumber, cleanId]
     );
 
     if (supplierEmail && supplierEmail.includes('@')) {
@@ -1067,15 +1076,13 @@ app.post('/upload', authGuard, upload.single('image'), (req, res) => {
 });
 
 // --- RUTE ZA NARUDŽBE KUPACA ---
-
-// POPRAVLJENO: Pametni linkovi za izlazne račune
 app.get('/all-orders', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM orders ORDER BY id DESC');
     res.json(result.rows.map(o => ({ 
       ...o, 
       items: parseJsonSafe(o.items, []), 
-      // Pametni link za kupce i knjigovođu
+      // Pametni link za narudžbe
       invoiceUrl: `https://modaluxe-backend.onrender.com/api/order-pdf/${o.id}`,
       storno_url: o.storno_url,
       createdAt: o.created_at, 
@@ -1311,7 +1318,6 @@ app.get('/api/ura-pdf/:id', async (req, res) => {
     const result = await pool.query('SELECT file_url, storno_url FROM inbound_invoices WHERE id = $1', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).send('Račun nije pronađen.');
     const inv = result.rows[0];
-    // Ako postoji storno povratnica, OBAVEZNO preusmjeri na nju!
     if (inv.storno_url) {
         res.redirect(inv.storno_url);
     } else if (inv.file_url) {
@@ -1327,7 +1333,6 @@ app.get('/api/order-pdf/:id', async (req, res) => {
     const result = await pool.query('SELECT invoice_url, storno_url FROM orders WHERE id = $1', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).send('Narudžba nije pronađena.');
     const o = result.rows[0];
-    // Ako postoji storno račun kupca, OBAVEZNO preusmjeri na njega!
     if (o.storno_url) {
         res.redirect(o.storno_url);
     } else if (o.invoice_url) {

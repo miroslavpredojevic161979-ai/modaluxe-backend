@@ -214,7 +214,6 @@ async function fetchInboundInvoicesFromEmail() {
         const senderAddress = mail.from && mail.from.value[0] ? mail.from.value[0].address : 'Nepoznato';
         const supplierName = (mail.from && mail.from.value[0].name) ? mail.from.value[0].name : senderAddress;
         
-        // Ignoriraj mailove koje šalje sama trgovina
         if (senderAddress.toLowerCase() === process.env.EMAIL_USER.toLowerCase()) continue; 
 
         const dateStr = new Date().toLocaleDateString('hr-HR');
@@ -248,7 +247,6 @@ async function fetchInboundInvoicesFromEmail() {
             const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').replace('.pdf', '') : `racun_${i}`;
             const fName = `ura_pdf_${Date.now()}_${safeName}`;
             
-            // Upload PDF-a
             const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'image');
             
             await pool.query(
@@ -257,7 +255,6 @@ async function fetchInboundInvoicesFromEmail() {
             );
           }
         } else {
-          // NOVO: Pretvaramo tekst maila u PDF kako bi se normalno otvarao u aplikaciji
           const fName = `ura_tekst_${Date.now()}`; 
           
           await new Promise((resolve, reject) => {
@@ -277,11 +274,10 @@ async function fetchInboundInvoicesFromEmail() {
                 resolve();
               } catch(e) {
                 console.error('Greška pri uploadu teksta maila:', e);
-                resolve(); // Idemo dalje čak i ako pukne
+                resolve(); 
               }
             });
             
-            // Crtamo PDF
             doc.fontSize(14).font('Helvetica-Bold').fillColor('#dd6b20').text('Sadržaj e-maila (Nema originalnog PDF privitka)', { align: 'center' });
             doc.moveDown(2);
             doc.fillColor('#000000');
@@ -511,7 +507,6 @@ const generateStornoPDFInvoice = (orderData, originalInvoiceNumber, stornoInvoic
     const items = parseJsonSafe(orderData.items, []);
     const disc = parseJsonSafe(orderData.discount, { amount: 0 });
     
-    // Izračun: Samo artikli (bez dostave)
     let itemsTotal = 0;
     items.forEach(item => { 
         itemsTotal += Number(item.price) * (item.qty || item.quantity || 1); 
@@ -1364,17 +1359,17 @@ app.get('/payment-cancel', (req, res) => {
 
 app.get('/', (req, res) => res.send('KISFALUBA Backend Online!'));
 
-app.listen(PORT, '0.0.0.0', () => { 
-  console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`); 
-});
-kod za brisanje računa
-// PRIVREMENA METLA ZA BRISANJE SVEGA
+// --- PRIVREMENA METLA ZA BRISANJE SVEGA ---
 app.get('/brisanje-baze', async (req, res) => {
   try {
     await pool.query('DELETE FROM orders');
     await pool.query('DELETE FROM inbound_invoices');
-    res.send('<h1>Sve narudžbe i ulazni računi su uspješno obrisani! 🧹</h1><p>Sada se vrati u VS Code, OBRISI ovaj kod i ponovno stisni Sync Changes kako ti nitko drugi ne bi mogao obrisati bazu.</p>');
+    res.send('<h1>Sve narudžbe i ulazni računi su uspješno obrisani! 🧹</h1><p>Sada se vrati u VS Code, OBRISI ovaj kod i napravi novi Deploy kako ti nitko na internetu ne bi mogao obrisati bazu.</p>');
   } catch (err) { 
     res.status(500).send('Greška pri brisanju: ' + err.message); 
   }
+});
+
+app.listen(PORT, '0.0.0.0', () => { 
+  console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`); 
 });

@@ -40,6 +40,7 @@ const initDB = async () => {
   try {
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'DOLAZNI'");
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
+    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS supplier_email VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount JSONB DEFAULT '{\"amount\": 0}'::jsonb");
@@ -121,14 +122,13 @@ const upload = multer({
   fileFilter: fileFilter
 });
 
-// Pomoćna funkcija za upload datoteka iz maila direktno na Cloudinary
 const uploadBufferToCloudinary = (buffer, filename, resourceType = 'auto') => {
   return new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
       { 
         folder: 'kisfaluba_ura', 
         public_id: filename, 
-        resource_type: resourceType // Koristimo format kakav je zatražen
+        resource_type: resourceType
       },
       (error, result) => {
         if (error) return reject(error);
@@ -237,7 +237,6 @@ async function fetchInboundInvoicesFromEmail() {
         }
         if (isNaN(extractedAmount)) extractedAmount = 0;
 
-        // POPRAVAK: Sada traži i PDF i SLIKE (JPG, PNG) koje je poslao dobavljač
         const validAttachments = (mail.attachments || []).filter(attr => 
           attr.contentType === 'application/pdf' || 
           attr.contentType?.startsWith('image/') ||
@@ -250,16 +249,14 @@ async function fetchInboundInvoicesFromEmail() {
             const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').split('.')[0] : `racun_${i}`;
             const fName = `ura_doc_${Date.now()}_${safeName}`;
             
-            // Šaljemo prilog točno onakav kakav jest (auto format) bez prepravljanja!
             const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'auto');
             
             await pool.query(
-              "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
-              [supplierName, 'Iz maila (Original)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
+              "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)",
+              [supplierName, senderAddress, 'Iz maila (Original)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
             );
           }
         } else {
-          // Ako je mail u potpunosti BEZ priloga (samo čisti tekst), tek onda crtamo PDF
           const fName = `ura_tekst_${Date.now()}`; 
           
           await new Promise((resolve, reject) => {
@@ -270,11 +267,11 @@ async function fetchInboundInvoicesFromEmail() {
             doc.on('end', async () => {
               try {
                 const pdfBuffer = Buffer.concat(chunks);
-                const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image'); // Ovdje je 'image' ok jer ga mi stvaramo
+                const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image');
                 
                 await pool.query(
-                  "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
-                  [supplierName, 'Iz maila (Tekst)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
+                  "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)",
+                  [supplierName, senderAddress, 'Iz maila (Tekst)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
                 );
                 resolve();
               } catch(e) {
@@ -655,87 +652,120 @@ const generateUraStornoPDF = (inv, filePath) => {
 
     const d = new Date();
     const dateStr = d.toLocaleDateString('hr-HR');
-    const currentYear = d.getFullYear();
-    const cleanId = String(inv.id).split('-')[0];
+    const timeStr = d.toLocaleTimeString('hr-HR');
 
-    doc.fontSize(16).font('Helvetica-Bold').fillColor('#000000').text('KISFALUBA j.d.o.o.', 40, 40);
-    doc.fontSize(10).font('Helvetica').fillColor('#555555');
-    doc.text('Zagorska ulica 40, 31300 Branjina, Republika Hrvatska', 40, 60);
-    doc.text('OIB: 82125639708 | MBS: 5990572');
-    doc.text('Trgovacki sud u Osijeku');
-    doc.text('Temeljni kapital: 10,00 EUR, uplacen u cijelosti');
+    const finalRefund = Number(inv.amount) || 0; 
+    const supplierName = inv.supplier || 'Nepoznato';
+    const originalInvoiceNumber = inv.invoice_number || 'N/A';
+    const stornoInvoiceNumber = originalInvoiceNumber.toUpperCase().includes('STORNO') ? originalInvoiceNumber : `STORNO-${originalInvoiceNumber}`;
 
-    doc.fontSize(14).font('Helvetica-Bold').fillColor('#dd6b20').text('ROBNI DOKUMENT', 40, 40, { align: 'right' });
-    
+    doc.fontSize(16).font('Helvetica-Bold').fillColor('#000000').text('KISFALUBA', { align: 'center' });
     doc.moveDown(2);
-    doc.moveTo(40, doc.y).lineTo(550, doc.y).strokeColor('#dd6b20').lineWidth(2).stroke();
-    doc.lineWidth(1); 
+    doc.fontSize(10).font('Helvetica');
+    doc.text(fixText(`Postovani/a ${supplierName},`));
+    doc.moveDown(0.5);
+    doc.text(fixText(`Obavjestavamo Vas o povratu robe vezano za Vas racun br. ${originalInvoiceNumber}.`));
+    doc.moveDown(1.5);
+    doc.font('Helvetica-Bold').fontSize(11).text(fixText('Detalji povrata'));
+    doc.moveDown(0.5);
+
+    let startY = doc.y;
+    const drawTable1Row = (y, col1, col2, col3, isHeader = false) => {
+      const rowHeight = 25;
+      doc.rect(40, y, 510, rowHeight).fillAndStroke(isHeader ? '#fafafa' : '#ffffff', '#dddddd');
+      doc.moveTo(350, y).lineTo(350, y + rowHeight).stroke('#dddddd');
+      doc.moveTo(430, y).lineTo(430, y + rowHeight).stroke('#dddddd');
+      doc.fillColor('#000000').font(isHeader ? 'Helvetica-Bold' : 'Helvetica').fontSize(9);
+      doc.text(col1, 50, y + 8, { width: 290 });
+      doc.text(col2, 350, y + 8, { width: 80, align: 'center' });
+      doc.text(col3, 430, y + 8, { width: 110, align: 'right', lineBreak: false }); 
+      return y + rowHeight;
+    };
+
+    startY = drawTable1Row(startY, 'Opis povrata', fixText('Kolicina'), 'Vrijednost (EUR)', true);
+
+    const itemName = fixText(`Povrat po racunu br. ${originalInvoiceNumber}`);
+    const price = Number(Math.abs(finalRefund)).toFixed(2);
+    startY = drawTable1Row(startY, itemName, `1`, `-${price} EUR`, false);
+
+    doc.y = startY + 10;
+    doc.font('Helvetica-Bold').fontSize(10).fillColor('#e53e3e').text(`UKUPNI STORNO: -${Math.abs(finalRefund).toFixed(2)} EUR`, 300, doc.y, { width: 250, align: 'right' });
+    if (inv.note) {
+        doc.y += 5;
+        doc.font('Helvetica').fontSize(8).fillColor('#666666').text(fixText(`Napomena: ${inv.note}`), 300, doc.y, { width: 250, align: 'right' });
+    }
+    doc.fillColor('#000000');
+    doc.moveDown(2);
+
+    doc.font('Helvetica-Bold').fontSize(11).text(fixText('Podaci dobavljaca'), 40, doc.y);
+    doc.moveTo(40, doc.y + 2).lineTo(550, doc.y + 2).strokeColor('#dddddd').stroke();
+    doc.moveDown(0.5);
+    doc.font('Helvetica').fontSize(9);
+    doc.text(fixText(supplierName));
+    doc.moveDown(3);
+
+    doc.font('Helvetica-Bold').fontSize(14).fillColor('#e53e3e').text(fixText('STORNO RACUN / POVRATNICA'), { align: 'center' });
+    doc.fillColor('#000000');
     doc.moveDown(1.5);
 
     let currentY = doc.y;
-    doc.fontSize(10).font('Helvetica-Bold').fillColor('#718096').text('DOBAVLJAC (KOME SE VRACA):', 40, currentY);
-    doc.fontSize(14).font('Helvetica-Bold').fillColor('#000000').text(fixText(inv.supplier || 'Nepoznato'), 40, currentY + 15);
-
-    doc.fontSize(10).font('Helvetica-Bold').fillColor('#000000').text('Mjesto izdavanja:', 350, currentY);
-    doc.font('Helvetica').text('Branjina, HR', 450, currentY);
-    doc.font('Helvetica-Bold').text('Datum povrata:', 350, currentY + 15);
-    doc.font('Helvetica').text(dateStr, 450, currentY + 15);
-
-    doc.moveDown(4);
-
-    doc.fontSize(18).font('Helvetica-Bold').fillColor('#dd6b20').text(`POVRATNICA DOBAVLJACU br. POV-${cleanId}/${currentYear}`, 40, doc.y, { align: 'center', letterSpacing: 1 });
-    doc.moveDown(2.5);
+    doc.font('Helvetica-Bold').fontSize(9).text('KISFALUBA j.d.o.o.', 40, currentY);
+    doc.font('Helvetica').text('Zagorska ulica 40, 31300 Branjina, Republika Hrvatska');
+    doc.text('OIB: 82125639708 | MBS: 5990572');
+    doc.text('Trgovacki sud u Osijeku');
+    doc.text('Temeljni kapital: 10,00 EUR, uplacen u cijelosti');
+    doc.moveDown(1.5);
 
     currentY = doc.y;
-    doc.rect(40, currentY, 510, 40).fill('#f7fafc'); 
-    doc.rect(40, currentY, 4, 40).fill('#dd6b20'); 
-    doc.fillColor('#000000').fontSize(10);
-    doc.font('Helvetica-Bold').text('Vezano za ulazni racun dobavljaca br.: ', 55, currentY + 10, { continued: true }).font('Helvetica').text(fixText(inv.invoice_number || 'N/A'));
-    doc.font('Helvetica-Bold').text('Razlog povrata: ', 55, currentY + 24, { continued: true }).font('Helvetica').text('Povrat robe / Storno (sukladno dogovoru)');
-    
+    doc.font('Helvetica-Bold').text(fixText('Broj storno racuna:'), 40, currentY);
+    doc.font('Helvetica').text(stornoInvoiceNumber, 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Vezano za racun br:', 40, currentY);
+    doc.font('Helvetica').text(originalInvoiceNumber, 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Datum storna:', 40, currentY);
+    doc.font('Helvetica').text(dateStr, 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Vrijeme storna:', 40, currentY);
+    doc.font('Helvetica').text(timeStr, 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Mjesto izdavanja:', 40, currentY);
+    doc.font('Helvetica').text('Branjina, Republika Hrvatska', 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Dobavljac:', 40, currentY);
+    doc.font('Helvetica').text(fixText(supplierName), 150, currentY);
+    doc.moveDown(2);
+
+    let t2Y = doc.y;
+    const drawTable2Row = (y, col1, col2, col3, col4, col5, isHeader = false) => {
+      const h = 25;
+      doc.rect(40, y, 510, h).fillAndStroke(isHeader ? '#fafafa' : '#ffffff', '#dddddd');
+      doc.moveTo(100, y).lineTo(100, y + h).stroke('#dddddd');
+      doc.moveTo(310, y).lineTo(310, y + h).stroke('#dddddd');
+      doc.moveTo(370, y).lineTo(370, y + h).stroke('#dddddd');
+      doc.moveTo(460, y).lineTo(460, y + h).stroke('#dddddd');
+      
+      doc.fillColor('#000000').font(isHeader ? 'Helvetica-Bold' : 'Helvetica').fontSize(9);
+      doc.text(col1, 40, y + 8, { width: 60, align: 'center' });
+      doc.text(col2, 110, y + 8, { width: 190 });
+      doc.text(col3, 310, y + 8, { width: 60, align: 'center' });
+      doc.text(col4, 370, y + 8, { width: 80, align: 'right' }); 
+      doc.text(col5, 460, y + 8, { width: 80, align: 'right' }); 
+      return y + h;
+    };
+
+    t2Y = drawTable2Row(t2Y, 'Redni broj', 'Opis', fixText('Kolicina'), 'Jedinicna cijena (EUR)', 'Ukupno (EUR)', true);
+    t2Y = drawTable2Row(t2Y, '1', itemName, '1', `-${price}`, `-${price}`, false);
+
+    doc.y = t2Y + 10;
+    doc.font('Helvetica-Bold').fontSize(10).fillColor('#e53e3e').text(`Ukupan iznos storna: -${Math.abs(finalRefund).toFixed(2)} EUR`, 300, doc.y, { width: 250, align: 'right' });
     doc.moveDown(3);
-
-    let tY = doc.y;
-    doc.rect(40, tY, 510, 25).fill('#fffaf0');
-    doc.fillColor('#dd6b20').font('Helvetica-Bold').fontSize(10);
-    doc.text('R.br.', 50, tY + 8);
-    doc.text('Opis povrata / Napomena', 90, tY + 8);
-    doc.text('Kolicina', 350, tY + 8, { width: 60, align: 'center' });
-    doc.text('Vrijednost (EUR)', 430, tY + 8, { width: 110, align: 'right' });
-
-    tY += 25;
-    doc.rect(40, tY, 510, 35).stroke('#cbd5e0');
-    doc.fillColor('#000000').font('Helvetica').fontSize(10);
-    doc.text('1.', 50, tY + 12);
-    doc.text(fixText(`Povrat po racunu br. ${inv.invoice_number || 'N/A'}`), 90, tY + 8);
-    doc.fontSize(8).fillColor('#666666').text(fixText(inv.note ? 'Napomena: ' + inv.note : ''), 90, tY + 22);
-    doc.fontSize(10).fillColor('#000000');
-    doc.text('1', 350, tY + 12, { width: 60, align: 'center' });
-    doc.text(`-${Number(Math.abs(inv.amount || 0)).toFixed(2)} EUR`, 430, tY + 12, { width: 110, align: 'right' });
-
-    doc.moveDown(4);
-
-    currentY = doc.y;
-    doc.rect(40, currentY, 510, 40).fill('#fff5f5');
-    doc.fillColor('#4a5568').fontSize(9);
-    doc.font('Helvetica-Bold').text('ZAKONSKA NAPOMENA: ', 50, currentY + 10, { continued: true }).font('Helvetica').text('Ovaj dokument sluzi iskljucivo kao dokaz o fizickom povratu robe dobavljacu. Molimo Vas da nam po primitku ove povratnice izdate sluzbeno Knjigovodstveno odobrenje kako bismo mogli uskladiti financijske obveze.', { width: 490 });
-
-    doc.moveDown(6);
-
-    currentY = doc.y;
     
-    doc.moveTo(60, currentY).lineTo(220, currentY).strokeColor('#333333').stroke();
-    doc.font('Helvetica-Bold').fontSize(10).fillColor('#333333');
-    doc.text('Potpis dobavljaca (primio)', 60, currentY + 5, { width: 160, align: 'center' });
-
-    doc.font('Times-Italic').fontSize(18).fillColor('#000000').text('Miroslav Predojevic', 350, currentY - 22, { width: 160, align: 'center' });
-    doc.moveTo(350, currentY).lineTo(510, currentY).strokeColor('#333333').stroke();
-    doc.font('Helvetica-Bold').fontSize(10).fillColor('#333333');
-    doc.text('Za KISFALUBA j.d.o.o. (predao)', 350, currentY + 5, { width: 160, align: 'center' });
-
-    doc.fontSize(8).fillColor('#999999').text('Ovaj robni dokument je generiran automatski iz sustava "Kisfaluba Moda" i pravovaljan je bez ziga.', 40, 780, { align: 'center' });
-
+    doc.font('Helvetica').fontSize(8).fillColor('#666666');
+    doc.text(fixText('Napomena: Ovaj dokument sluzi iskljucivo kao dokaz o fizickom povratu robe dobavljacu.'), { align: 'center' });
+    doc.text(fixText('Ovaj storno racun izdan je u elektronickom obliku i vrijedi bez potpisa i pecata.'), { align: 'center' });
     doc.end();
+    
     stream.on('finish', () => resolve(filePath));
     stream.on('error', reject);
   });
@@ -900,11 +930,11 @@ app.get('/inbound-invoices', async (req, res) => {
 });
 
 app.post('/inbound-invoices', async (req, res) => {
-  const { supplier, invoice_number, amount, file_url, note, date } = req.body;
+  const { supplier, supplier_email, invoice_number, amount, file_url, note, date } = req.body;
   try {
     const result = await pool.query(
-      "INSERT INTO inbound_invoices (supplier, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, 'DOLAZNI', false) RETURNING *",
-      [supplier, invoice_number, amount, file_url, note, date]
+      "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false) RETURNING *",
+      [supplier, supplier_email || '', invoice_number, amount, file_url, note, date]
     );
     res.json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: "Greška" }); }
@@ -986,10 +1016,13 @@ app.post('/api/send-ura-storno', async (req, res) => {
       ['STORNO ARHIVA', fileUrl, stornoNumber, cleanId]
     );
 
-    if (supplierEmail && supplierEmail.includes('@')) {
+    // Pametno korištenje e-maila: prvo probamo onaj koji nam je sustav zapisao, a onda fallback ako je netko ručno unio
+    const finalEmailToSend = (inv.supplier_email && inv.supplier_email.includes('@')) ? inv.supplier_email : supplierEmail;
+
+    if (finalEmailToSend && finalEmailToSend.includes('@')) {
       const mailOptions = {
         from: process.env.EMAIL_USER,
-        to: supplierEmail,
+        to: finalEmailToSend,
         subject: `Storno / Povratnica - ${stornoNumber}`,
         html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU</h2><p>Poštovani,</p><p>U privitku Vam dostavljamo službeni storno dokument za povrat robe.</p></div>`,
         attachments: [{ filename: `${stornoNumber}.pdf`, path: fPath }]

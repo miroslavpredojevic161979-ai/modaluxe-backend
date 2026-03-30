@@ -41,6 +41,7 @@ const initDB = async () => {
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'DOLAZNI'");
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS supplier_email VARCHAR(255)");
+    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount JSONB DEFAULT '{\"amount\": 0}'::jsonb");
@@ -1016,7 +1017,6 @@ app.post('/api/send-ura-storno', async (req, res) => {
       ['STORNO ARHIVA', fileUrl, stornoNumber, cleanId]
     );
 
-    // Pametno korištenje e-maila: prvo probamo onaj koji nam je sustav zapisao, a onda fallback ako je netko ručno unio
     const finalEmailToSend = (inv.supplier_email && inv.supplier_email.includes('@')) ? inv.supplier_email : supplierEmail;
 
     if (finalEmailToSend && finalEmailToSend.includes('@')) {

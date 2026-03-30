@@ -15,7 +15,6 @@ const nodemailer = require('nodemailer');
 const imaps = require('imap-simple');
 const simpleParser = require('mailparser').simpleParser;
 const cron = require('node-cron');
-const puppeteer = require('puppeteer');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
@@ -184,6 +183,7 @@ const deductStock = async (items) => {
 };
 
 // --- AUTOMATSKO ČITANJE MAILOVA (URA) ---
+// --- AUTOMATSKO ČITANJE MAILOVA (URA) ---
 async function fetchInboundInvoicesFromEmail() {
   const config = {
     imap: {
@@ -246,6 +246,7 @@ async function fetchInboundInvoicesFromEmail() {
         );
 
         if (validAttachments.length > 0) {
+          // --- STARA LOGIKA: Ako ima PDF ili sliku u privitku ---
           for (let i = 0; i < validAttachments.length; i++) {
             const attachment = validAttachments[i];
             const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').split('.')[0] : `racun_${i}`;
@@ -255,49 +256,39 @@ async function fetchInboundInvoicesFromEmail() {
             
             await pool.query(
               "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)",
-              [supplierName, senderAddress, 'Iz maila (Original)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
+              [supplierName, senderAddress, 'Iz maila', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
             );
           }
         } else {
-          // --- PRAVI SKENER ZA ŠARENE HTML MAILOVE (PUPPETEER) ---
-          const fName = `ura_sken_${Date.now()}`; 
+          // --- NEMA PRIVITKA: Pretvaramo obican tekst u PDF dokument (bez Puppeteera) ---
+          const fName = `ura_tekst_${Date.now()}`;
+          const doc = new PDFDocument({ margin: 40, size: 'A4' });
+          let buffers = [];
           
-          try {
-            console.log('Pokrećem HTML skener za mail...');
-            
-            // Uzimamo originalni dizajn iz maila. Ako je slučajno samo čisti tekst, stavljamo ga u uredan okvir.
-            const htmlContent = mail.html || `<div style="font-family: Arial, sans-serif; padding: 20px; white-space: pre-wrap; line-height: 1.5;">${escapeHtml(mail.text) || subject}</div>`;
-            
-            // Palimo nevidljivu virtualnu kameru
-            const browser = await puppeteer.launch({ 
-              headless: true, 
-              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] 
-            });
-            const page = await browser.newPage();
-            
-            // Učitavamo originalni mail u kameru
-            await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 15000 });
-            
-            // Slikamo ga i pretvaramo u A4 PDF
-            const pdfBuffer = await page.pdf({ 
-              format: 'A4', 
-              printBackground: true,
-              margin: { top: '20px', bottom: '20px', left: '20px', right: '20px' }
-            });
-            
-            await browser.close();
-            console.log('Mail uspješno skeniran u PDF!');
-            
-            // Šaljemo gotov sken (PDF) na Cloudinary
-            const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image');
-            
-            await pool.query(
-              "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false)",
-              [supplierName, senderAddress, 'Iz maila (Skenirano)', extractedAmount, uploadResult.secure_url, subject, dateStr]
-            );
-          } catch(e) {
-            console.error('Greška pri skeniranju maila s kamerom:', e.message);
-          }
+          doc.on('data', buffers.push.bind(buffers));
+          doc.on('end', async () => {
+            let pdfData = Buffer.concat(buffers);
+            try {
+              const uploadResult = await uploadBufferToCloudinary(pdfData, fName, 'image');
+              await pool.query(
+                "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false)",
+                [supplierName, senderAddress, 'Tekst iz maila', extractedAmount, uploadResult.secure_url, subject, dateStr]
+              );
+            } catch(upErr) {
+              console.error('Greška pri spremanju PDF teksta:', upErr);
+            }
+          });
+
+          doc.fontSize(16).font('Helvetica-Bold').text('Sadrzaj e-maila (Nema privitka)', { align: 'center' });
+          doc.moveDown(2);
+          doc.fontSize(12).font('Helvetica-Bold').text(`Od: `).font('Helvetica').text(`${supplierName} (${senderAddress})`);
+          doc.font('Helvetica-Bold').text(`Naslov: `).font('Helvetica').text(`${fixText(subject)}`);
+          doc.font('Helvetica-Bold').text(`Datum: `).font('Helvetica').text(`${dateStr}`);
+          doc.moveDown();
+          doc.moveTo(40, doc.y).lineTo(550, doc.y).strokeColor('#cccccc').stroke();
+          doc.moveDown(2);
+          doc.fontSize(10).fillColor('#333333').text(fixText(mail.text || 'E-mail ne sadrzi citljiv tekst.'));
+          doc.end();
         }
       } catch (singleMailErr) {
         console.error('Greška pri obradi JEDNOG maila:', singleMailErr.message);
@@ -1022,9 +1013,11 @@ app.post('/api/send-ura-storno', async (req, res) => {
     }
     const stornoNumber = siguranBrojRacuna.toUpperCase().includes('STORNO') ? siguranBrojRacuna : `STORNO-${siguranBrojRacuna}`;
     
+    // --- KLJUČNA PROMJENA: Ne diramo originalni invoice_number i NE arhiviramo još! ---
+    // Spremamo link povratnice u storno_url, a status stavljamo u 'POVRATI'
     await pool.query(
-      'UPDATE inbound_invoices SET status = $1, storno_url = $2, invoice_number = $3, archived = false WHERE id = $4', 
-      ['STORNO ARHIVA', fileUrl, stornoNumber, cleanId]
+      'UPDATE inbound_invoices SET status = $1, storno_url = $2 WHERE id = $3', 
+      ['POVRATI', fileUrl, cleanId]
     );
 
     const finalEmailToSend = (inv.supplier_email && inv.supplier_email.includes('@')) ? inv.supplier_email : supplierEmail;

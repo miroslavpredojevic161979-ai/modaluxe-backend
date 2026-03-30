@@ -963,17 +963,51 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
     const { status } = req.body;
     const id = String(req.params.id).split('-')[0];
 
+    let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
+    
     if (status === 'ARHIVIRANI' || status === 'STORNO ARHIVA') {
-        await pool.query('UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2', [status, id]);
+        query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
     } else if (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') {
-        await pool.query('UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2', ['POVRATI', id]);
-    } else {
-        await pool.query('UPDATE inbound_invoices SET status = $1 WHERE id = $2', [status, id]);
+        query = 'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *';
     }
-    res.json({ success: true });
-  } catch (err) { 
-    console.error(err);
-    res.status(500).json({ error: 'Greška u bazi.' }); 
+
+    // Unificiramo ime statusa u bazi
+    const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
+    const result = await pool.query(query, [targetStatus, id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Račun nije pronađen.' });
+    }
+    
+    const invData = result.rows[0];
+
+    // DODANO: AUTOMATSKO GENERIRANJE STORNO PDF-a (Isto kao kod narudžbi!)
+    if (targetStatus === 'POVRATI' && !invData.storno_url) {
+      const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
+      const filePath = path.join(__dirname, 'uploads', fileName);
+      
+      // Generiramo dokument
+      await generateUraStornoPDF(invData, filePath);
+      
+      // Šaljemo ga na Cloudinary
+      const uploadResult = await cloudinary.uploader.upload(filePath, {
+        folder: 'kisfaluba_ura',
+        resource_type: 'image'
+      });
+      const stornoUrl = uploadResult.secure_url;
+      
+      // Brišemo privremeni file sa servera
+      try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
+      
+      // Spremamo link u bazu
+      await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [stornoUrl, id]);
+      invData.storno_url = stornoUrl;
+    }
+
+    res.json({ success: true, invoice: invData });
+  } catch (err) {
+    console.error("Greška pri ažuriranju URA statusa:", err);
+    res.status(500).json({ error: 'Greška u bazi.' });
   }
 });
 
@@ -1001,6 +1035,17 @@ app.delete('/inbound-invoices/:id', async (req, res) => {
     await pool.query('DELETE FROM inbound_invoices WHERE id = $1', [id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Greška pri brisanju' }); }
+});
+app.patch('/inbound-invoices/:id/file', async (req, res) => {
+  try {
+    const id = String(req.params.id).split('-')[0];
+    const { fileUrl } = req.body;
+    await pool.query('UPDATE inbound_invoices SET file_url = $1 WHERE id = $2', [fileUrl, id]);
+    res.json({ success: true, message: 'Dokument uspješno spremljen u bazu!' });
+  } catch (err) { 
+    console.error("Greška pri spremanju PDF linka u bazu:", err);
+    res.status(500).json({ error: 'Greška u bazi.' }); 
+  }
 });
 
 app.post('/api/send-ura-storno', async (req, res) => {

@@ -299,11 +299,23 @@ async function fetchInboundInvoicesFromEmail() {
           }
         }
 
-        // --- ZAPIS U BAZU ---
-        await pool.query(
-          "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false)",
-          [supplierName, senderAddress, finalNote === subject ? 'Iz maila' : finalNote, extractedAmount, finalFileUrl, subject, dateStr]
+ // --- PROVJERA DUPLIKATA I ZAPIS ---
+        const duplicateCheck = await pool.query(
+          "SELECT id FROM inbound_invoices WHERE supplier = $1 AND invoice_number = $2 AND amount = $3",
+          [supplierName, finalNote === subject ? 'Iz maila' : finalNote, extractedAmount]
         );
+
+        if (duplicateCheck.rows.length === 0) {
+          // Ako račun NE postoji, upiši ga
+          await pool.query(
+            "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false)",
+            [supplierName, senderAddress, finalNote === subject ? 'Iz maila' : finalNote, extractedAmount, finalFileUrl, subject, dateStr]
+          );
+          console.log(`✅ Račun od ${supplierName} (${extractedAmount} EUR) uspješno spremljen.`);
+        } else {
+          // Ako račun već POSTOJI, samo ga preskoči
+          console.log(`⚠️ Preskačem duplikat računa od ${supplierName}.`);
+        }
 
       } catch (singleMailErr) {
         console.error('Greška pri obradi JEDNOG maila:', singleMailErr.message);

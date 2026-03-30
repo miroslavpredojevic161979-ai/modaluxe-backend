@@ -8,14 +8,12 @@ const bcrypt = require('bcrypt');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const crypto = require('crypto');
 const PDFDocument = require('pdfkit');
 const pool = require('./db');
 const nodemailer = require('nodemailer');
 const imaps = require('imap-simple');
 const simpleParser = require('mailparser').simpleParser;
 const cron = require('node-cron');
-const puppeteer = require('puppeteer');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
@@ -183,7 +181,7 @@ const deductStock = async (items) => {
   }
 };
 
-// --- PAMETNI ČITAČ MAILOVA SA SKENEROM ---
+// --- AUTOMATSKO ČITANJE MAILOVA (URA) - TVOJ ORIGINALNI KOD ---
 async function fetchInboundInvoicesFromEmail() {
   const config = {
     imap: {
@@ -223,9 +221,21 @@ async function fetchInboundInvoicesFromEmail() {
         
         let extractedAmount = 0;
         const textToSearch = (mail.text || '') + ' ' + (mail.html || '');
+        
         const amountRegex = /(?:ukupno|iznos|total|za platiti|iznos računa)[^\d]*([\d]+[.,]\d{2})/i;
         const match = textToSearch.match(amountRegex);
-        if (match && match[1]) { extractedAmount = parseFloat(match[1].replace(',', '.')); }
+        
+        if (match && match[1]) {
+          extractedAmount = parseFloat(match[1].replace(',', '.'));
+        } else {
+          const eurRegex = /([\d]+[.,]\d{2})\s*(?:eur|€)/gi;
+          let eurMatches = [...textToSearch.matchAll(eurRegex)];
+          if (eurMatches.length > 0) {
+            const lastMatch = eurMatches[eurMatches.length - 1][1];
+            extractedAmount = parseFloat(lastMatch.replace(',', '.'));
+          }
+        }
+        if (isNaN(extractedAmount)) extractedAmount = 0;
 
         const validAttachments = (mail.attachments || []).filter(attr => 
           attr.contentType === 'application/pdf' || 
@@ -234,40 +244,60 @@ async function fetchInboundInvoicesFromEmail() {
         );
 
         if (validAttachments.length > 0) {
-          // Ako ima PDF, spremi original
+          // --- STARA LOGIKA: Ako ima PDF ili sliku u privitku ---
           for (let i = 0; i < validAttachments.length; i++) {
             const attachment = validAttachments[i];
-            const fName = `ura_doc_${Date.now()}_${i}`;
+            const safeName = attachment.filename ? attachment.filename.replace(/\s+/g, '_').split('.')[0] : `racun_${i}`;
+            const fName = `ura_doc_${Date.now()}_${safeName}`;
+            
             const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'auto');
+            
             await pool.query(
-              "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false)",
-              [supplierName, senderAddress, 'Iz maila', extractedAmount, uploadResult.secure_url, subject, dateStr]
+              "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)",
+              [supplierName, senderAddress, 'Iz maila', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
             );
           }
         } else {
-          // AKO NEMA PDF-a: USLIKAJ HTML MAIL (Puppeteer)
-          const fName = `ura_sken_${Date.now()}`; 
-          try {
-            const htmlContent = mail.html || `<div style="font-family: Arial; padding: 20px;">${mail.text || subject}</div>`;
-            const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
-            const page = await browser.newPage();
-            await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
-            const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
-            await browser.close();
-            const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image');
-            await pool.query(
-              "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false)",
-              [supplierName, senderAddress, 'Skenirano iz maila', extractedAmount, uploadResult.secure_url, subject, dateStr]
-            );
-          } catch(err) { console.error('Skeniranje nije uspjelo:', err); }
+          // --- NEMA PRIVITKA: Pretvaramo obican tekst u PDF dokument ---
+          const fName = `ura_tekst_${Date.now()}`;
+          const doc = new PDFDocument({ margin: 40, size: 'A4' });
+          let buffers = [];
+          
+          doc.on('data', buffers.push.bind(buffers));
+          doc.on('end', async () => {
+            let pdfData = Buffer.concat(buffers);
+            try {
+              const uploadResult = await uploadBufferToCloudinary(pdfData, fName, 'image');
+              await pool.query(
+                "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false)",
+                [supplierName, senderAddress, 'Tekst iz maila', extractedAmount, uploadResult.secure_url, subject, dateStr]
+              );
+            } catch(upErr) {
+              console.error('Greška pri spremanju PDF teksta:', upErr);
+            }
+          });
+
+          doc.fontSize(16).font('Helvetica-Bold').text('Sadrzaj e-maila (Nema privitka)', { align: 'center' });
+          doc.moveDown(2);
+          doc.fontSize(12).font('Helvetica-Bold').text(`Od: `).font('Helvetica').text(`${supplierName} (${senderAddress})`);
+          doc.font('Helvetica-Bold').text(`Naslov: `).font('Helvetica').text(`${fixText(subject)}`);
+          doc.font('Helvetica-Bold').text(`Datum: `).font('Helvetica').text(`${dateStr}`);
+          doc.moveDown();
+          doc.moveTo(40, doc.y).lineTo(550, doc.y).strokeColor('#cccccc').stroke();
+          doc.moveDown(2);
+          doc.fontSize(10).fillColor('#333333').text(fixText(mail.text || 'E-mail ne sadrzi citljiv tekst.'));
+          doc.end();
         }
-      } catch (err) { console.error('Greška maila:', err); }
+      } catch (singleMailErr) {
+        console.error('Greška pri obradi JEDNOG maila:', singleMailErr.message);
+      }
     }
     if (connection) connection.end();
-  } catch (err) { console.error('IMAP Greška:', err); }
+  } catch (err) {
+    console.error('Greška pri spajanju na IMAP:', err.message);
+  }
 }
 
-// Pokreni provjeru svakih 15 minuta
 cron.schedule('*/15 * * * *', () => { fetchInboundInvoicesFromEmail(); });
 
 // --- GENERIRANJE HTML MAILA ZA KUPCE ---
@@ -564,7 +594,7 @@ const generateStornoPDFInvoice = (orderData, originalInvoiceNumber, stornoInvoic
     doc.font('Helvetica-Bold').text('Mjesto izdavanja:', 40, currentY);
     doc.font('Helvetica').text('Branjina, Republika Hrvatska', 150, currentY);
     currentY += 15;
-    doc.font('Helvetica-Bold').text('Kupac:', 40, currentY);
+    doc.font('Helvetica-Bold').text('Dobavljac:', 40, currentY);
     doc.font('Helvetica').text(fixText(orderData.name), 150, currentY);
     currentY += 15;
     doc.font('Helvetica-Bold').text('Adresa kupca:', 40, currentY);
@@ -703,6 +733,9 @@ const generateUraStornoPDF = (inv, filePath) => {
     currentY += 15;
     doc.font('Helvetica-Bold').text('Dobavljac:', 40, currentY);
     doc.font('Helvetica').text(fixText(supplierName), 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Adresa kupca:', 40, currentY);
+    doc.font('Helvetica').text(fixText(orderData.address), 150, currentY);
     doc.moveDown(2);
 
     let t2Y = doc.y;
@@ -887,10 +920,9 @@ app.post('/create-checkout-session', async (req, res) => {
 
 // --- RUTE ZA ULAZNE RAČUNE (URA) ---
 
-app.post('/inbound-invoices/fetch-email', async (req, res) => {
-  console.log("Ručno pokrenuta provjera mailova...");
-  await fetchInboundInvoicesFromEmail();
-  res.json({ success: true, message: 'Provjera pošte završena.' });
+app.post('/inbound-invoices/fetch-email', (req, res) => {
+  res.json({ success: true, message: 'Provjera pošte je pokrenuta u pozadini.' });
+  fetchInboundInvoicesFromEmail().catch(err => console.error(err));
 });
 
 app.get('/inbound-invoices', async (req, res) => {
@@ -982,7 +1014,7 @@ app.post('/api/send-ura-storno', async (req, res) => {
     }
     const stornoNumber = siguranBrojRacuna.toUpperCase().includes('STORNO') ? siguranBrojRacuna : `STORNO-${siguranBrojRacuna}`;
     
-    // OVO JE ISPRAVLJENO: Spremamo link povratnice u storno_url, NE diramo invoice_number, NE arhiviramo
+    // Spremamo link povratnice u storno_url, a status stavljamo u 'POVRATI'
     await pool.query(
       'UPDATE inbound_invoices SET status = $1, storno_url = $2 WHERE id = $3', 
       ['POVRATI', fileUrl, cleanId]

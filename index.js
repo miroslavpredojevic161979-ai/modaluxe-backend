@@ -947,15 +947,79 @@ app.get('/inbound-invoices', async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Greška servera" }); }
 });
 
-app.post('/inbound-invoices', async (req, res) => {
-  const { supplier, supplier_email, invoice_number, amount, file_url, note, date } = req.body;
+app.patch('/inbound-invoices/:id/status', async (req, res) => {
   try {
-    const result = await pool.query(
-      "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false) RETURNING *",
-      [supplier, supplier_email || '', invoice_number, amount, file_url, note, date]
-    );
-    res.json(result.rows[0]);
-  } catch (err) { res.status(500).json({ error: "Greška" }); }
+    const { status } = req.body;
+    const id = String(req.params.id).split('-')[0];
+
+    const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
+
+    if (targetStatus === 'POVRATI') {
+       // --- KNJIGOVODSTVENA LOGIKA STORNA ---
+       // 1. Dohvaćamo originalni račun
+       const origRes = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
+       if (origRes.rows.length === 0) return res.status(404).json({ error: 'Račun nije pronađen.' });
+       const orig = origRes.rows[0];
+
+       if (orig.status === 'POVRATI') {
+           // Ako je netko već kliknuo storno na storno, spriječi duplanje
+           return res.json({ success: true, invoice: orig });
+       }
+
+       // 2. Definiramo broj storno računa
+       let siguranBroj = orig.invoice_number ? String(orig.invoice_number).trim() : `URA-${orig.id}`;
+       const stornoNumber = siguranBroj.toUpperCase().includes('STORNO') ? siguranBroj : `STORNO-${siguranBroj}`;
+
+       // 3. KREIRAMO NOVI STAVAK U BAZI ZA KNJIGOVOĐU (S negativnim iznosom!)
+       const stornoInsert = await pool.query(`
+         INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'POVRATI', false) RETURNING *
+       `, [
+         orig.supplier,
+         orig.supplier_email,
+         stornoNumber,
+         -Math.abs(Number(orig.amount)), // Upisujemo negativan iznos
+         orig.file_url, // Čuvamo vizualnu kopiju originala na novom računu
+         `Storno za račun br. ${siguranBroj}`,
+         new Date().toLocaleDateString('hr-HR')
+       ]);
+
+       let newStorno = stornoInsert.rows[0];
+
+       // 4. Generiramo PDF koristeći podatke originalnog računa
+       const fileName = `ura_storno_${newStorno.id}_${Date.now()}.pdf`;
+       const filePath = path.join(__dirname, 'uploads', fileName);
+       await generateUraStornoPDF(orig, filePath); 
+
+       // 5. Šaljemo PDF u cloud
+       const uploadResult = await cloudinary.uploader.upload(filePath, { folder: 'kisfaluba_ura', resource_type: 'image' });
+       const stornoUrl = uploadResult.secure_url;
+       try { fs.unlinkSync(filePath); } catch (e) {}
+
+       // 6. Vežemo generirani storno PDF za taj NOVI račun
+       await pool.query('UPDATE inbound_invoices SET storno_url = $1, file_url = $2 WHERE id = $3', [stornoUrl, stornoUrl, newStorno.id]);
+
+       // 7. VRAĆAMO ORIGINAL FRONTENDU (Kako original ne bi nestao s ekrana iz "Redovnih troškova")
+       return res.json({ success: true, invoice: orig });
+    }
+
+    // --- AKO NIJE STORNO (npr. samo označavamo kao PLAĆENO) ---
+    let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
+    if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA') {
+        query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
+    }
+
+    const result = await pool.query(query, [targetStatus, id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Račun nije pronađen.' });
+    }
+
+    res.json({ success: true, invoice: result.rows[0] });
+
+  } catch (err) {
+    console.error("Greška pri ažuriranju URA statusa:", err);
+    res.status(500).json({ error: 'Greška u bazi.' });
+  }
 });
 
 app.patch('/inbound-invoices/:id/status', async (req, res) => {

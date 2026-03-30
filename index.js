@@ -15,6 +15,7 @@ const nodemailer = require('nodemailer');
 const imaps = require('imap-simple');
 const simpleParser = require('mailparser').simpleParser;
 const cron = require('node-cron');
+const puppeteer = require('puppeteer');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
@@ -258,36 +259,45 @@ async function fetchInboundInvoicesFromEmail() {
             );
           }
         } else {
-          const fName = `ura_tekst_${Date.now()}`; 
+          // --- PRAVI SKENER ZA ŠARENE HTML MAILOVE (PUPPETEER) ---
+          const fName = `ura_sken_${Date.now()}`; 
           
-          await new Promise((resolve, reject) => {
-            const chunks = [];
-            const doc = new PDFDocument({ margin: 40, size: 'A4' });
+          try {
+            console.log('Pokrećem HTML skener za mail...');
             
-            doc.on('data', chunk => chunks.push(chunk));
-            doc.on('end', async () => {
-              try {
-                const pdfBuffer = Buffer.concat(chunks);
-                const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image');
-                
-                await pool.query(
-                  "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)",
-                  [supplierName, senderAddress, 'Iz maila (Tekst)', extractedAmount, uploadResult.secure_url, subject, dateStr, 'DOLAZNI']
-                );
-                resolve();
-              } catch(e) {
-                console.error('Greška pri uploadu teksta maila:', e);
-                resolve(); 
-              }
+            // Uzimamo originalni dizajn iz maila. Ako je slučajno samo čisti tekst, stavljamo ga u uredan okvir.
+            const htmlContent = mail.html || `<div style="font-family: Arial, sans-serif; padding: 20px; white-space: pre-wrap; line-height: 1.5;">${escapeHtml(mail.text) || subject}</div>`;
+            
+            // Palimo nevidljivu virtualnu kameru
+            const browser = await puppeteer.launch({ 
+              headless: true, 
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] 
+            });
+            const page = await browser.newPage();
+            
+            // Učitavamo originalni mail u kameru
+            await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 15000 });
+            
+            // Slikamo ga i pretvaramo u A4 PDF
+            const pdfBuffer = await page.pdf({ 
+              format: 'A4', 
+              printBackground: true,
+              margin: { top: '20px', bottom: '20px', left: '20px', right: '20px' }
             });
             
-            doc.fontSize(14).font('Helvetica-Bold').fillColor('#dd6b20').text('Sadržaj e-maila (Nema originalnog PDF privitka)', { align: 'center' });
-            doc.moveDown(2);
-            doc.fillColor('#000000');
-            const content = mail.text || subject || 'Ovaj e-mail nema tekstualni sadržaj.';
-            doc.fontSize(10).font('Helvetica').text(fixText(content));
-            doc.end();
-          });
+            await browser.close();
+            console.log('Mail uspješno skeniran u PDF!');
+            
+            // Šaljemo gotov sken (PDF) na Cloudinary
+            const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image');
+            
+            await pool.query(
+              "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false)",
+              [supplierName, senderAddress, 'Iz maila (Skenirano)', extractedAmount, uploadResult.secure_url, subject, dateStr]
+            );
+          } catch(e) {
+            console.error('Greška pri skeniranju maila s kamerom:', e.message);
+          }
         }
       } catch (singleMailErr) {
         console.error('Greška pri obradi JEDNOG maila:', singleMailErr.message);
@@ -1302,6 +1312,33 @@ app.get('/orders/:id/invoice', async (req, res) => {
   } catch (err) { res.status(500).send('Greška.'); }
 });
 
+// --- SLANJE IZVJEŠTAJA KNJIGOVOĐI ---
+app.post('/api/send-accountant', async (req, res) => {
+  try {
+    const { accountantEmail, subject, htmlBody, invoiceIds } = req.body;
+    
+    // 1. Server sam šalje mail knjigovođi
+    await transporter.sendMail({
+      from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
+      to: accountantEmail,
+      subject: subject || 'Izvještaj za knjigovodstvo',
+      html: htmlBody
+    });
+
+    // 2. Ako je mail uspješno poslan, server ih automatski arhivira
+    if (invoiceIds && invoiceIds.length > 0) {
+      const cleanIds = invoiceIds.map(id => parseInt(String(id).split('-')[0], 10)).filter(id => !isNaN(id));
+      if (cleanIds.length > 0) {
+        await pool.query('UPDATE inbound_invoices SET archived = true WHERE id = ANY($1::int[])', [cleanIds]);
+      }
+    }
+
+    res.json({ success: true, message: 'Izvještaj uspješno poslan knjigovođi!' });
+  } catch (err) {
+    console.error('Greška pri slanju knjigovođi:', err);
+    res.status(500).json({ error: 'Greška pri slanju maila knjigovođi.' });
+  }
+});
 // --- RUTE ZA POSTAVKE I KATEGORIJE ---
 app.get('/settings', async (req, res) => {
   try {

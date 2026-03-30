@@ -982,7 +982,7 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
        const orig = origRes.rows[0];
 
        // --- BRAVA PROTIV DUPLANJA ---
-       if (orig.archived === true || orig.storno_url) {
+       if (orig.storno_url) {
            return res.json({ success: true, invoice: orig });
        }
 
@@ -1013,12 +1013,11 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
        const stornoUrl = uploadResult.secure_url;
        try { fs.unlinkSync(filePath); } catch (e) {}
 
-       // 3. KLJUČNO: Originalu palimo 'archived = true' da nestane s liste rada,
-       // ali mu NE MIJENJAMO status (ostaje u svojoj rubrici, npr. SPREMLJENI)
-       await pool.query('UPDATE inbound_invoices SET storno_url = $1, archived = true WHERE id = $2', [stornoUrl, orig.id]);
+       // 3. KLJUČNO: Originalni račun ostavljamo NETAKNUT. Nema mijenjanja statusa, NEMA arhiviranja.
+       // Dodajemo mu samo storno link kako bi ostao u izvještaju zajedno s novim negativnim računom.
+       await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [stornoUrl, orig.id]);
        await pool.query('UPDATE inbound_invoices SET storno_url = $1, file_url = $2 WHERE id = $3', [stornoUrl, stornoUrl, newStorno.id]);
 
-       orig.archived = true;
        orig.storno_url = stornoUrl;
        return res.json({ success: true, invoice: orig });
     }

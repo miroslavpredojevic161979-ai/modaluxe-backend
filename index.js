@@ -1093,7 +1093,7 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
        if (origRes.rows.length === 0) return res.status(404).json({ error: 'Račun nije pronađen.' });
        const orig = origRes.rows[0];
 
-       // BRAVA: Ako je već arhiviran (obrađen) ili već ima storno link, ne radi ništa!
+       // --- BRAVA PROTIV DUPLANJA ---
        if (orig.archived === true || orig.storno_url) {
            return res.json({ success: true, invoice: orig });
        }
@@ -1101,7 +1101,7 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
        let siguranBroj = orig.invoice_number ? String(orig.invoice_number).trim() : `URA-${orig.id}`;
        const stornoNumber = siguranBroj.toUpperCase().includes('STORNO') ? siguranBroj : `STORNO-${siguranBroj}`;
 
-       // 1. KREIRAMO NOVI RAČUN (Minus iznos)
+       // 1. KREIRAMO NOVI RAČUN (Minus iznos za knjigovođu)
        const stornoInsert = await pool.query(`
          INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived)
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'POVRATI', false) RETURNING *
@@ -1125,7 +1125,8 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
        const stornoUrl = uploadResult.secure_url;
        try { fs.unlinkSync(filePath); } catch (e) {}
 
-       // 3. KLJUČNO: Original ostaje 'SPREMLJENI' (ne bježi), ali dobiva 'archived = true' da nestane s radne liste
+       // 3. KLJUČNO: Originalu palimo 'archived = true' da nestane s liste rada,
+       // ali mu NE MIJENJAMO status (ostaje u svojoj rubrici, npr. SPREMLJENI)
        await pool.query('UPDATE inbound_invoices SET storno_url = $1, archived = true WHERE id = $2', [stornoUrl, orig.id]);
        await pool.query('UPDATE inbound_invoices SET storno_url = $1, file_url = $2 WHERE id = $3', [stornoUrl, stornoUrl, newStorno.id]);
 
@@ -1134,7 +1135,7 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
        return res.json({ success: true, invoice: orig });
     }
 
-    // Ažuriranje za ostale statuse (Plaćeno, Arhivirano...)
+    // Za ostale statuse (Plaćeno, Arhivirano)
     let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
     if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA') {
         query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';

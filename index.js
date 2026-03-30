@@ -955,22 +955,18 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
     const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
 
     if (targetStatus === 'POVRATI') {
-       // --- KNJIGOVODSTVENA LOGIKA STORNA ---
-       // 1. Dohvaćamo originalni račun
        const origRes = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
        if (origRes.rows.length === 0) return res.status(404).json({ error: 'Račun nije pronađen.' });
        const orig = origRes.rows[0];
 
        if (orig.status === 'POVRATI') {
-           // Ako je netko već kliknuo storno na storno, spriječi duplanje
            return res.json({ success: true, invoice: orig });
        }
 
-       // 2. Definiramo broj storno računa
        let siguranBroj = orig.invoice_number ? String(orig.invoice_number).trim() : `URA-${orig.id}`;
        const stornoNumber = siguranBroj.toUpperCase().includes('STORNO') ? siguranBroj : `STORNO-${siguranBroj}`;
 
-       // 3. KREIRAMO NOVI STAVAK U BAZI ZA KNJIGOVOĐU (S negativnim iznosom!)
+       // Kreiramo NOVI račun u minusu za knjigovođu
        const stornoInsert = await pool.query(`
          INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived)
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'POVRATI', false) RETURNING *
@@ -978,32 +974,32 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
          orig.supplier,
          orig.supplier_email,
          stornoNumber,
-         -Math.abs(Number(orig.amount)), // Upisujemo negativan iznos
-         orig.file_url, // Čuvamo vizualnu kopiju originala na novom računu
+         -Math.abs(Number(orig.amount)),
+         orig.file_url, 
          `Storno za račun br. ${siguranBroj}`,
          new Date().toLocaleDateString('hr-HR')
        ]);
 
        let newStorno = stornoInsert.rows[0];
 
-       // 4. Generiramo PDF koristeći podatke originalnog računa
+       // Generiramo PDF
        const fileName = `ura_storno_${newStorno.id}_${Date.now()}.pdf`;
        const filePath = path.join(__dirname, 'uploads', fileName);
        await generateUraStornoPDF(orig, filePath); 
 
-       // 5. Šaljemo PDF u cloud
        const uploadResult = await cloudinary.uploader.upload(filePath, { folder: 'kisfaluba_ura', resource_type: 'image' });
        const stornoUrl = uploadResult.secure_url;
        try { fs.unlinkSync(filePath); } catch (e) {}
 
-       // 6. Vežemo generirani storno PDF za taj NOVI račun
+       // Spremamo PDF i u NOVI storno račun, ali i u ORIGINAL (kako bi slanje maila radilo), a pritom original OSTAVLJAMO u Redovnim troškovima!
        await pool.query('UPDATE inbound_invoices SET storno_url = $1, file_url = $2 WHERE id = $3', [stornoUrl, stornoUrl, newStorno.id]);
+       await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [stornoUrl, orig.id]);
 
-       // 7. VRAĆAMO ORIGINAL FRONTENDU (Kako original ne bi nestao s ekrana iz "Redovnih troškova")
+       orig.storno_url = stornoUrl;
        return res.json({ success: true, invoice: orig });
     }
 
-    // --- AKO NIJE STORNO (npr. samo označavamo kao PLAĆENO) ---
+    // Za sve ostale statuse (Plaćeno, Arhivirano itd.)
     let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
     if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA') {
         query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
@@ -1016,59 +1012,6 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
 
     res.json({ success: true, invoice: result.rows[0] });
 
-  } catch (err) {
-    console.error("Greška pri ažuriranju URA statusa:", err);
-    res.status(500).json({ error: 'Greška u bazi.' });
-  }
-});
-
-app.patch('/inbound-invoices/:id/status', async (req, res) => {
-  try {
-    const { status } = req.body;
-    const id = String(req.params.id).split('-')[0];
-
-    let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
-    
-    if (status === 'ARHIVIRANI' || status === 'STORNO ARHIVA') {
-        query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
-    } else if (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') {
-        query = 'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *';
-    }
-
-    // Unificiramo ime statusa u bazi
-    const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
-    const result = await pool.query(query, [targetStatus, id]);
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Račun nije pronađen.' });
-    }
-    
-    const invData = result.rows[0];
-
-    // DODANO: AUTOMATSKO GENERIRANJE STORNO PDF-a (Isto kao kod narudžbi!)
-    if (targetStatus === 'POVRATI' && !invData.storno_url) {
-      const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
-      const filePath = path.join(__dirname, 'uploads', fileName);
-      
-      // Generiramo dokument
-      await generateUraStornoPDF(invData, filePath);
-      
-      // Šaljemo ga na Cloudinary
-      const uploadResult = await cloudinary.uploader.upload(filePath, {
-        folder: 'kisfaluba_ura',
-        resource_type: 'image'
-      });
-      const stornoUrl = uploadResult.secure_url;
-      
-      // Brišemo privremeni file sa servera
-      try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
-      
-      // Spremamo link u bazu
-      await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [stornoUrl, id]);
-      invData.storno_url = stornoUrl;
-    }
-
-    res.json({ success: true, invoice: invData });
   } catch (err) {
     console.error("Greška pri ažuriranju URA statusa:", err);
     res.status(500).json({ error: 'Greška u bazi.' });
@@ -1120,53 +1063,44 @@ app.post('/api/send-ura-storno', async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({error: 'Račun nije pronađen'});
     const inv = result.rows[0];
 
-    const fileName = `ura_storno_${cleanId}_${Date.now()}`;
-    const fPath = path.join(__dirname, 'uploads', `${fileName}.pdf`);
-    
-    // 1. GENERIRAJ STORNO POVRATNICU
-    await generateUraStornoPDF(inv, fPath);
+    // Samo dohvaćamo link, NE mijenjamo status originalu u bazi!
+    const pdfLinkZaDobavljaca = inv.storno_url || inv.file_url;
+    if (!pdfLinkZaDobavljaca) return res.status(400).json({ error: 'Dokument još nije generiran ili priložen.' });
 
-    // 2. POŠALJI NA CLOUDINARY
-    const uploadResult = await cloudinary.uploader.upload(fPath, {
-      folder: 'kisfaluba_ura',
-      resource_type: 'image',
-      public_id: fileName
-    });
-
-    const fileUrl = uploadResult.secure_url;
-    
     let siguranBrojRacuna = 'POV';
     if (inv.invoice_number) {
         siguranBrojRacuna = String(inv.invoice_number).trim();
     }
     const stornoNumber = siguranBrojRacuna.toUpperCase().includes('STORNO') ? siguranBrojRacuna : `STORNO-${siguranBrojRacuna}`;
-    
-    // 3. SPREMI LINK U BAZU (Sada se link sigurno čuva!)
-    await pool.query(
-      'UPDATE inbound_invoices SET status = $1, storno_url = $2 WHERE id = $3', 
-      ['POVRATI', fileUrl, cleanId]
-    );
 
-    // 4. POŠALJI MAIL DOBAVLJAČU (Vratio sam kod koji sam ti obrisao!)
     const finalEmailToSend = (inv.supplier_email && inv.supplier_email.includes('@')) ? inv.supplier_email : supplierEmail;
 
     if (finalEmailToSend && finalEmailToSend.includes('@')) {
-      const mailOptions = {
-        from: process.env.EMAIL_USER,
+      const emailHtml = `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; color: #333; line-height: 1.5; border: 1px solid #eee; border-radius: 5px;">
+          <h2 style="text-align: center; color: #e53e3e; margin-bottom: 20px;">OBAVIJEST O POVRATU / STORNO</h2>
+          <p>Poštovani,</p>
+          <p>Obavještavamo Vas o povratu vezano uz Vaš račun.</p>
+          <p>U nastavku se nalazi poveznica na naš službeni storno dokument / povratnicu.</p>
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${pdfLinkZaDobavljaca}" style="background-color: #e53e3e; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">PREUZMI DOKUMENT</a>
+          </div>
+          <p style="font-size: 12px; color: #666; margin-top: 30px;">Srdačan pozdrav,<br>Kišfaluba j.d.o.o.</p>
+        </div>
+      `;
+
+      await transporter.sendMail({
+        from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
         to: finalEmailToSend,
         subject: `Storno / Povratnica - ${stornoNumber}`,
-        html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU</h2><p>Poštovani,</p><p>U privitku Vam dostavljamo službeni storno dokument za povrat robe.</p></div>`,
-        attachments: [{ filename: `${stornoNumber}.pdf`, path: fPath }]
-      };
-      await transporter.sendMail(mailOptions);
+        html: emailHtml
+      });
     }
 
-    try { fs.unlinkSync(fPath); } catch (e) { console.error("Brisanje temp fajla nije uspjelo:", e); }
-
-    res.json({ success: true, message: 'Storno uspješno generiran i poslan!', fileUrl: fileUrl });
+    res.json({ success: true, message: 'Storno mail uspješno poslan dobavljaču!' });
 
   } catch (error) {
-    console.error('Greška pri storniranju:', error);
+    console.error('Greška pri slanju storno maila:', error);
     res.status(500).json({ error: 'Greška servera.' });
   }
 });

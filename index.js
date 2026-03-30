@@ -299,7 +299,7 @@ async function fetchInboundInvoicesFromEmail() {
           }
         }
 
- // --- PROVJERA DUPLIKATA I ZAPIS ---
+        // --- PROVJERA DUPLIKATA I ZAPIS ---
         const duplicateCheck = await pool.query(
           "SELECT id FROM inbound_invoices WHERE supplier = $1 AND invoice_number = $2 AND amount = $3",
           [supplierName, finalNote === subject ? 'Iz maila' : finalNote, extractedAmount]
@@ -959,127 +959,15 @@ app.get('/inbound-invoices', async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Greška servera" }); }
 });
 
-app.patch('/inbound-invoices/:id/status', async (req, res) => {
+app.post('/inbound-invoices', async (req, res) => {
+  const { supplier, supplier_email, invoice_number, amount, file_url, note, date } = req.body;
   try {
-    const { status } = req.body;
-    const id = String(req.params.id).split('-')[0];
-
-    const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
-
-    if (targetStatus === 'POVRATI') {
-       const origRes = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
-       if (origRes.rows.length === 0) return res.status(404).json({ error: 'Račun nije pronađen.' });
-       const orig = origRes.rows[0];
-
-       if (orig.status === 'POVRATI') {
-           return res.json({ success: true, invoice: orig });
-       }
-
-       let siguranBroj = orig.invoice_number ? String(orig.invoice_number).trim() : `URA-${orig.id}`;
-       const stornoNumber = siguranBroj.toUpperCase().includes('STORNO') ? siguranBroj : `STORNO-${siguranBroj}`;
-
-       // Kreiramo NOVI račun u minusu za knjigovođu
-       const stornoInsert = await pool.query(`
-         INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'POVRATI', false) RETURNING *
-       `, [
-         orig.supplier,
-         orig.supplier_email,
-         stornoNumber,
-         -Math.abs(Number(orig.amount)),
-         orig.file_url, 
-         `Storno za račun br. ${siguranBroj}`,
-         new Date().toLocaleDateString('hr-HR')
-       ]);
-
-       let newStorno = stornoInsert.rows[0];
-
-       // Generiramo PDF
-       const fileName = `ura_storno_${newStorno.id}_${Date.now()}.pdf`;
-       const filePath = path.join(__dirname, 'uploads', fileName);
-       await generateUraStornoPDF(orig, filePath); 
-
-       const uploadResult = await cloudinary.uploader.upload(filePath, { folder: 'kisfaluba_ura', resource_type: 'image' });
-       const stornoUrl = uploadResult.secure_url;
-       try { fs.unlinkSync(filePath); } catch (e) {}
-
-       // Spremamo PDF i u NOVI storno račun, ali i u ORIGINAL (kako bi slanje maila radilo), a pritom original OSTAVLJAMO u Redovnim troškovima!
-       await pool.query('UPDATE inbound_invoices SET storno_url = $1, file_url = $2 WHERE id = $3', [stornoUrl, stornoUrl, newStorno.id]);
-       await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [stornoUrl, orig.id]);
-
-       orig.storno_url = stornoUrl;
-       return res.json({ success: true, invoice: orig });
-    }
-
-    // Za sve ostale statuse (Plaćeno, Arhivirano itd.)
-    let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
-    if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA') {
-        query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
-    }
-
-    const result = await pool.query(query, [targetStatus, id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Račun nije pronađen.' });
-    }
-
-    res.json({ success: true, invoice: result.rows[0] });
-
-  } catch (err) {
-    console.error("Greška pri ažuriranju URA statusa:", err);
-    res.status(500).json({ error: 'Greška u bazi.' });
-  }
-});
-
-app.post('/inbound-invoices/archive', async (req, res) => {
-  try {
-    const { invoiceIds } = req.body;
-    if (!invoiceIds || !Array.isArray(invoiceIds) || invoiceIds.length === 0) {
-      return res.json({ success: true, message: 'Nema računa za arhiviranje.' });
-    }
-    
-    const cleanIds = invoiceIds.map(id => parseInt(String(id).split('-')[0], 10)).filter(id => !isNaN(id));
-    if (cleanIds.length === 0) return res.json({ success: true });
-
-    await pool.query('UPDATE inbound_invoices SET archived = true WHERE id = ANY($1::int[])', [cleanIds]);
-    res.json({ success: true, message: 'Računi su uspješno arhivirani.' });
-  } catch (err) { 
-    console.error("Greška pri arhiviranju URA:", err);
-    res.status(500).json({ error: 'Greška u bazi.' }); 
-  }
-});
-
-app.delete('/inbound-invoices/:id', async (req, res) => {
-  try {
-    const id = String(req.params.id).split('-')[0];
-    await pool.query('DELETE FROM inbound_invoices WHERE id = $1', [id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Greška pri brisanju' }); }
-});
-app.patch('/inbound-invoices/:id/file', async (req, res) => {
-  try {
-    const id = String(req.params.id).split('-')[0];
-    const { fileUrl } = req.body;
-    await pool.query('UPDATE inbound_invoices SET file_url = $1 WHERE id = $2', [fileUrl, id]);
-    res.json({ success: true, message: 'Dokument uspješno spremljen u bazu!' });
-  } catch (err) { 
-    console.error("Greška pri spremanju PDF linka u bazu:", err);
-    res.status(500).json({ error: 'Greška u bazi.' }); 
-  }
-});
-
-// --- RUTE ZA ULAZNE RAČUNE (URA) ---
-
-app.post('/inbound-invoices/fetch-email', async (req, res) => {
-  console.log("Ručno pokrenuta provjera mailova...");
-  await fetchInboundInvoicesFromEmail();
-  res.json({ success: true, message: 'Provjera pošte završena.' });
-});
-
-app.get('/inbound-invoices', async (req, res) => {
-  try {
-    const result = await pool.query("SELECT * FROM inbound_invoices ORDER BY id DESC");
-    res.json(result.rows);
-  } catch (err) { res.status(500).json({ error: "Greška servera" }); }
+    const result = await pool.query(
+      "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false) RETURNING *",
+      [supplier, supplier_email || '', invoice_number, amount, file_url, note, date]
+    );
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: "Greška u bazi." }); }
 });
 
 app.patch('/inbound-invoices/:id/status', async (req, res) => {
@@ -1148,6 +1036,24 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
   }
 });
 
+app.post('/inbound-invoices/archive', async (req, res) => {
+  try {
+    const { invoiceIds } = req.body;
+    if (!invoiceIds || !Array.isArray(invoiceIds) || invoiceIds.length === 0) {
+      return res.json({ success: true, message: 'Nema računa za arhiviranje.' });
+    }
+    
+    const cleanIds = invoiceIds.map(id => parseInt(String(id).split('-')[0], 10)).filter(id => !isNaN(id));
+    if (cleanIds.length === 0) return res.json({ success: true });
+
+    await pool.query('UPDATE inbound_invoices SET archived = true WHERE id = ANY($1::int[])', [cleanIds]);
+    res.json({ success: true, message: 'Računi su uspješno arhivirani.' });
+  } catch (err) { 
+    console.error("Greška pri arhiviranju URA:", err);
+    res.status(500).json({ error: 'Greška u bazi.' }); 
+  }
+});
+
 app.delete('/inbound-invoices/:id', async (req, res) => {
   try {
     const id = String(req.params.id).split('-')[0];
@@ -1161,8 +1067,11 @@ app.patch('/inbound-invoices/:id/file', async (req, res) => {
     const id = String(req.params.id).split('-')[0];
     const { fileUrl } = req.body;
     await pool.query('UPDATE inbound_invoices SET file_url = $1 WHERE id = $2', [fileUrl, id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Greška u bazi.' }); }
+    res.json({ success: true, message: 'Dokument uspješno spremljen u bazu!' });
+  } catch (err) { 
+    console.error("Greška pri spremanju PDF linka u bazu:", err);
+    res.status(500).json({ error: 'Greška u bazi.' }); 
+  }
 });
 
 app.post('/api/send-ura-storno', async (req, res) => {
@@ -1565,14 +1474,4 @@ app.get('/brisanje-baze', async (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => { 
   console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`); 
-});
-// PRIVREMENA METLA ZA BRISANJE SVEGA
-app.get('/brisanje-baze', async (req, res) => {
-  try {
-    await pool.query('DELETE FROM orders');
-    await pool.query('DELETE FROM inbound_invoices');
-    res.send('<h1>Sve narudžbe i ulazni računi su uspješno obrisani! 🧹</h1><p>Sada se vrati u VS Code, OBRISI ovaj kod i ponovno stisni Sync Changes kako ti nitko drugi ne bi mogao obrisati bazu.</p>');
-  } catch (err) { 
-    res.status(500).send('Greška pri brisanju: ' + err.message); 
-  }
 });

@@ -261,9 +261,17 @@ async function fetchInboundInvoicesFromEmail() {
 try {
             console.log("Uslikavam HTML mail...");
             const htmlContent = mail.html || `<div style="font-family: Arial; padding: 20px; white-space: pre-wrap;">${mail.text || subject}</div>`;
-            const browser = await puppeteer.launch({
+    const browser = await puppeteer.launch({
               headless: true,
-              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
+              args: [
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage', 
+                '--single-process',
+                '--disable-gpu',
+                '--no-zygote',
+                '--disable-software-rasterizer'
+              ]
             });
             const page = await browser.newPage();
             

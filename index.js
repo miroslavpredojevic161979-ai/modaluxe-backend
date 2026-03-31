@@ -1,4 +1,5 @@
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -876,7 +877,16 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
 app.use(express.json());
 
 // --- AUTHENTIKACIJA ---
-app.post('/api/login', async (req, res) => {
+
+// Pravilo: Maksimalno 5 pokušaja u 15 minuta
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, 
+  max: 5, 
+  message: { error: 'Previše neuspješnih pokušaja prijave. Zbog sigurnosti, pokušajte ponovno za 15 minuta.' }
+});
+
+// Ruta za prijavu sa zaštitom
+app.post('/api/login', loginLimiter, async (req, res) => {
   const { password } = req.body;
   const isMatch = await bcrypt.compare(password, process.env.ADMIN_HASH);
 

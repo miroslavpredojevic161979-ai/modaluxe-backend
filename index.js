@@ -953,49 +953,53 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
     const { status } = req.body;
     const id = String(req.params.id).split('-')[0];
     
-    // Unificiramo ime statusa
     const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
 
+    // Prvo moramo izvući originalni račun da znamo kakav mu je stari status
+    const origRes = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
+    if (origRes.rows.length === 0) return res.status(404).json({ error: 'Račun nije pronađen.' });
+    const invData = origRes.rows[0];
+
+    // Ako stišćemo POVRATI
+    if (targetStatus === 'POVRATI') {
+      // Generiramo PDF samo ako ga još nema
+      if (!invData.storno_url) {
+          const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
+          const filePath = path.join(__dirname, 'uploads', fileName);
+          
+          await generateUraStornoPDF(invData, filePath); 
+          
+          const uploadResult = await cloudinary.uploader.upload(filePath, { 
+            folder: 'kisfaluba_ura', 
+            resource_type: 'image' 
+          });
+          const stornoUrl = uploadResult.secure_url;
+          try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
+    
+          // KLJUČNA STVAR: Ne mijenjamo status! Ažuriramo SAMO storno_url.
+          // Tako račun ostaje u svojoj rubrici (npr. PREGLEDANI) i ostaje u Redovnim troškovima!
+          await pool.query('UPDATE inbound_invoices SET storno_url = $1, archived = false WHERE id = $2', [stornoUrl, id]);
+          
+          invData.storno_url = stornoUrl;
+      }
+      
+      // Vraćamo ga nazad, on je sad dobio storno_url, ali je ostao "zabetoniran" u starom statusu
+      return res.json({ success: true, invoice: invData });
+    }
+
+    // Za ostale statuse (Kada klikneš "Pregledani", "Spremljeno", "Arhivirano")
     let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
     
-    // Logika ista kao kod narudžbi: samo COMPLETED i ARHIVIRANI statusi sakrivaju račun (archived = true)
-    // Svi ostali, uključujući POVRATI, moraju ostati vidljivi (archived = false)
-    if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA' || targetStatus === 'COMPLETED') {
+    if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA') {
         query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
     } else {
+        // Za DOLAZNI, PREGLEDANI, SPREMLJENI - mijenjamo status i osiguravamo da je vidljiv
         query = 'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *';
     }
 
     const result = await pool.query(query, [targetStatus, id]);
     
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Račun nije pronađen.' });
-    }
-    
-    const invData = result.rows[0];
-
-    // Ako je račun poslan u POVRATI, automatski generiramo Storno PDF (ako već ne postoji link)
-    // Ne stvaramo novi red u bazi, nego koristimo postojeći (isto kao kod narudžbi)
-    if (targetStatus === 'POVRATI' && !invData.storno_url) {
-      const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
-      const filePath = path.join(__dirname, 'uploads', fileName);
-      
-      await generateUraStornoPDF(invData, filePath); 
-      
-      const uploadResult = await cloudinary.uploader.upload(filePath, { 
-        folder: 'kisfaluba_ura', 
-        resource_type: 'image' 
-      });
-      const stornoUrl = uploadResult.secure_url;
-      
-      try { fs.unlinkSync(filePath); } catch (e) {}
-
-      // Spremamo storno link u isti taj račun
-      await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [stornoUrl, id]);
-      invData.storno_url = stornoUrl;
-    }
-
-    res.json({ success: true, invoice: invData });
+    res.json({ success: true, invoice: result.rows[0] });
   } catch (err) {
     console.error("Greška pri ažuriranju statusa:", err);
     res.status(500).json({ error: 'Greška u bazi.' });

@@ -952,54 +952,37 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
   try {
     const { status } = req.body;
     const id = String(req.params.id).split('-')[0];
-    
     const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
 
-    // Prvo moramo izvući originalni račun da znamo kakav mu je stari status
-    const origRes = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
-    if (origRes.rows.length === 0) return res.status(404).json({ error: 'Račun nije pronađen.' });
-    const invData = origRes.rows[0];
-
-    // Ako stišćemo POVRATI
-    if (targetStatus === 'POVRATI') {
-      // Generiramo PDF samo ako ga još nema
-      if (!invData.storno_url) {
-          const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
-          const filePath = path.join(__dirname, 'uploads', fileName);
-          
-          await generateUraStornoPDF(invData, filePath); 
-          
-          const uploadResult = await cloudinary.uploader.upload(filePath, { 
-            folder: 'kisfaluba_ura', 
-            resource_type: 'image' 
-          });
-          const stornoUrl = uploadResult.secure_url;
-          try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
-    
-          // KLJUČNA STVAR: Ne mijenjamo status! Ažuriramo SAMO storno_url.
-          // Tako račun ostaje u svojoj rubrici (npr. PREGLEDANI) i ostaje u Redovnim troškovima!
-          await pool.query('UPDATE inbound_invoices SET storno_url = $1, archived = false WHERE id = $2', [stornoUrl, id]);
-          
-          invData.storno_url = stornoUrl;
-      }
-      
-      // Vraćamo ga nazad, on je sad dobio storno_url, ali je ostao "zabetoniran" u starom statusu
-      return res.json({ success: true, invoice: invData });
-    }
-
-    // Za ostale statuse (Kada klikneš "Pregledani", "Spremljeno", "Arhivirano")
     let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
     
-    if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA') {
+    // Logika kao kod narudžbi: Ako je POVRAT ili ARHIVA, archived postaje TRUE (betonira se)
+    if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA' || targetStatus === 'POVRATI') {
         query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
     } else {
-        // Za DOLAZNI, PREGLEDANI, SPREMLJENI - mijenjamo status i osiguravamo da je vidljiv
         query = 'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *';
     }
 
     const result = await pool.query(query, [targetStatus, id]);
     
-    res.json({ success: true, invoice: result.rows[0] });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Račun nije pronađen.' });
+    }
+    
+    const invData = result.rows[0];
+
+    // Generiraj storno PDF ako ga nema
+    if (targetStatus === 'POVRATI' && !invData.storno_url) {
+      const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
+      const filePath = path.join(__dirname, 'uploads', fileName);
+      await generateUraStornoPDF(invData, filePath); 
+      const uploadResult = await cloudinary.uploader.upload(filePath, { folder: 'kisfaluba_ura', resource_type: 'image' });
+      await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [uploadResult.secure_url, id]);
+      invData.storno_url = uploadResult.secure_url;
+      try { fs.unlinkSync(filePath); } catch (e) {}
+    }
+
+    res.json({ success: true, invoice: invData });
   } catch (err) {
     console.error("Greška pri ažuriranju statusa:", err);
     res.status(500).json({ error: 'Greška u bazi.' });

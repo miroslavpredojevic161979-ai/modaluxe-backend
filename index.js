@@ -911,24 +911,56 @@ const authGuard = (req, res, next) => {
   });
 };
 
-// --- STRIPE CHECKOUT ---
+// --- STRIPE CHECKOUT (SIGURNA VERZIJA) ---
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    const { items, customer, total, isApp, discount } = req.body; 
+    const { items, customer, isApp, discount, shippingPrice } = req.body; 
     const normalizedItems = parseJsonSafe(items, []);
-    const totalAmount = Number((Number.isFinite(Number(total)) ? Number(total) : calcTotals(normalizedItems)).toFixed(2));
+
+    if (normalizedItems.length === 0) {
+      return res.status(400).json({ error: 'Košarica je prazna.' });
+    }
+
+    // 1. SIGURNOST: DOHVAĆANJE PRAVIH CIJENA IZ BAZE
+    const itemIds = normalizedItems.map(item => String(item.id));
+    const dbProductsResult = await pool.query('SELECT id, price FROM products WHERE id = ANY($1)', [itemIds]);
     
-    const address = customer.address; 
+    // Spremanje pravih cijena u brzu memoriju
+    const dbPrices = {};
+    dbProductsResult.rows.forEach(row => {
+      dbPrices[row.id] = Number(row.price);
+    });
+
+    // 2. SIGURNO RAČUNANJE TOTALA (Backend sam zbraja!)
+    let safeSubtotal = 0;
+    const validatedItems = normalizedItems.map(item => {
+      const realPrice = dbPrices[item.id] || 0; // Vuče cijenu iz baze, a ne s frontenda
+      const qty = toNumberSafe(item.qty || item.quantity || 1);
+      safeSubtotal += realPrice * qty;
+      return { ...item, price: realPrice, qty }; // Ažuriramo košaricu pravim cijenama
+    });
+
+    // 3. DODAVANJE DOSTAVE I POPUSTA
+    const safeShipping = toNumberSafe(shippingPrice || 0); 
+    const safeDiscount = discount && discount.amount ? toNumberSafe(discount.amount) : 0;
+
+    let totalAmount = safeSubtotal + safeShipping - safeDiscount;
+    if (totalAmount < 0) totalAmount = 0; // Osiguranje da nikad ne ide u minus
+
+    const totalInCents = Math.round(totalAmount * 100);
+
+    // --- ZAPIS U BAZU ---
+    const address = customer.address || `${customer.street}, ${customer.postalCode} ${customer.city}, ${customer.country}`; 
     const name = `${customer.firstName} ${customer.lastName}`;
     
     const newOrder = await pool.query(
       'INSERT INTO orders (name, address, phone, email, total, items, status, discount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
-      [name, address, customer.phone || '', customer.email || '', totalAmount, JSON.stringify(normalizedItems), 'NEW', JSON.stringify(discount || { amount: 0 })]
+      [name, address, customer.phone || '', customer.email || '', totalAmount, JSON.stringify(validatedItems), 'NEW', JSON.stringify(discount || { amount: 0 })]
     );
     const orderId = newOrder.rows[0].id;
-    await deductStock(normalizedItems);
+    await deductStock(validatedItems); // Skidanje zalihe
     
-    const totalInCents = Math.round(totalAmount * 100);
+    // --- STRIPE SESIJA ---
     const successUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-success?app=true` : `${req.protocol}://${req.get('host')}/payment-success`;
     const cancelUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-cancel?app=true` : `${req.protocol}://${req.get('host')}/payment-cancel`;
     
@@ -939,7 +971,7 @@ app.post('/create-checkout-session', async (req, res) => {
       line_items: [{
         price_data: {
           currency: 'eur',
-          product_data: { name: 'KISFALUBA Vaša narudžba', description: `Kupac: ${name}` },
+          product_data: { name: 'Kišfaluba narudžba', description: `Kupac: ${name}` },
           unit_amount: totalInCents,
         },
         quantity: 1
@@ -948,6 +980,7 @@ app.post('/create-checkout-session', async (req, res) => {
       success_url: req.body.returnUrl ? req.body.returnUrl : successUrl,
       cancel_url: req.body.returnUrl ? req.body.returnUrl.replace('payment-success', 'payment-cancel') : cancelUrl,
     });
+    
     res.json({ url: session.url });
   } catch (err) {
     console.error('Stripe greška:', err.message);

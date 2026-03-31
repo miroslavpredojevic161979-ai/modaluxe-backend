@@ -258,7 +258,7 @@ async function fetchInboundInvoicesFromEmail() {
           }
         } else {
           // --- NEMA PRILOGA: PALIMO PUPPETEER DA SLIKA HTML ---
-          try {
+try {
             console.log("Uslikavam HTML mail...");
             const htmlContent = mail.html || `<div style="font-family: Arial; padding: 20px; white-space: pre-wrap;">${mail.text || subject}</div>`;
             const browser = await puppeteer.launch({
@@ -266,7 +266,10 @@ async function fetchInboundInvoicesFromEmail() {
               args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
             });
             const page = await browser.newPage();
-            await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 15000 });
+            
+            // OVDJE JE ISPRAVAK: Više ne čekamo sve žive linkove/slike da se učitaju, nego samo osnovni kod (domcontentloaded)
+            await page.setContent(htmlContent, { waitUntil: 'domcontentloaded', timeout: 20000 });
+            
             const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
             await browser.close();
 
@@ -276,7 +279,7 @@ async function fetchInboundInvoicesFromEmail() {
             finalNote = 'Iz maila (Skenirano)';
           } catch (puppeteerErr) {
             console.error("Puppeteer greška, spašavam kao običan tekst:", puppeteerErr);
-            // Osigurač ako skener ipak zapne - snimit će ga tekstualno da ne izgubiš račun!
+            // Osigurač ako skener ipak zapne zbog manjka memorije servera
             try {
               const fName = `ura_tekst_${Date.now()}`;
               const doc = new PDFDocument({ margin: 40, size: 'A4' });
@@ -291,8 +294,9 @@ async function fetchInboundInvoicesFromEmail() {
                       } catch(err) { reject(err); }
                   });
               });
-              doc.fontSize(16).text('Sadržaj e-maila (Greška u skeniranju formata)', { align: 'center' }).moveDown(2);
-              doc.fontSize(10).text(fixText(mail.text || 'E-mail ne sadrži čitljiv tekst.'));
+              // PROMIJENJEN NASLOV: Nije više "Greška" nego "Tekstualni format"
+              doc.fontSize(16).text('Sadržaj e-maila (Tekstualni format)', { align: 'center' }).moveDown(2);
+              doc.fontSize(10).text(fixText(mail.text || 'E-mail ne sadrži HTML ili se slike nisu mogle učitati.'));
               doc.end();
               finalFileUrl = await uploadPromise;
             } catch(fallbackErr) { console.error(fallbackErr); }

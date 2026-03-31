@@ -957,7 +957,7 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
     let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
     
     // Logika kao kod narudžbi: Ako je POVRAT ili ARHIVA, archived postaje TRUE (betonira se)
-    if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA' || targetStatus === 'POVRATI') {
+if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA') {
         query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
     } else {
         query = 'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *';

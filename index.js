@@ -299,23 +299,12 @@ async function fetchInboundInvoicesFromEmail() {
           }
         }
 
-        // --- PROVJERA DUPLIKATA I ZAPIS ---
-        const duplicateCheck = await pool.query(
-          "SELECT id FROM inbound_invoices WHERE supplier = $1 AND invoice_number = $2 AND amount = $3",
-          [supplierName, finalNote === subject ? 'Iz maila' : finalNote, extractedAmount]
+ // --- ZAPIS U BAZU (BEZ PROVJERE DUPLIKATA) ---
+        await pool.query(
+          "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false)",
+          [supplierName, senderAddress, finalNote === subject ? 'Iz maila' : finalNote, extractedAmount, finalFileUrl, subject, dateStr]
         );
-
-        if (duplicateCheck.rows.length === 0) {
-          // Ako račun NE postoji, upiši ga
-          await pool.query(
-            "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false)",
-            [supplierName, senderAddress, finalNote === subject ? 'Iz maila' : finalNote, extractedAmount, finalFileUrl, subject, dateStr]
-          );
-          console.log(`✅ Račun od ${supplierName} (${extractedAmount} EUR) uspješno spremljen.`);
-        } else {
-          // Ako račun već POSTOJI, samo ga preskoči
-          console.log(`⚠️ Preskačem duplikat računa od ${supplierName}.`);
-        }
+        console.log(`✅ Račun od ${supplierName} (${extractedAmount} EUR) uspješno spremljen.`);
 
       } catch (singleMailErr) {
         console.error('Greška pri obradi JEDNOG maila:', singleMailErr.message);
@@ -963,66 +952,52 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
   try {
     const { status } = req.body;
     const id = String(req.params.id).split('-')[0];
+    
+    // Unificiramo ime statusa
     const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
 
-    if (targetStatus === 'POVRATI') {
-       const origRes = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
-       if (origRes.rows.length === 0) return res.status(404).json({ error: 'Račun nije pronađen.' });
-       const orig = origRes.rows[0];
-
-       // BRAVA PROTIV DUPLANJA: Ako je već arhiviran ili ima storno, samo ga vrati
-       if (orig.archived === true || orig.storno_url) {
-           return res.json({ success: true, invoice: orig });
-       }
-
-       let siguranBroj = orig.invoice_number ? String(orig.invoice_number).trim() : `URA-${orig.id}`;
-       const stornoNumber = siguranBroj.toUpperCase().includes('STORNO') ? siguranBroj : `STORNO-${siguranBroj}`;
-
-       // 1. KREIRAMO NOVI RAČUN (Minus iznos za knjigovođu, ulazi ravno u status POVRATI)
-       const stornoInsert = await pool.query(`
-         INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'POVRATI', false) RETURNING *
-       `, [
-         orig.supplier,
-         orig.supplier_email,
-         stornoNumber,
-         -Math.abs(Number(orig.amount)),
-         orig.file_url, 
-         `Storno za račun br. ${siguranBroj}`,
-         new Date().toLocaleDateString('hr-HR')
-       ]);
-
-       let newStorno = stornoInsert.rows[0];
-
-       // 2. GENERIRAMO PDF
-       const fileName = `ura_storno_${newStorno.id}_${Date.now()}.pdf`;
-       const filePath = path.join(__dirname, 'uploads', fileName);
-       await generateUraStornoPDF(orig, filePath); 
-       
-       const uploadResult = await cloudinary.uploader.upload(filePath, { folder: 'kisfaluba_ura', resource_type: 'image' });
-       const stornoUrl = uploadResult.secure_url;
-       try { fs.unlinkSync(filePath); } catch (e) {}
-
-       // 3. KLJUČNO ZA KNJIGOVOĐU: 
-       // Originalnom računu NE MIJENJAMO status (ostaje gdje je bio), samo ga sakrijemo (archived=true)
-       // i zalijepimo mu storno PDF. Novom negativnom računu također lijepimo PDF.
-       await pool.query('UPDATE inbound_invoices SET storno_url = $1, archived = true WHERE id = $2', [stornoUrl, orig.id]);
-       await pool.query('UPDATE inbound_invoices SET storno_url = $1, file_url = $2 WHERE id = $3', [stornoUrl, stornoUrl, newStorno.id]);
-
-       orig.archived = true;
-       orig.storno_url = stornoUrl;
-       return res.json({ success: true, invoice: orig });
-    }
-
-    // Za ostale statuse (Plaćeno, Arhivirano)
     let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
-    if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA') {
+    
+    // Logika ista kao kod narudžbi: samo COMPLETED i ARHIVIRANI statusi sakrivaju račun (archived = true)
+    // Svi ostali, uključujući POVRATI, moraju ostati vidljivi (archived = false)
+    if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA' || targetStatus === 'COMPLETED') {
         query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
+    } else {
+        query = 'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *';
     }
+
     const result = await pool.query(query, [targetStatus, id]);
-    res.json({ success: true, invoice: result.rows[0] });
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Račun nije pronađen.' });
+    }
+    
+    const invData = result.rows[0];
+
+    // Ako je račun poslan u POVRATI, automatski generiramo Storno PDF (ako već ne postoji link)
+    // Ne stvaramo novi red u bazi, nego koristimo postojeći (isto kao kod narudžbi)
+    if (targetStatus === 'POVRATI' && !invData.storno_url) {
+      const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
+      const filePath = path.join(__dirname, 'uploads', fileName);
+      
+      await generateUraStornoPDF(invData, filePath); 
+      
+      const uploadResult = await cloudinary.uploader.upload(filePath, { 
+        folder: 'kisfaluba_ura', 
+        resource_type: 'image' 
+      });
+      const stornoUrl = uploadResult.secure_url;
+      
+      try { fs.unlinkSync(filePath); } catch (e) {}
+
+      // Spremamo storno link u isti taj račun
+      await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [stornoUrl, id]);
+      invData.storno_url = stornoUrl;
+    }
+
+    res.json({ success: true, invoice: invData });
   } catch (err) {
-    console.error("Greška pri promjeni statusa:", err);
+    console.error("Greška pri ažuriranju statusa:", err);
     res.status(500).json({ error: 'Greška u bazi.' });
   }
 });
@@ -1076,17 +1051,26 @@ app.post('/api/send-ura-storno', async (req, res) => {
     const finalEmail = (inv.supplier_email && inv.supplier_email.includes('@')) ? inv.supplier_email : supplierEmail;
 
     if (finalEmail && finalEmail.includes('@')) {
+      let siguranBroj = inv.invoice_number ? String(inv.invoice_number).trim() : `URA-${inv.id}`;
+      const stornoNumber = siguranBroj.toUpperCase().includes('STORNO') ? siguranBroj : `STORNO-${siguranBroj}`;
+
       await transporter.sendMail({
         from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
         to: finalEmail,
-        subject: `Storno / Povratnica - ${inv.invoice_number}`,
-        html: `<p>Poštovani, u privitku je dokument: <a href="${pdfLink}">PREUZMI</a></p>`
+        subject: `Storno / Povratnica - ${stornoNumber}`,
+        html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU</h2><p>Poštovani,</p><p>U privitku Vam dostavljamo službeni storno dokument za povrat robe.</p></div>`,
+        attachments: [
+          {
+            filename: `${stornoNumber}.pdf`,
+            path: pdfLink
+          }
+        ]
       });
     }
-    res.json({ success: true, message: 'Storno mail je uspješno poslan dobavljaču!' });
+    res.json({ success: true, message: 'Storno mail je uspješno poslan dobavljaču s privitkom!' });
   } catch (error) { 
-    console.error(error);
-    res.status(500).json({ error: 'Greška servera.' }); 
+    console.error("Greška pri slanju storno maila dobavljaču:", error);
+    res.status(500).json({ error: 'Greška servera pri slanju e-maila.' }); 
   }
 });
 

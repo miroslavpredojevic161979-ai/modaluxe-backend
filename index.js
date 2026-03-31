@@ -954,15 +954,16 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
     const id = String(req.params.id).split('-')[0];
     const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
 
-    let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
+let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
     
-    // Logika kao kod narudžbi: Ako je POVRAT ili ARHIVA, archived postaje TRUE (betonira se)
-if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA') {
+    if (targetStatus === 'ARHIVIRANI') {
+        // Samo kada šalješ redovni izvještaj, original se "betonira" u arhivu
         query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
-    } else {
+    } else if (targetStatus === 'POVRATI') {
+        // Kada račun ide u obradu povrata, osiguravamo da je otključan
         query = 'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *';
     }
-
+ 
     const result = await pool.query(query, [targetStatus, id]);
     
     if (result.rows.length === 0) {

@@ -1539,6 +1539,17 @@ app.patch('/api/complaints/:id', async (req, res) => {
     res.status(500).json({ error: 'Greška pri ažuriranju prigovora' });
   }
 });
+// Brisanje prigovora (za Admin panel)
+app.delete('/api/complaints/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query('DELETE FROM complaints WHERE id = $1', [id]);
+    res.json({ success: true, message: 'Prigovor obrisan' });
+  } catch (err) {
+    console.error('Greška pri brisanju prigovora:', err);
+    res.status(500).json({ error: 'Greška na serveru' });
+  }
+});
 
 // --- PRIVREMENA METLA ZA BRISANJE SVEGA ---
 app.get('/brisanje-baze', async (req, res) => {

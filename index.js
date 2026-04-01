@@ -57,6 +57,20 @@ const initDB = async () => {
         name VARCHAR(255) NOT NULL
       );
     `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS complaints (
+        id VARCHAR(255) PRIMARY KEY,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        full_name VARCHAR(255) NOT NULL,
+        email VARCHAR(255),
+        phone VARCHAR(255),
+        order_id VARCHAR(255),
+        message TEXT NOT NULL,
+        status VARCHAR(50) DEFAULT 'NEW',
+        admin_note TEXT
+      );
+    `);
     console.log("Baza podataka (kolone i tablice) uspješno sinkronizirana.");
   } catch (err) {
     console.error("Greška pri sinkronizaciji baze:", err.message);
@@ -1479,6 +1493,52 @@ app.get('/payment-cancel', (req, res) => {
 });
 
 app.get('/', (req, res) => res.send('KISFALUBA Backend Online!'));
+
+// --- RUTE ZA PRIGOVORE ---
+
+// Dohvaćanje svih prigovora (za Admin panel)
+app.get('/api/complaints', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM complaints ORDER BY created_at DESC');
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Greška prigovori GET:', err);
+    res.status(500).json({ error: 'Greška servera' });
+  }
+});
+
+// Kupac šalje novi prigovor
+app.post('/api/complaints', async (req, res) => {
+  const { id, fullName, email, phone, orderId, message } = req.body;
+  try {
+    await pool.query(
+      'INSERT INTO complaints (id, full_name, email, phone, order_id, message, status) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [id, fullName, email || '', phone || '', orderId || '', message, 'NEW']
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Greška prigovori POST:', err);
+    res.status(500).json({ error: 'Greška pri spremanju prigovora' });
+  }
+});
+
+// Admin mijenja status ili napomenu prigovora
+app.patch('/api/complaints/:id', async (req, res) => {
+  const { id } = req.params;
+  const { status, adminNote } = req.body;
+  try {
+    if (status !== undefined) {
+      await pool.query('UPDATE complaints SET status = $1 WHERE id = $2', [status, id]);
+    }
+    if (adminNote !== undefined) {
+      await pool.query('UPDATE complaints SET admin_note = $1 WHERE id = $2', [adminNote, id]);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Greška prigovori PATCH:', err);
+    res.status(500).json({ error: 'Greška pri ažuriranju prigovora' });
+  }
+});
 
 // --- PRIVREMENA METLA ZA BRISANJE SVEGA ---
 app.get('/brisanje-baze', async (req, res) => {

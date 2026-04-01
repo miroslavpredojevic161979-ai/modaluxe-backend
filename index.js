@@ -1551,6 +1551,10 @@ app.get('/brisanje-baze', async (req, res) => {
   }
 });
 
+// FORSIRANJE BAZE DA PRIHVATI DECIMALE (CENTE)
+pool.query('ALTER TABLE products ALTER COLUMN price TYPE NUMERIC(10,2)').catch(e => console.log('Price update:', e.message));
+pool.query('ALTER TABLE products ALTER COLUMN cost_price TYPE NUMERIC(10,2)').catch(e => console.log('Cost update:', e.message));
+
 app.listen(PORT, '0.0.0.0', () => { 
   console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`); 
 });

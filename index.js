@@ -1569,3 +1569,4 @@ app.get('/brisanje-baze', async (req, res) => {
     res.status(500).send('Greška pri brisanju: ' + err.message); 
   }
 });
+// vercel budi se 123

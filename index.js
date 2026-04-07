@@ -982,17 +982,10 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         const updatedOrder = updateResult.rows[0];
         
         if (updatedOrder) {
-          const invoiceNumber = invoiceNumberFromOrderId(orderId);
-          const fileName = `racun_${orderId}_${Date.now()}.pdf`;
-          const filePath = path.join(__dirname, 'uploads', fileName);
-          
-          await generatePDFInvoice(updatedOrder, invoiceNumber, filePath);
-          
-          const uploadResult = await cloudinary.uploader.upload(filePath, {
-            folder: 'kisfaluba_racuni',
-            resource_type: 'image'
-          });
-          const invoiceUrl = uploadResult.secure_url;
+// POKREĆEMO SOLO.HR ZA KARTICE
+          const soloRacun = await createSoloInvoice(updatedOrder, true);
+          const invoiceUrl = soloRacun ? soloRacun.pdf : null;
+          const invoiceNumber = soloRacun ? soloRacun.broj_racuna : invoiceNumberFromOrderId(orderId);
           
           try { fs.unlinkSync(filePath); } catch (e) { console.error('Brisanje lokalnog fajla propalo:', e); }
           
@@ -1370,18 +1363,10 @@ app.post('/orders', async (req, res) => {
     const orderId = orderData.id;
     await deductStock(normalizedItems);
     
-    const invoiceNumber = invoiceNumberFromOrderId(orderId);
-    const fileName = `racun_${orderId}_${Date.now()}.pdf`;
-    const filePath = path.join(__dirname, 'uploads', fileName);
-    
-    await generatePDFInvoice(orderData, invoiceNumber, filePath);
-    
-    const uploadResult = await cloudinary.uploader.upload(filePath, {
-      folder: 'kisfaluba_racuni',
-      resource_type: 'image'
-    });
-    const invoiceUrl = uploadResult.secure_url;
-    try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
+// POKREĆEMO SOLO.HR ZA POUZEĆE
+    const soloRacun = await createSoloInvoice(orderData, false); // false = Gotovina/Pouzeće
+    const invoiceUrl = soloRacun ? soloRacun.pdf : null;
+    const invoiceNumber = soloRacun ? soloRacun.broj_racuna : invoiceNumberFromOrderId(orderId);
     
     await pool.query('UPDATE orders SET invoice_url = $1 WHERE id = $2', [invoiceUrl, orderId]);
     orderData.invoice_url = invoiceUrl;

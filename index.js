@@ -936,6 +936,8 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           );
           
           console.log(`Narudžba ID ${orderId} je PLAĆENA i PDF račun je generiran!`);
+          // Šaljemo nalog dobavljačima nakon uplate karticom
+                  sendPackingSlipsToSuppliers(updatedOrder, parseJsonSafe(updatedOrder.items, [])).catch(e => console.error("X Greška dobavljači Stripe:", e));
           
           if (updatedOrder.email) {
             await transporter.sendMail({

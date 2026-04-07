@@ -167,6 +167,82 @@ const transporter = nodemailer.createTransport({
   },
   tls: { rejectUnauthorized: false }
 });
+// --- SLANJE NALOGA DOBAVLJAČIMA (DROPSHIPPING) ---
+const sendPackingSlipsToSuppliers = async (order, items) => {
+  try {
+    const supplierGroups = {};
+    
+    for (const item of items) {
+      if (!item.id) continue;
+      
+      const res = await pool.query('SELECT supplier_email FROM products WHERE id = $1', [item.id]);
+      if (res.rows.length === 0 || !res.rows[0].supplier_email) continue; 
+      
+      const email = res.rows[0].supplier_email.trim();
+      if (!supplierGroups[email]) {
+        supplierGroups[email] = [];
+      }
+      supplierGroups[email].push(item);
+    }
+
+    for (const [supplierEmail, supplierItems] of Object.entries(supplierGroups)) {
+      
+      const itemsHtml = supplierItems.map(i => {
+        const qty = i.qty || i.quantity || 1;
+        const brand = i.brand || '';
+        const variant = i.selectedVariantKey ? i.selectedVariantKey.split('|')[0] : 'Standard';
+        return `<li style="margin-bottom: 10px; font-size: 16px;">
+          <strong>${qty}x</strong> ${brand} ${i.name} 
+          <br><span style="color: #d69e2e; font-size: 14px;">Veličina/Boja: <strong>${variant}</strong></span>
+        </li>`;
+      }).join('');
+
+      const mailOptions = {
+        from: '"Kišfaluba Moda" <' + process.env.EMAIL_USER + '>',
+        to: supplierEmail,
+        subject: "NOVI RADNI NALOG - Narudžba #" + order.id,
+        html: `
+          <div style="font-family: Arial, sans-serif; color: #111; max-width: 600px; margin: auto; border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden;">
+            <div style="background-color: #000; color: #D4AF37; padding: 20px; text-align: center;">
+              <h2 style="margin: 0; letter-spacing: 2px;">KIŠFALUBA - RADNI NALOG</h2>
+              <p style="margin: 5px 0 0 0; font-size: 12px; color: #fff;">Službeni nalog za pakiranje i slanje robe</p>
+            </div>
+            
+            <div style="padding: 20px;">
+              <p>Poštovani,</p>
+              <p>Zaprimili smo novu narudžbu. Molimo vas da zapakirate sljedeće proizvode u Kisfaluba ambalažu i pošaljete kupcu na ovu adresu:</p>
+              
+              <div style="background-color: #f7fafc; padding: 15px; border-left: 4px solid #D4AF37; margin: 20px 0;">
+                <h3 style="margin-top: 0; color: #2b6cb0;">PODACI KUPCA ZA DOSTAVU:</h3>
+                <p style="margin: 0; font-size: 16px;"><strong>Ime i prezime:</strong> ${order.name}</p>
+                <p style="margin: 5px 0 0 0; font-size: 16px;"><strong>Adresa:</strong> ${order.address}</p>
+                <p style="margin: 5px 0 0 0; font-size: 16px;"><strong>Telefon (za kurira):</strong> ${order.phone}</p>
+              </div>
+
+              <h3 style="border-bottom: 2px solid #eee; padding-bottom: 5px;">STAVKE ZA PAKIRANJE:</h3>
+              <ul style="list-style-type: none; padding: 0;">
+                ${itemsHtml}
+              </ul>
+
+              <p style="margin-top: 30px; font-size: 12px; color: #e53e3e; font-weight: bold;">
+                NAPOMENA: U paket NE STAVLJATI račune s cijenama. Račun je kupcu već poslan elektronički. U paket obavezno priložiti letak s pravom na povrat.
+              </p>
+            </div>
+            
+            <div style="background-color: #f1f1f1; padding: 15px; text-align: center; font-size: 11px; color: #666;">
+              Automatski generirano iz Kisfaluba sustava. Narudžba ID: ${order.id}
+            </div>
+          </div>
+        `
+      };
+
+      await transporter.sendMail(mailOptions);
+      console.log("Radni nalog poslan dobavljaču: " + supplierEmail);
+    }
+  } catch (error) {
+    console.error("Greška pri slanju maila dobavljačima:", error);
+  }
+};
 
 // --- SKIDANJE ZALIHE ---
 const deductStock = async (items) => {

@@ -1331,6 +1331,8 @@ app.post('/orders', async (req, res) => {
         })
       }).catch(e => console.error('X Greška slanja računa:', e));
     }
+    // Šaljemo radni nalog dobavljačima (Pouzeće)
+    sendPackingSlipsToSuppliers(orderData, normalizedItems).catch(e => console.error("X Greška dobavljači:", e));
     res.json({ message: 'Narudžba uspješna!', order: orderData });
   } catch (err) { res.status(500).json({ error: 'Greška pri spremanju.' }); }
 });

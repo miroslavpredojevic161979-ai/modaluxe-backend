@@ -1,4 +1,5 @@
 const express = require('express');
+const axios = require('axios');
 const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 const Stripe = require('stripe');
@@ -111,6 +112,71 @@ const calcTotals = (items) => {
     return acc + toNumberSafe(it.price) * toNumberSafe(it.qty || it.quantity || 1);
   }, 0);
   return Number(sum.toFixed(2));
+};
+// --- SOLO.HR FISKALIZACIJA ---
+const createSoloInvoice = async (orderData, isPaid) => {
+  try {
+    const token = process.env.SOLO_API_TOKEN;
+    if (!token) return null;
+
+    const items = parseJsonSafe(orderData.items, []);
+    let usluge = items.map(item => ({
+      tip_usluge: 1, 
+      opis_usluge: `${item.brand || ''} ${item.name} (${item.selectedVariantKey?.split('|')[0] || 'Std'})`.trim(),
+      kolicina: toNumberSafe(item.qty || item.quantity || 1),
+      cijena: toNumberSafe(item.price),
+      popust: 0,
+      porez_stopa: 0 
+    }));
+
+    const itemsTotal = items.reduce((acc, item) => acc + (toNumberSafe(item.price) * toNumberSafe(item.qty || 1)), 0);
+    const disc = parseJsonSafe(orderData.discount, { amount: 0 });
+    let shippingPrice = Number(orderData.total) - itemsTotal + Number(disc.amount);
+    
+    if (shippingPrice > 0) {
+      usluge.push({
+        tip_usluge: 2,
+        opis_usluge: 'Dostava',
+        kolicina: 1,
+        cijena: Number(shippingPrice.toFixed(2)),
+        popust: 0,
+        porez_stopa: 0
+      });
+    }
+
+    if (disc && disc.amount > 0) {
+        usluge.push({
+            tip_usluge: 2,
+            opis_usluge: `Popust (${disc.code || 'Promo'})`,
+            kolicina: 1,
+            cijena: -Math.abs(Number(disc.amount)),
+            popust: 0,
+            porez_stopa: 0
+        });
+    }
+
+    const payload = {
+      token: token,
+      tip_racuna: 1, 
+      kupac_naziv: orderData.name,
+      kupac_adresa: orderData.address,
+      nacin_placanja: isPaid ? 3 : 2, // 3 = Kartice, 2 = Gotovina (Pouzeće)
+      prikazi_porez: 0, 
+      usluge: usluge
+    };
+
+    const res = await axios.post('https://api.solo.com.hr/racun', payload);
+    if (res.data && res.data.status === 1) {
+      console.log("Solo račun uspješno kreiran! PDF: " + res.data.racun.pdf);
+      return res.data.racun;
+    } else {
+      console.error("Solo.hr odbio račun:", res.data.poruka);
+      return null;
+    }
+  } catch (err) {
+    console.error("Greška pri spajanju sa Solo.hr:", err.message);
+    return null;
+  }
 };
 
 // --- UPLOAD (MULTER + CLOUDINARY) ---

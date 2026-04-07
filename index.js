@@ -1,5 +1,6 @@
 const express = require('express');
 const axios = require('axios');
+const FormData = require('form-data');
 const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 const Stripe = require('stripe');
@@ -120,57 +121,31 @@ const createSoloInvoice = async (orderData, isPaid) => {
     if (!token) return null;
 
     const items = parseJsonSafe(orderData.items, []);
-    let usluge = items.map(item => ({
-      tip_usluge: 1, 
-      opis_usluge: `${item.brand || ''} ${item.name} (${item.selectedVariantKey?.split('|')[0] || 'Std'})`.trim(),
-      kolicina: toNumberSafe(item.qty || item.quantity || 1),
-      cijena: toNumberSafe(item.price),
-      popust: 0,
-      porez_stopa: 0 
-    }));
+    const form = new FormData();
+    form.append('token', token);
+    form.append('tip_racuna', '1'); 
+    form.append('kupac_naziv', orderData.name || 'Gost');
+    form.append('kupac_adresa', orderData.address || '');
+    form.append('nacin_placanja', isPaid ? '3' : '2'); 
+    form.append('prikazi_porez', '0'); 
+    form.append('fiskalizacija', '1'); 
 
-    const itemsTotal = items.reduce((acc, item) => acc + (toNumberSafe(item.price) * toNumberSafe(item.qty || 1)), 0);
-    const disc = parseJsonSafe(orderData.discount, { amount: 0 });
-    let shippingPrice = Number(orderData.total) - itemsTotal + Number(disc.amount);
-    
-    if (shippingPrice > 0) {
-      usluge.push({
-        tip_usluge: 2,
-        opis_usluge: 'Dostava',
-        kolicina: 1,
-        cijena: Number(shippingPrice.toFixed(2)),
-        popust: 0,
-        porez_stopa: 0
-      });
-    }
+    items.forEach((item, index) => {
+      form.append(`usluge[${index}][opis_usluge]`, `${item.brand || ''} ${item.name}`.trim());
+      form.append(`usluge[${index}][kolicina]`, String(item.qty || 1));
+      form.append(`usluge[${index}][cijena]`, String(item.price));
+      form.append(`usluge[${index}][porez_stopa]`, '0');
+    });
 
-    if (disc && disc.amount > 0) {
-        usluge.push({
-            tip_usluge: 2,
-            opis_usluge: `Popust (${disc.code || 'Promo'})`,
-            kolicina: 1,
-            cijena: -Math.abs(Number(disc.amount)),
-            popust: 0,
-            porez_stopa: 0
-        });
-    }
+    const res = await axios.post('https://api.solo.com.hr/racun', form, {
+      headers: form.getHeaders()
+    });
 
-    const payload = {
-      token: token,
-      tip_racuna: 1, 
-      kupac_naziv: orderData.name,
-      kupac_adresa: orderData.address,
-      nacin_placanja: isPaid ? 3 : 2, // 3 = Kartice, 2 = Gotovina (Pouzeće)
-      prikazi_porez: 0, 
-      usluge: usluge
-    };
-
-    const res = await axios.post('https://api.solo.com.hr/racun', payload);
     if (res.data && res.data.status === 1) {
       console.log("Solo račun uspješno kreiran! PDF: " + res.data.racun.pdf);
       return res.data.racun;
     } else {
-   console.error("Solo.hr odbio račun. Detalji:", JSON.stringify(res.data));
+      console.error("Solo.hr odbio račun. Detalji:", JSON.stringify(res.data));
       return null;
     }
   } catch (err) {

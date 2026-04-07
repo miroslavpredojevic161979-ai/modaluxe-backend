@@ -170,7 +170,7 @@ const createSoloInvoice = async (orderData, isPaid) => {
       console.log("Solo račun uspješno kreiran! PDF: " + res.data.racun.pdf);
       return res.data.racun;
     } else {
-      console.error("Solo.hr odbio račun:", res.data.poruka);
+   console.error("Solo.hr odbio račun. Detalji:", JSON.stringify(res.data));
       return null;
     }
   } catch (err) {
@@ -987,7 +987,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           const invoiceUrl = soloRacun ? soloRacun.pdf : null;
           const invoiceNumber = soloRacun ? soloRacun.broj_racuna : invoiceNumberFromOrderId(orderId);
           
-          try { fs.unlinkSync(filePath); } catch (e) { console.error('Brisanje lokalnog fajla propalo:', e); }
+        
           
           await pool.query(
             "UPDATE orders SET invoice_url = $1 WHERE id = $2",
@@ -1188,7 +1188,6 @@ let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
       const uploadResult = await cloudinary.uploader.upload(filePath, { folder: 'kisfaluba_ura', resource_type: 'image' });
       await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [uploadResult.secure_url, id]);
       invData.storno_url = uploadResult.secure_url;
-      try { fs.unlinkSync(filePath); } catch (e) {}
     }
 
     res.json({ success: true, invoice: invData });
@@ -1445,7 +1444,7 @@ app.patch('/orders/:id/status', async (req, res) => {
         resource_type: 'image'
       });
       const stornoUrl = uploadResult.secure_url;
-      try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
+    
       
       await pool.query('UPDATE orders SET storno_url = $1, archived = false WHERE id = $2', [stornoUrl, orderId]);
       

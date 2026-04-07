@@ -51,6 +51,7 @@ const initDB = async () => {
     await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS material_info TEXT");
     await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS manufacturer_info TEXT");
     await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS sustainability_info TEXT");
+    await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS supplier_email VARCHAR(255)");
     await pool.query(`
       CREATE TABLE IF NOT EXISTS categories (
         id VARCHAR(255) PRIMARY KEY,
@@ -1222,10 +1223,10 @@ app.get('/products', async (req, res) => {
 
 app.post('/products', authGuard, async (req, res) => {
   try {
-    const { brand, name, description, price, cost_price, category, images, variants, fit_info, material_info, manufacturer_info, sustainability_info } = req.body;
+    const { brand, name, description, price, cost_price, category, images, variants, fit_info, material_info, manufacturer_info, sustainability_info, supplier_email } = req.body;
     const result = await pool.query(
-      'INSERT INTO products (brand, name, description, price, cost_price, category, images, variants, fit_info, material_info, manufacturer_info, sustainability_info) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *',
-      [brand || '', name || '', description || '', toNumberSafe(price), toNumberSafe(cost_price || 0), category || '', JSON.stringify(images || []), JSON.stringify(variants || []), fit_info || '', material_info || '', manufacturer_info || '', sustainability_info || '']
+      'INSERT INTO products (brand, name, description, price, cost_price, category, images, variants, fit_info, material_info, manufacturer_info, sustainability_info, supplier_email) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *',
+      [brand || '', name || '', description || '', toNumberSafe(price), toNumberSafe(cost_price || 0), category || '', JSON.stringify(images || []), JSON.stringify(variants || []), fit_info || '', material_info || '', manufacturer_info || '', sustainability_info || '', supplier_email || '']
     );
     const saved = result.rows[0];
     saved.images = parseJsonSafe(saved.images, []);
@@ -1237,10 +1238,10 @@ app.post('/products', authGuard, async (req, res) => {
 app.put('/products/:id', authGuard, async (req, res) => {
   try {
     const { id } = req.params;
-    const { brand, name, description, price, cost_price, category, images, variants, fit_info, material_info, manufacturer_info, sustainability_info } = req.body;
+    const { brand, name, description, price, cost_price, category, images, variants, fit_info, material_info, manufacturer_info, sustainability_info, supplier_email } = req.body;
     const result = await pool.query(
-      'UPDATE products SET brand = $1, name = $2, description = $3, price = $4, cost_price = $5, category = $6, images = $7, variants = $8, fit_info = $9, material_info = $10, manufacturer_info = $11, sustainability_info = $12 WHERE id = $13 RETURNING *',
-      [brand || '', name || '', description || '', toNumberSafe(price), toNumberSafe(cost_price || 0), category || '', JSON.stringify(images || []), JSON.stringify(variants || []), fit_info || '', material_info || '', manufacturer_info || '', sustainability_info || '', id]
+      'UPDATE products SET brand = $1, name = $2, description = $3, price = $4, cost_price = $5, category = $6, images = $7, variants = $8, fit_info = $9, material_info = $10, manufacturer_info = $11, sustainability_info = $12, supplier_email = $13 WHERE id = $14 RETURNING *',
+      [brand || '', name || '', description || '', toNumberSafe(price), toNumberSafe(cost_price || 0), category || '', JSON.stringify(images || []), JSON.stringify(variants || []), fit_info || '', material_info || '', manufacturer_info || '', sustainability_info || '', supplier_email || '', id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Proizvod nije pronađen' });
     const saved = result.rows[0];

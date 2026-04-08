@@ -144,7 +144,7 @@ const createSoloInvoice = async (orderData, isPaid) => {
       }
     }
 
-  // --- SOLO.HR STAVKE (Sada koristimo _1, _2 indekse!) ---
+// --- SOLO.HR STAVKE (Hibridni format koji traže) ---
     items.forEach((item, index) => {
       const i = index + 1; // Redni broj: 1, 2, 3...
       
@@ -152,9 +152,11 @@ const createSoloInvoice = async (orderData, isPaid) => {
       let naziv = `${item.brand || ''} ${item.name || ''}`.trim();
       if (!naziv || naziv === 'undefined') naziv = 'Artikl';
 
-      // SVAKI ključ dobiva "_broj" na kraju (npr. opis_usluge_1, opis_usluge_2)
-      params.append(`usluga_${i}`, String(i)); 
-      params.append(`opis_usluge_${i}`, escapeHtml(naziv).substring(0, 990)); // Osigurač za duljinu
+      // 1. OVO JE BROJČANIK: Uvijek se zove 'usluga' bez indeksa! (Tako Solo broji redove)
+      params.append('usluga', String(i)); 
+
+      // 2. DETALJI: Svi oni MORAJU dobiti "_broj" na kraju (npr. opis_usluge_1)
+      params.append(`opis_usluge_${i}`, escapeHtml(naziv).substring(0, 990));
       params.append(`kolicina_${i}`, String(item.qty || 1));
       params.append(`cijena_${i}`, String(item.price || 0));
       params.append(`porez_stopa_${i}`, '0');

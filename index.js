@@ -121,24 +121,29 @@ const createSoloInvoice = async (orderData, isPaid) => {
     if (!token) return null;
 
     const items = parseJsonSafe(orderData.items, []);
-    const form = new FormData();
-    form.append('token', token);
-    form.append('tip_racuna', '1'); 
-    form.append('kupac_naziv', orderData.name || 'Gost');
-    form.append('kupac_adresa', orderData.address || '');
-    form.append('nacin_placanja', isPaid ? '3' : '2'); 
-    form.append('prikazi_porez', '0'); 
-    form.append('fiskalizacija', '1'); 
+    
+    // OVDJE JE POPRAVAK: Pakiramo podatke kao 'querystring' točno kako Solo traži
+    const params = new URLSearchParams();
+    params.append('token', token);
+    params.append('tip_racuna', '1'); 
+    params.append('kupac_naziv', orderData.name || 'Gost');
+    params.append('kupac_adresa', orderData.address || '');
+    params.append('nacin_placanja', isPaid ? '3' : '2'); 
+    params.append('prikazi_porez', '0'); 
+    params.append('fiskalizacija', '1'); 
 
     items.forEach((item, index) => {
-      form.append(`usluge[${index}][opis_usluge]`, `${item.brand || ''} ${item.name}`.trim());
-      form.append(`usluge[${index}][kolicina]`, String(item.qty || 1));
-      form.append(`usluge[${index}][cijena]`, String(item.price));
-      form.append(`usluge[${index}][porez_stopa]`, '0');
+      params.append(`usluge[${index}][opis_usluge]`, `${item.brand || ''} ${item.name}`.trim());
+      params.append(`usluge[${index}][kolicina]`, String(item.qty || 1));
+      params.append(`usluge[${index}][cijena]`, String(item.price));
+      params.append(`usluge[${index}][porez_stopa]`, '0');
     });
 
-    const res = await axios.post('https://api.solo.com.hr/racun', form, {
-      headers: form.getHeaders()
+    // Šaljemo parametre kao string s točnim 'content-type' zaglavljem
+    const res = await axios.post('https://api.solo.com.hr/racun', params.toString(), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
     });
 
     if (res.data && res.data.status === 1) {

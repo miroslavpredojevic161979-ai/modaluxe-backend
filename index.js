@@ -1348,14 +1348,14 @@ app.get('/orders/:id/invoice', async (req, res) => {
     const result = await pool.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).send('Nije pronađeno.');
     const orderData = result.rows[0];
-    const paymentMethod = orderData.status === 'PAID' ? 'Kartično plaćanje' : 'Pouzeće';
-    const html = buildInvoiceEmailHtml({
-      orderId: orderData.id, customerName: orderData.name, customerAddress: orderData.address,
-      customerPhone: orderData.phone, customerEmail: orderData.email, paymentMethod: paymentMethod,
-      items: parseJsonSafe(orderData.items, []), totalAmount: orderData.total, dateObj: orderData.created_at,
-      discount: parseJsonSafe(orderData.discount, null) 
-    });
-    res.send(html);
+    
+    // AKO IMAMO SOLO.HR PDF, ODMAH PREUSMJERI KUPCA NA NJEGA!
+    if (orderData.invoice_url && orderData.invoice_url.startsWith('http')) {
+        return res.redirect(orderData.invoice_url);
+    }
+    
+    // Ako se Solo račun još nije stigao generirati (osigurač)
+    res.send('<h1 style="text-align:center; margin-top:50px;">Račun se generira...</h1><p style="text-align:center;">Molimo osvježite stranicu za nekoliko trenutaka.</p>');
   } catch (err) { res.status(500).send('Greška.'); }
 });
 

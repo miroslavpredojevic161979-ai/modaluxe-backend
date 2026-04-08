@@ -132,25 +132,32 @@ const createSoloInvoice = async (orderData, isPaid) => {
     params.append('prikazi_porez', '0'); 
     params.append('fiskalizacija', '1'); 
 
-// 1. Pravilo: Šaljemo ukupan broj usluga
-    params.append('usluge', String(items.length));
+// --- LOGIKA ZA POPUST (Pretvaramo EUR u postotak za Solo.hr) ---
+    const popustObj = parseJsonSafe(orderData.discount, { amount: 0 });
+    let popustPostotak = '0';
 
-    // 2. i 3. Pravilo: 'usluga' se ponavlja, a ostali podaci dobivaju redni broj (_1, _2...)
+    if (popustObj && popustObj.amount > 0) {
+      let ukupnoArtikli = items.reduce((acc, item) => acc + (Number(item.price || 0) * Number(item.qty || 1)), 0);
+      if (ukupnoArtikli > 0) {
+        let izracunatiPostotak = (Number(popustObj.amount) / ukupnoArtikli) * 100;
+        popustPostotak = izracunatiPostotak.toFixed(2); 
+      }
+    }
+
+    // Pakiramo usluge bez indeksa - OVO JE JEDINI FORMAT KOJI SOLO PRIHVAĆA!
     items.forEach((item, index) => {
-      const i = index + 1; 
+      params.append('usluga', String(index + 1)); 
       
-      params.append('usluga', String(i)); 
-      
-      // Osigurač: Ako je ime slučajno prazno, šaljemo "Artikl" da izbjegnemo Grešku 109
+      // OSIGURAČ: Ako iz baze slučajno dođe prazno ime, šaljemo "Artikl"
       let naziv = `${item.brand || ''} ${item.name || ''}`.trim();
       if (!naziv || naziv === 'undefined') naziv = 'Artikl';
-      
-      params.append(`opis_usluge_${i}`, naziv.substring(0, 100)); 
-      params.append(`kolicina_${i}`, String(item.qty || 1));
-      params.append(`cijena_${i}`, String(item.price || 0));
-      params.append(`porez_stopa_${i}`, '0');
-    });
 
+      params.append('opis_usluge', naziv);
+      params.append('kolicina', String(item.qty || 1));
+      params.append('cijena', String(item.price || 0));
+      params.append('porez_stopa', '0');
+      params.append('popust', popustPostotak); // <--- OVO JE ONO ŠTO JE FALILO
+    });
     // Šaljemo parametre kao string s točnim 'content-type' zaglavljem
     const res = await axios.post('https://api.solo.com.hr/racun', params.toString(), {
       headers: {

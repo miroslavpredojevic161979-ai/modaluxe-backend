@@ -132,18 +132,23 @@ const createSoloInvoice = async (orderData, isPaid) => {
     params.append('prikazi_porez', '0'); 
     params.append('fiskalizacija', '1'); 
 
-// Finalni Solo format: Array s indeksima koji STROGO kreću od 1, uz osigurač za ime
+// 1. Pravilo: Šaljemo ukupan broj usluga
+    params.append('usluge', String(items.length));
+
+    // 2. i 3. Pravilo: 'usluga' se ponavlja, a ostali podaci dobivaju redni broj (_1, _2...)
     items.forEach((item, index) => {
       const i = index + 1; 
       
-      // OSIGURAČ: Ako je ime proizvoda prazno ili undefined, šaljemo "Artikl" da račun ne propadne
+      params.append('usluga', String(i)); 
+      
+      // Osigurač: Ako je ime slučajno prazno, šaljemo "Artikl" da izbjegnemo Grešku 109
       let naziv = `${item.brand || ''} ${item.name || ''}`.trim();
       if (!naziv || naziv === 'undefined') naziv = 'Artikl';
-
-      params.append(`usluge[${i}][opis_usluge]`, naziv);
-      params.append(`usluge[${i}][kolicina]`, String(item.qty || 1));
-      params.append(`usluge[${i}][cijena]`, String(item.price || 0));
-      params.append(`usluge[${i}][porez_stopa]`, '0');
+      
+      params.append(`opis_usluge_${i}`, naziv.substring(0, 100)); 
+      params.append(`kolicina_${i}`, String(item.qty || 1));
+      params.append(`cijena_${i}`, String(item.price || 0));
+      params.append(`porez_stopa_${i}`, '0');
     });
 
     // Šaljemo parametre kao string s točnim 'content-type' zaglavljem

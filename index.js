@@ -144,19 +144,21 @@ const createSoloInvoice = async (orderData, isPaid) => {
       }
     }
 
-    // Pakiramo usluge bez indeksa - OVO JE JEDINI FORMAT KOJI SOLO PRIHVAĆA!
+  // --- SOLO.HR STAVKE (Sada koristimo _1, _2 indekse!) ---
     items.forEach((item, index) => {
-      params.append('usluga', String(index + 1)); 
+      const i = index + 1; // Redni broj: 1, 2, 3...
       
       // OSIGURAČ: Ako iz baze slučajno dođe prazno ime, šaljemo "Artikl"
       let naziv = `${item.brand || ''} ${item.name || ''}`.trim();
       if (!naziv || naziv === 'undefined') naziv = 'Artikl';
 
-      params.append('opis_usluge', naziv);
-      params.append('kolicina', String(item.qty || 1));
-      params.append('cijena', String(item.price || 0));
-      params.append('porez_stopa', '0');
-      params.append('popust', popustPostotak); // <--- OVO JE ONO ŠTO JE FALILO
+      // SVAKI ključ dobiva "_broj" na kraju (npr. opis_usluge_1, opis_usluge_2)
+      params.append(`usluga_${i}`, String(i)); 
+      params.append(`opis_usluge_${i}`, escapeHtml(naziv).substring(0, 990)); // Osigurač za duljinu
+      params.append(`kolicina_${i}`, String(item.qty || 1));
+      params.append(`cijena_${i}`, String(item.price || 0));
+      params.append(`porez_stopa_${i}`, '0');
+      params.append(`popust_${i}`, popustPostotak); 
     });
     // Šaljemo parametre kao string s točnim 'content-type' zaglavljem
     const res = await axios.post('https://api.solo.com.hr/racun', params.toString(), {

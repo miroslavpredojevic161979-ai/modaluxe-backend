@@ -125,7 +125,8 @@ const createSoloInvoice = async (orderData, isPaid) => {
     // OVDJE JE POPRAVAK: Pakiramo podatke kao 'querystring' točno kako Solo traži
     const params = new URLSearchParams();
     params.append('token', token);
-    params.append('tip_racuna', '1'); 
+    params.append('tip_racuna', '1');
+     params.append('tip_usluge', '1');
     params.append('kupac_naziv', orderData.name || 'Gost');
     params.append('kupac_adresa', orderData.address || '');
     params.append('nacin_placanja', isPaid ? '3' : '2'); 

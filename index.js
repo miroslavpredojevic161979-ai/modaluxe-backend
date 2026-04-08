@@ -132,14 +132,18 @@ const createSoloInvoice = async (orderData, isPaid) => {
     params.append('prikazi_porez', '0'); 
     params.append('fiskalizacija', '1'); 
 
-// Pakiramo usluge bez ikakvih zagrada ili indeksa u imenima parametara!
-    // Solo.hr očekuje doslovno ponavljanje istih imena (duplikate) u nizu.
+// Finalni Solo format: Array s indeksima koji STROGO kreću od 1, uz osigurač za ime
     items.forEach((item, index) => {
-      params.append('usluga', String(index + 1)); 
-      params.append('opis_usluge', `${item.brand || ''} ${item.name}`.trim());
-      params.append('kolicina', String(item.qty || 1));
-      params.append('cijena', String(item.price));
-      params.append('porez_stopa', '0');
+      const i = index + 1; 
+      
+      // OSIGURAČ: Ako je ime proizvoda prazno ili undefined, šaljemo "Artikl" da račun ne propadne
+      let naziv = `${item.brand || ''} ${item.name || ''}`.trim();
+      if (!naziv || naziv === 'undefined') naziv = 'Artikl';
+
+      params.append(`usluge[${i}][opis_usluge]`, naziv);
+      params.append(`usluge[${i}][kolicina]`, String(item.qty || 1));
+      params.append(`usluge[${i}][cijena]`, String(item.price || 0));
+      params.append(`usluge[${i}][porez_stopa]`, '0');
     });
 
     // Šaljemo parametre kao string s točnim 'content-type' zaglavljem

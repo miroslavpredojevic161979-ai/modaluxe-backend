@@ -133,11 +133,17 @@ const createSoloInvoice = async (orderData, isPaid) => {
     params.append('prikazi_porez', '0'); 
     params.append('fiskalizacija', '1'); 
 
+// OVO RJEŠAVA GREŠKU 107 (Šaljemo im ukupan broj proizvoda)
+    params.append('usluge', String(items.length));
+
+    // Pakiramo proizvode s rednim brojevima (_1, _2, _3...) točno kako Solo traži
     items.forEach((item, index) => {
-      params.append(`usluge[${index}][opis_usluge]`, `${item.brand || ''} ${item.name}`.trim());
-      params.append(`usluge[${index}][kolicina]`, String(item.qty || 1));
-      params.append(`usluge[${index}][cijena]`, String(item.price));
-      params.append(`usluge[${index}][porez_stopa]`, '0');
+      const i = index + 1; // Solo traži da brojanje počne od 1, a ne od 0
+      params.append(`usluga_${i}`, String(i));
+      params.append(`opis_usluge_${i}`, `${item.brand || ''} ${item.name}`.trim());
+      params.append(`kolicina_${i}`, String(item.qty || 1));
+      params.append(`cijena_${i}`, String(item.price));
+      params.append(`porez_stopa_${i}`, '0');
     });
 
     // Šaljemo parametre kao string s točnim 'content-type' zaglavljem

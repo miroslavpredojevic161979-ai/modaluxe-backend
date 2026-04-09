@@ -128,10 +128,10 @@ const createSoloInvoice = async (orderData, isPaid) => {
      params.append('tip_usluge', '1');
     params.append('kupac_naziv', orderData.name || 'Gost');
 params.append('kupac_adresa', orderData.address || '');
-    // PRIVREMENI BYPASS: Sve knjižimo kao transakcijski račun (2) dok ne riješiš FINA certifikat
-    params.append('nacin_placanja', '2'); 
+   // Vraćamo pravu logiku za plaćanje i fiskalizaciju!
+    params.append('nacin_placanja', isPaid ? '3' : '2'); 
     params.append('prikazi_porez', '0'); 
-    params.append('fiskalizacija', '0'); // Gasimo fiskalizaciju
+    params.append('fiskalizacija', '1'); // Sada palimo fiskalizaciju jer imamo Demo certifikat!
 
 // --- LOGIKA ZA POPUST (Pretvaramo EUR u postotak za Solo.hr) ---
     const popustObj = parseJsonSafe(orderData.discount, { amount: 0 });

@@ -964,6 +964,30 @@ app.post('/upload', authGuard, upload.single('image'), (req, res) => {
   res.json({ imageUrl: req.file.path });
 });
 
+// --- UPLOAD PDF RAČUNA ZA NARUDŽBE (RUČNO DODAVANJE) ---
+app.post('/upload-invoice', authGuard, upload.single('invoice'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'Nema datoteke za upload' });
+  }
+  
+  const orderId = req.body.orderId;
+  if (!orderId) {
+    return res.status(400).json({ error: 'Nedostaje ID narudžbe' });
+  }
+
+  try {
+    // req.file.path sadrži sigurni Cloudinary link nakon uploada
+    const pdfUrl = req.file.path;
+    
+    // Spremi link u bazu pod tu narudžbu
+    await pool.query('UPDATE orders SET invoice_url = $1 WHERE id = $2', [pdfUrl, orderId]);
+    
+    res.json({ success: true, invoiceUrl: pdfUrl });
+  } catch (err) {
+    console.error('Greška pri spremanju računa u bazu:', err);
+    res.status(500).json({ error: 'Greška baze podataka' });
+  }
+});
 // --- RUTE ZA NARUDŽBE ---
 app.get('/all-orders', async (req, res) => {
   try {

@@ -1134,11 +1134,18 @@ app.post('/orders/:id/send-storno', async (req, res) => {
       </div>
     `;
 
-    await transporter.sendMail({
+await transporter.sendMail({
       from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
       to: orderData.email,
+      bcc: process.env.EMAIL_USER, // <-- TEBI STIŽE SKRIVENA KOPIJA STORNA!
       subject: `Storno račun i obavijest o povratu - KISFALUBA`,
-      html: emailHtml
+      html: emailHtml,
+      attachments: [
+        {
+          filename: `Storno_Racun_Kisfaluba_${orderId}.pdf`,
+          path: pdfLinkZaKupca
+        }
+      ]
     });
 
     res.json({ success: true, message: 'Storno mail uspješno poslan kupcu!' });

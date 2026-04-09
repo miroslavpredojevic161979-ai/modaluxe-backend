@@ -115,7 +115,7 @@ const calcTotals = (items) => {
 };
 
 // --- SOLO.HR FISKALIZACIJA ---
-const createSoloInvoice = async (orderData, isPaid) => {
+const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
   try {
     const token = process.env.SOLO_API_TOKEN;
     if (!token) return null;
@@ -131,6 +131,7 @@ const createSoloInvoice = async (orderData, isPaid) => {
     params.append('nacin_placanja', isPaid ? '3' : '2'); 
     params.append('prikazi_porez', '0'); 
     params.append('fiskalizacija', '1');
+    if (isStorno) params.append('napomena', `Storno računa za narudžbu ${orderData.id}`);
 
     const popustObj = parseJsonSafe(orderData.discount, { amount: 0 });
     let popustPostotak = '0';
@@ -148,23 +149,24 @@ const createSoloInvoice = async (orderData, isPaid) => {
       let naziv = `${item.brand || ''} ${item.name || ''}`.trim();
       if (!naziv || naziv === 'undefined') naziv = 'Artikl';
 
+      // AKO JE STORNO, KOLIČINA IDE U MINUS!
+      let finalQty = Number(item.qty || 1);
+      if (isStorno) finalQty = -Math.abs(finalQty);
+
       params.append('usluga', String(i)); 
       params.append(`opis_usluge_${i}`, escapeHtml(naziv).substring(0, 990));
-      params.append(`kolicina_${i}`, String(item.qty || 1));
+      params.append(`kolicina_${i}`, String(finalQty));
       params.append(`cijena_${i}`, String(item.price || 0));
       params.append(`porez_stopa_${i}`, '0');
       params.append(`popust_${i}`, popustPostotak); 
     });
     
     const res = await axios.post('https://api.solo.com.hr/racun', params.toString(), {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
-      }
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     });
 
-    // ISPRAVLJENO DA PRIHVATI I DEMO RAČUNE
     if (res.data && res.data.racun) { 
-      console.log("Solo račun uspješno kreiran! PDF: " + res.data.racun.pdf);
+      console.log(`Solo ${isStorno ? 'STORNO ' : ''}račun uspješno kreiran! PDF: ` + res.data.racun.pdf);
       return res.data.racun;
     } else {
       console.error("Solo.hr odbio račun. Detalji:", JSON.stringify(res.data));
@@ -175,6 +177,7 @@ const createSoloInvoice = async (orderData, isPaid) => {
     return null;
   }
 };
+
 
 // --- UPLOAD (MULTER + CLOUDINARY) ---
 const storage = new CloudinaryStorage({
@@ -480,154 +483,6 @@ async function fetchInboundInvoicesFromEmail() {
 
 cron.schedule('*/15 * * * *', () => { fetchInboundInvoicesFromEmail(); });
 
-// --- PDF GENERATORI (ZA STORNO) ---
-const generateStornoPDFInvoice = (orderData, originalInvoiceNumber, stornoInvoiceNumber, filePath) => {
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ margin: 40, size: 'A4' });
-    const stream = fs.createWriteStream(filePath);
-    doc.pipe(stream);
-    
-    const d = new Date();
-    const dateStr = d.toLocaleDateString('hr-HR');
-    const timeStr = d.toLocaleTimeString('hr-HR');
-    
-    const items = parseJsonSafe(orderData.items, []);
-    const disc = parseJsonSafe(orderData.discount, { amount: 0 });
-    
-    let itemsTotal = 0;
-    items.forEach(item => { 
-        itemsTotal += Number(item.price) * (item.qty || item.quantity || 1); 
-    });
-    const finalRefund = itemsTotal - Number(disc.amount);
-    
-    doc.fontSize(16).font('Helvetica-Bold').fillColor('#000000').text('KISFALUBA', { align: 'center' });
-    doc.moveDown(2);
-    doc.fontSize(10).font('Helvetica');
-    doc.text(fixText(`Postovani/a ${orderData.name},`));
-    doc.moveDown(0.5);
-    doc.text(fixText(`Obavjestavamo Vas da je Vas racun br. ${originalInvoiceNumber} storniran (povrat robe/sredstava).`));
-    doc.moveDown(1.5);
-    doc.font('Helvetica-Bold').fontSize(11).text(fixText('Detalji stornirane narudzbe'));
-    doc.moveDown(0.5);
-    
-    let startY = doc.y;
-    const drawTable1Row = (y, col1, col2, col3, isHeader = false) => {
-      const rowHeight = 25;
-      doc.rect(40, y, 510, rowHeight).fillAndStroke(isHeader ? '#fafafa' : '#ffffff', '#dddddd');
-      doc.moveTo(350, y).lineTo(350, y + rowHeight).stroke('#dddddd');
-      doc.moveTo(430, y).lineTo(430, y + rowHeight).stroke('#dddddd');
-      doc.fillColor('#000000').font(isHeader ? 'Helvetica-Bold' : 'Helvetica').fontSize(9);
-      doc.text(col1, 50, y + 8, { width: 290 });
-      doc.text(col2, 350, y + 8, { width: 80, align: 'center' });
-      doc.text(col3, 430, y + 8, { width: 110, align: 'right', lineBreak: false }); 
-      return y + rowHeight;
-    };
-
-    startY = drawTable1Row(startY, 'Artikl', fixText('Kolicina'), 'Cijena (EUR)', true);
-    
-    items.forEach((item) => {
-      const name = fixText(`${item.brand ? item.brand + ' ' : ''}${item.name} (${(item.variantKey && item.variantKey.split('|')[0]) || 'Std'})`);
-      const qty = item.qty || item.quantity || 1;
-      const price = Number(item.price).toFixed(2);
-      startY = drawTable1Row(startY, name, `-${qty}`, `-${price} EUR`, false);
-    });
-
-    doc.y = startY + 10;
-    if (disc && disc.amount > 0) {
-        doc.font('Helvetica-Bold').fontSize(9).fillColor('#e53e3e').text(`Storniran popust: +${Number(disc.amount).toFixed(2)} EUR`, 300, doc.y, { width: 250, align: 'right' });
-        doc.y += 5;
-    }
-    doc.font('Helvetica-Bold').fontSize(10).fillColor('#e53e3e').text(`UKUPNI STORNO: -${finalRefund.toFixed(2)} EUR`, 300, doc.y, { width: 250, align: 'right' });
-    doc.font('Helvetica').fontSize(8).fillColor('#666666').text(fixText('Napomena: Usluga dostave se ne stornira.'), 300, doc.y, { width: 250, align: 'right' });
-    doc.fillColor('#000000');
-    doc.moveDown(2);
-    
-    doc.font('Helvetica-Bold').fontSize(11).text(fixText('Podaci kupca'), 40, doc.y);
-    doc.moveTo(40, doc.y + 2).lineTo(550, doc.y + 2).strokeColor('#dddddd').stroke();
-    doc.moveDown(0.5);
-    doc.font('Helvetica').fontSize(9);
-    doc.text(fixText(orderData.name || ''));
-    doc.text(fixText(orderData.address || ''));
-    doc.text(`Telefon: ${fixText(orderData.phone || '')}`);
-    doc.text(`E-mail: ${fixText(orderData.email || '')}`);
-    doc.moveDown(3);
-    
-    doc.font('Helvetica-Bold').fontSize(14).fillColor('#e53e3e').text(fixText('STORNO RACUN'), { align: 'center' });
-    doc.fillColor('#000000');
-    doc.moveDown(1.5);
-    
-    let currentY = doc.y;
-    doc.font('Helvetica-Bold').fontSize(9).text('KISFALUBA j.d.o.o.', 40, currentY);
-    doc.font('Helvetica').text('Zagorska ulica 40, 31300 Branjina, Republika Hrvatska');
-    doc.text('OIB: 82125639708 | MBS: 5990572');
-    doc.text('Trgovacki sud u Osijeku');
-    doc.text('Temeljni kapital: 10,00 EUR, uplacen u cijelosti');
-    doc.moveDown(1.5);
-    
-    currentY = doc.y;
-    doc.font('Helvetica-Bold').text(fixText('Broj storno racuna:'), 40, currentY);
-    doc.font('Helvetica').text(stornoInvoiceNumber, 150, currentY);
-    currentY += 15;
-    doc.font('Helvetica-Bold').text('Vezano za racun br:', 40, currentY);
-    doc.font('Helvetica').text(originalInvoiceNumber, 150, currentY);
-    currentY += 15;
-    doc.font('Helvetica-Bold').text('Datum storna:', 40, currentY);
-    doc.font('Helvetica').text(dateStr, 150, currentY);
-    currentY += 15;
-    doc.font('Helvetica-Bold').text('Vrijeme storna:', 40, currentY);
-    doc.font('Helvetica').text(timeStr, 150, currentY);
-    currentY += 15;
-    doc.font('Helvetica-Bold').text('Mjesto izdavanja:', 40, currentY);
-    doc.font('Helvetica').text('Branjina, Republika Hrvatska', 150, currentY);
-    currentY += 15;
-    doc.font('Helvetica-Bold').text('Dobavljac:', 40, currentY);
-    doc.font('Helvetica').text(fixText(orderData.name), 150, currentY);
-    currentY += 15;
-    doc.font('Helvetica-Bold').text('Adresa kupca:', 40, currentY);
-    doc.font('Helvetica').text(fixText(orderData.address), 150, currentY);
-    doc.moveDown(2);
-    
-    let t2Y = doc.y;
-    const drawTable2Row = (y, col1, col2, col3, col4, col5, isHeader = false) => {
-      const h = 25;
-      doc.rect(40, y, 510, h).fillAndStroke(isHeader ? '#fafafa' : '#ffffff', '#dddddd');
-      doc.moveTo(100, y).lineTo(100, y + h).stroke('#dddddd');
-      doc.moveTo(310, y).lineTo(310, y + h).stroke('#dddddd');
-      doc.moveTo(370, y).lineTo(370, y + h).stroke('#dddddd');
-      doc.moveTo(460, y).lineTo(460, y + h).stroke('#dddddd');
-      
-      doc.fillColor('#000000').font(isHeader ? 'Helvetica-Bold' : 'Helvetica').fontSize(9);
-      doc.text(col1, 40, y + 8, { width: 60, align: 'center' });
-      doc.text(col2, 110, y + 8, { width: 190 });
-      doc.text(col3, 310, y + 8, { width: 60, align: 'center' });
-      doc.text(col4, 370, y + 8, { width: 80, align: 'right' }); 
-      doc.text(col5, 460, y + 8, { width: 80, align: 'right' }); 
-      return y + h;
-    };
-
-    t2Y = drawTable2Row(t2Y, 'Redni broj', 'Opis proizvoda', fixText('Kolicina'), 'Jedinicna cijena (EUR)', 'Ukupno (EUR)', true);
-    
-    items.forEach((item, index) => {
-      const name = fixText(`${item.brand ? item.brand + ' ' : ''}${item.name} (${(item.variantKey && item.variantKey.split('|')[0]) || 'Std'})`);
-      const qty = item.qty || item.quantity || 1;
-      const price = Number(item.price);
-      const total = price * qty;
-      t2Y = drawTable2Row(t2Y, (index + 1).toString(), name, `-${qty}`, `-${price.toFixed(2)}`, `-${total.toFixed(2)}`, false);
-    });
-
-    doc.y = t2Y + 10;
-    doc.font('Helvetica-Bold').fontSize(10).fillColor('#e53e3e').text(`Ukupan iznos storna: -${finalRefund.toFixed(2)} EUR`, 300, doc.y, { width: 250, align: 'right' });
-    doc.moveDown(3);
-    
-    doc.font('Helvetica').fontSize(8).fillColor('#666666');
-    doc.text(fixText('Drustvo nije u sustavu poreza na dodanu vrijednost (PDV).'), { align: 'center' });
-    doc.text(fixText('Ovaj storno racun izdan je u elektronickom obliku i vrijedi bez potpisa i pecata.'), { align: 'center' });
-    doc.end();
-    
-    stream.on('finish', () => resolve(filePath));
-    stream.on('error', reject);
-  });
-};
 
 const generateUraStornoPDF = (inv, filePath) => {
   return new Promise((resolve, reject) => {
@@ -786,20 +641,28 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
             "UPDATE orders SET invoice_url = $1 WHERE id = $2",
             [invoiceUrl, orderId]
           );
+          // Šaljemo nalog dobavljačima za kartične uplate
+          sendPackingSlipsToSuppliers(updatedOrder, parseJsonSafe(updatedOrder.items, [])).catch(e => console.error("X Greška dobavljači Stripe:", e));
           
-          if (updatedOrder.email && invoiceUrl) {
+ if (updatedOrder.email && invoiceUrl) {
             await transporter.sendMail({
               from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
               to: updatedOrder.email,
-              subject: `Račun za narudžbu br. ${updatedOrder.id}`,
+              subject: `Fiskalizirani račun za narudžbu br. ${updatedOrder.id}`,
               html: `
                 <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #D4AF37; text-align: center;">
                   <h2>Hvala na kupnji!</h2>
                   <p>Vaša uplata je uspješno obrađena.</p>
-                  <p>Službeni fiskalizirani račun preuzmite ovdje:</p>
+                  <p>Službeni fiskalizirani račun nalazi se u <strong>privitku ovog e-maila</strong>, a možete ga preuzeti i klikom na gumb ispod:</p>
                   <a href="${invoiceUrl}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block; margin: 20px 0;">PREUZMI PDF RAČUN</a>
                 </div>
-              `
+              `,
+              attachments: [
+                {
+                  filename: `Racun_Kisfaluba_${invoiceNumber.replace(/\//g, '_')}.pdf`,
+                  path: invoiceUrl
+                }
+              ]
             });
           }
         }
@@ -1142,7 +1005,7 @@ app.post('/orders', async (req, res) => {
     
     await pool.query('UPDATE orders SET invoice_url = $1 WHERE id = $2', [invoiceUrl, orderId]);
     
-    if (email && invoiceUrl) {
+if (email && invoiceUrl) {
       await transporter.sendMail({
         from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
         to: email,
@@ -1151,14 +1014,20 @@ app.post('/orders', async (req, res) => {
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #eee; text-align: center;">
             <h2 style="color: #000;">Vaša narudžba je zaprimljena!</h2>
             <p>Odabrali ste plaćanje <strong>pouzećem</strong>.</p>
-            <p>Vaš službeni fiskalizirani račun preuzmite na linku ispod:</p>
+            <p>Vaš službeni fiskalizirani račun nalazi se u <strong>privitku ovog e-maila</strong>, a možete ga preuzeti i na linku ispod:</p>
             <div style="margin: 30px 0;">
               <a href="${invoiceUrl}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block;">PREUZMI PDF RAČUN</a>
             </div>
             <p style="font-size: 11px; color: #777;">Račun je izdan automatski i fiskaliziran.</p>
           </div>
-        `
-      });
+        `,
+        attachments: [
+          {
+            filename: `Racun_Kisfaluba_${invoiceNumber.replace(/\//g, '_')}.pdf`,
+            path: invoiceUrl
+          }
+        ]
+      }).catch(e => console.error('X Greška slanja računa:', e));
     }
     
     sendPackingSlipsToSuppliers(orderData, normalizedItems).catch(e => console.error("X Greška dobavljači:", e));
@@ -1212,25 +1081,18 @@ app.patch('/orders/:id/status', async (req, res) => {
     
     const orderData = result.rows[0];
 
-    if (status === 'REFUND') {
-      const originalInvoiceNumber = invoiceNumberFromOrderId(orderId);
-      const stornoInvoiceNumber = `${originalInvoiceNumber}-STORNO`;
-      const fileName = `storno_${orderId}_${Date.now()}.pdf`;
-      const filePath = path.join(__dirname, 'uploads', fileName);
+if (status === 'REFUND') {
+      // Šalje signal u Solo.hr da napravi storno (isStorno = true)
+      const soloStorno = await createSoloInvoice(orderData, true, true);
       
-      await generateStornoPDFInvoice(orderData, originalInvoiceNumber, stornoInvoiceNumber, filePath);
-      
-      const uploadResult = await cloudinary.uploader.upload(filePath, {
-        folder: 'kisfaluba_storno',
-        resource_type: 'image'
-      });
-      const stornoUrl = uploadResult.secure_url;
-      
-      
-      await pool.query('UPDATE orders SET storno_url = $1, archived = false WHERE id = $2', [stornoUrl, orderId]);
-      
-      orderData.storno_url = stornoUrl;
-      orderData.archived = false;
+      if (soloStorno && soloStorno.pdf) {
+        const stornoUrl = soloStorno.pdf;
+        await pool.query('UPDATE orders SET storno_url = $1, archived = false WHERE id = $2', [stornoUrl, orderId]);
+        orderData.storno_url = stornoUrl;
+        orderData.archived = false;
+      } else {
+        console.error("Nije uspjelo generiranje Solo storna.");
+      }
     }
 
     res.json({ success: true, order: orderData });

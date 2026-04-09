@@ -636,19 +636,22 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         if (updatedOrder) {
           const soloRacun = await createSoloInvoice(updatedOrder, true);
           const invoiceUrl = soloRacun ? soloRacun.pdf : null;
+          const invoiceNumber = soloRacun ? soloRacun.broj_racuna : invoiceNumberFromOrderId(orderId);
           
           await pool.query(
             "UPDATE orders SET invoice_url = $1 WHERE id = $2",
             [invoiceUrl, orderId]
           );
+          
           // Šaljemo nalog dobavljačima za kartične uplate
           sendPackingSlipsToSuppliers(updatedOrder, parseJsonSafe(updatedOrder.items, [])).catch(e => console.error("X Greška dobavljači Stripe:", e));
           
- if (updatedOrder.email && invoiceUrl) {
+          if (updatedOrder.email && invoiceUrl) {
             await transporter.sendMail({
               from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
               to: updatedOrder.email,
-              subject: `Fiskalizirani račun za narudžbu br. ${updatedOrder.id}`,
+              bcc: process.env.EMAIL_USER,
+              subject: `Fiskalizirani račun za narudžbu br. ${invoiceNumber}`,
               html: `
                 <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #D4AF37; text-align: center;">
                   <h2>Hvala na kupnji!</h2>
@@ -1009,6 +1012,7 @@ if (email && invoiceUrl) {
       await transporter.sendMail({
         from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
         to: email,
+        bcc: process.env.EMAIL_USER, // <-- TEBI STIŽE SKRIVENA KOPIJA!
         subject: `Potvrda narudžbe i račun br. ${invoiceNumber}`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #eee; text-align: center;">

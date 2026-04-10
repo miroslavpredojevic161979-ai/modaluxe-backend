@@ -131,7 +131,10 @@ const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
     params.append('nacin_placanja', isPaid ? '3' : '2'); 
     params.append('prikazi_porez', '0'); 
     params.append('fiskalizacija', '1');
-    if (isStorno) params.append('napomena', `Storno računa za narudžbu ${orderData.id}`);
+    
+    if (isStorno) {
+      params.append('napomena', `Storno računa za narudžbu ${orderData.id}. Povrat sredstava kupcu.`);
+    }
 
     const popustObj = parseJsonSafe(orderData.discount, { amount: 0 });
     let popustPostotak = '0';
@@ -149,14 +152,18 @@ const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
       let naziv = `${item.brand || ''} ${item.name || ''}`.trim();
       if (!naziv || naziv === 'undefined') naziv = 'Artikl';
 
-      // AKO JE STORNO, KOLIČINA IDE U MINUS!
-      let finalQty = Number(item.qty || 1);
-      if (isStorno) finalQty = -Math.abs(finalQty);
+      // ZA SOLO STORNO: Količina mora biti pozitivna, a CIJENA ide u minus!
+      let kolicina = Number(item.qty || 1);
+      let cijena = Number(item.price || 0);
+      
+      if (isStorno) {
+        cijena = -Math.abs(cijena);
+      }
 
       params.append('usluga', String(i)); 
       params.append(`opis_usluge_${i}`, escapeHtml(naziv).substring(0, 990));
-      params.append(`kolicina_${i}`, String(finalQty));
-      params.append(`cijena_${i}`, String(item.price || 0));
+      params.append(`kolicina_${i}`, String(kolicina));
+      params.append(`cijena_${i}`, String(cijena));
       params.append(`porez_stopa_${i}`, '0');
       params.append(`popust_${i}`, popustPostotak); 
     });
@@ -244,13 +251,21 @@ const sendPackingSlipsToSuppliers = async (order, items) => {
       if (!item.id) continue;
       
       const res = await pool.query('SELECT supplier_email FROM products WHERE id = $1', [item.id]);
-      if (res.rows.length === 0 || !res.rows[0].supplier_email) continue; 
+      if (res.rows.length === 0 || !res.rows[0].supplier_email) {
+        console.log(`[INFO] Artikl '${item.name}' NEMA upisan email dobavljača u bazi, preskačem slanje naloga.`);
+        continue; 
+      }
       
       const email = res.rows[0].supplier_email.trim();
       if (!supplierGroups[email]) {
         supplierGroups[email] = [];
       }
       supplierGroups[email].push(item);
+    }
+
+    if (Object.keys(supplierGroups).length === 0) {
+        console.log("[INFO] Niti jedan artikl iz ove narudžbe nema mail dobavljača. Mail NIJE poslan.");
+        return;
     }
 
     for (const [supplierEmail, supplierItems] of Object.entries(supplierGroups)) {
@@ -266,7 +281,7 @@ const sendPackingSlipsToSuppliers = async (order, items) => {
       }).join('');
 
       const mailOptions = {
-        from: '"Kišfaluba Moda" <' + process.env.EMAIL_USER + '>',
+        from: `"Kišfaluba Moda" <${process.env.EMAIL_USER}>`,
         to: supplierEmail,
         subject: "NOVI RADNI NALOG - Narudžba #" + order.id,
         html: `
@@ -1110,7 +1125,6 @@ app.patch('/orders/:id/status', async (req, res) => {
     const orderData = result.rows[0];
 
 if (status === 'REFUND') {
-      // Šalje signal u Solo.hr da napravi storno (isStorno = true)
       const soloStorno = await createSoloInvoice(orderData, true, true);
       
       if (soloStorno && soloStorno.pdf) {
@@ -1119,7 +1133,8 @@ if (status === 'REFUND') {
         orderData.storno_url = stornoUrl;
         orderData.archived = false;
       } else {
-        console.error("Nije uspjelo generiranje Solo storna.");
+        console.error(`Solo.hr je odbio storno za narudžbu ${orderId}. Nećemo kreirati krivi link.`);
+        return res.status(500).json({ error: 'Solo.hr je odbio kreirati storno. Provjerite u Render Logovima zašto.' });
       }
     }
 
@@ -1142,8 +1157,8 @@ app.post('/orders/:id/send-storno', async (req, res) => {
     const orderData = result.rows[0];
     if (!orderData.email) return res.status(400).json({ error: 'Kupac nema unesenu email adresu.' });
 
-    const pdfLinkZaKupca = orderData.storno_url || orderData.invoice_url;
-    if (!pdfLinkZaKupca) return res.status(400).json({ error: 'Storno račun još nije generiran.' });
+    const pdfLinkZaKupca = orderData.storno_url; // BEZ FALLBACKA NA ORIGINALNI RAČUN!
+    if (!pdfLinkZaKupca) return res.status(400).json({ error: 'Storno račun još nije generiran! Solo.hr ga je odbio ili niste stisnuli Povrat.' });
 
     const emailHtml = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; color: #333; line-height: 1.5; border: 1px solid #eee; border-radius: 5px;">

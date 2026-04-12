@@ -496,7 +496,6 @@ async function fetchInboundInvoicesFromEmail() {
   }
 }
 
-cron.schedule('*/15 * * * *', () => { fetchInboundInvoicesFromEmail(); });
 
 
 const generateUraStornoPDF = (inv, filePath) => {

@@ -23,6 +23,21 @@ const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const app = express();
 app.use(cors());
 
+// --- SOCKET.IO DODATAK ---
+const http = require('http');
+const { Server } = require('socket.io');
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*", // Dozvoljava spajanje svih uređaja
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH"]
+  }
+});
+
+app.set('io', io); // Spremamo io instancu da je možemo koristiti bilo gdje!
+// -------------------------
+
 // --- KONFIGURACIJA ---
 const PORT = process.env.PORT || 10000;
 const INVOICE_SECRET = process.env.INVOICE_SECRET;
@@ -659,7 +674,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           
           // Šaljemo nalog dobavljačima za kartične uplate
           sendPackingSlipsToSuppliers(updatedOrder, parseJsonSafe(updatedOrder.items, [])).catch(e => console.error("X Greška dobavljači Stripe:", e));
-          
+          req.app.get('io').emit('nova_narudzba', { id: orderId, name: updatedOrder.name });
           if (updatedOrder.email && invoiceUrl) {
             await transporter.sendMail({
               from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
@@ -1072,7 +1087,9 @@ if (email && invoiceUrl) {
       }).catch(e => console.error('X Greška slanja računa:', e));
     }
     
-    sendPackingSlipsToSuppliers(orderData, normalizedItems).catch(e => console.error("X Greška dobavljači:", e));
+   sendPackingSlipsToSuppliers(orderData, normalizedItems).catch(e => console.error("X Greška dobavljači:", e));
+    
+    req.app.get('io').emit('nova_narudzba', { id: orderId, name: orderData.name });
     
     res.json({ message: 'Narudžba uspješna!', order: orderData });
   } catch (err) { 
@@ -1374,7 +1391,7 @@ app.delete('/api/complaints/:id', async (req, res) => {
 pool.query('ALTER TABLE products ALTER COLUMN price TYPE NUMERIC(10,2)').catch(e => console.log('Price update:', e.message));
 pool.query('ALTER TABLE products ALTER COLUMN cost_price TYPE NUMERIC(10,2)').catch(e => console.log('Cost update:', e.message));
 
-app.listen(PORT, '0.0.0.0', () => { 
+server.listen(PORT, '0.0.0.0', () => { 
   console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`); 
 });
 // PRIVREMENA METLA ZA BRISANJE SVEGA

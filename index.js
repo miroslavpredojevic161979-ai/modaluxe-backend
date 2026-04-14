@@ -62,6 +62,8 @@ const initDB = async () => {
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount JSONB DEFAULT '{\"amount\": 0}'::jsonb");
+    await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS stripe_session_id VARCHAR(255)");
+    await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_at TIMESTAMP");
     await pool.query("ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS coupons JSONB DEFAULT '[]'::jsonb");
     await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS fit_info TEXT");
     await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS material_info TEXT");
@@ -684,40 +686,62 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-    const orderId = session.client_reference_id;
-    if (orderId) {
+    const orderId = session.client_reference_id || session.metadata?.orderId || null;
+    const sessionId = session.id || null;
+
+    if (orderId || sessionId) {
       try {
+        let existingOrderResult;
+
+        if (orderId) {
+          existingOrderResult = await pool.query(
+            'SELECT * FROM orders WHERE id = $1 LIMIT 1',
+            [orderId]
+          );
+        } else {
+          existingOrderResult = await pool.query(
+            'SELECT * FROM orders WHERE stripe_session_id = $1 LIMIT 1',
+            [sessionId]
+          );
+        }
+
+        const existingOrder = existingOrderResult.rows[0];
+        if (!existingOrder) {
+          console.error('Stripe webhook: narudba nije pronağena.', { orderId, sessionId });
+          return res.json({ received: true });
+        }
+
         const updateResult = await pool.query(
-          "UPDATE orders SET status = 'PAID' WHERE id = $1 RETURNING *",
-          [orderId]
+          "UPDATE orders SET status = 'PAID', stripe_session_id = COALESCE($2, stripe_session_id), paid_at = COALESCE(paid_at, NOW()) WHERE id = $1 RETURNING *",
+          [existingOrder.id, sessionId]
         );
         const updatedOrder = updateResult.rows[0];
-        
-        if (updatedOrder) {
+        const shouldFinalizeOrder = existingOrder.status !== 'PAID' || !existingOrder.invoice_url;
+
+        if (updatedOrder && shouldFinalizeOrder) {
           const soloRacun = await createSoloInvoice(updatedOrder, true);
           const invoiceUrl = soloRacun ? soloRacun.pdf : null;
-          const invoiceNumber = soloRacun ? soloRacun.broj_racuna : invoiceNumberFromOrderId(orderId);
-          
+          const invoiceNumber = soloRacun ? soloRacun.broj_racuna : invoiceNumberFromOrderId(existingOrder.id);
+
           await pool.query(
             "UPDATE orders SET invoice_url = $1 WHERE id = $2",
-            [invoiceUrl, orderId]
+            [invoiceUrl, existingOrder.id]
           );
-          
-          // Å aljemo nalog dobavljaÄima za kartiÄne uplate
-          sendPackingSlipsToSuppliers(updatedOrder, parseJsonSafe(updatedOrder.items, [])).catch(e => console.error("X GreÅ¡ka dobavljaÄi Stripe:", e));
-          req.app.get('io').emit('nova_narudzba', { id: orderId, name: updatedOrder.name });
+
+          sendPackingSlipsToSuppliers(updatedOrder, parseJsonSafe(updatedOrder.items, [])).catch(e => console.error("X Greška dobavljaèi Stripe:", e));
+          req.app.get('io').emit('nova_narudzba', { id: existingOrder.id, name: updatedOrder.name });
           if (updatedOrder.email && invoiceUrl) {
             await transporter.sendMail({
-              from: `"KIÅ FALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
+              from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
               to: updatedOrder.email,
               bcc: process.env.EMAIL_USER,
-              subject: `Fiskalizirani raÄun za narudÅ¾bu br. ${invoiceNumber}`,
+              subject: `Fiskalizirani raèun za narudbu br. ${invoiceNumber}`,
               html: `
                 <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #D4AF37; text-align: center;">
                   <h2>Hvala na kupnji!</h2>
-                  <p>VaÅ¡a uplata je uspjeÅ¡no obraÄ‘ena.</p>
-                  <p>SluÅ¾beni fiskalizirani raÄun nalazi se u <strong>privitku ovog e-maila</strong>, a moÅ¾ete ga preuzeti i klikom na gumb ispod:</p>
-                  <a href="${invoiceUrl}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block; margin: 20px 0;">PREUZMI PDF RAÄŒUN</a>
+                  <p>Vaša uplata je uspješno obrağena.</p>
+                  <p>Slubeni fiskalizirani raèun nalazi se u <strong>privitku ovog e-maila</strong>, a moete ga preuzeti i klikom na gumb ispod:</p>
+                  <a href="${invoiceUrl}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block; margin: 20px 0;">PREUZMI PDF RAÈUN</a>
                 </div>
               `,
               attachments: [
@@ -730,7 +754,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           }
         }
       } catch (dbErr) {
-        console.error('GreÅ¡ka pri aÅ¾uriranju baze:', dbErr);
+        console.error('Greška pri auriranju baze:', dbErr);
       }
     }
   }
@@ -813,14 +837,15 @@ app.post('/create-checkout-session', async (req, res) => {
       [name, address, customer.phone || '', customer.email || '', totalAmount, JSON.stringify(validatedItems), 'NEW', JSON.stringify(discount || { amount: 0 })]
     );
     const orderId = newOrder.rows[0].id;
-    await deductStock(validatedItems);
-    
     const successUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-success?app=true` : `${req.protocol}://${req.get('host')}/payment-success`;
     const cancelUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-cancel?app=true` : `${req.protocol}://${req.get('host')}/payment-cancel`;
     
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       client_reference_id: String(orderId),
+      metadata: {
+        orderId: String(orderId),
+      },
       customer_email: customer.email || undefined,
       line_items: [{
         price_data: {
@@ -834,8 +859,14 @@ app.post('/create-checkout-session', async (req, res) => {
       success_url: req.body.returnUrl ? req.body.returnUrl : successUrl,
       cancel_url: req.body.returnUrl ? req.body.returnUrl.replace('payment-success', 'payment-cancel') : cancelUrl,
     });
+
+    await pool.query(
+      'UPDATE orders SET stripe_session_id = $1 WHERE id = $2',
+      [session.id, orderId]
+    );
+    await deductStock(validatedItems);
     
-    res.json({ url: session.url });
+    res.json({ url: session.url, orderId: String(orderId) });
   } catch (err) {
     console.error('Stripe greÅ¡ka:', err.message);
     res.status(500).json({ error: 'GreÅ¡ka pri povezivanju sa Stripeom.' });
@@ -1068,6 +1099,31 @@ app.get('/orders', async (req, res) => {
     const result = await pool.query('SELECT * FROM orders ORDER BY id DESC');
     res.json(result.rows.map(o => ({ ...o, items: parseJsonSafe(o.items, []), })));
   } catch (err) { res.status(500).json({ error: 'GreÅ¡ka' }); }
+});
+
+app.get('/orders/:id/payment-status', async (req, res) => {
+  try {
+    const orderId = String(req.params.id).split('-')[0];
+    const result = await pool.query(
+      'SELECT id, status, invoice_url, paid_at FROM orders WHERE id = $1 LIMIT 1',
+      [orderId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Narudba nije pronağena.' });
+    }
+
+    const order = result.rows[0];
+    res.json({
+      id: order.id,
+      status: order.status,
+      invoiceUrl: order.invoice_url,
+      paidAt: order.paid_at,
+      isPaid: order.status === 'PAID'
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Greška servera' });
+  }
 });
 
 // --- POUZEÄ†E ---
@@ -1450,6 +1506,10 @@ app.get('/brisanje-baze', async (req, res) => {
     res.status(500).send('GreÅ¡ka pri brisanju: ' + err.message); 
   }
 });
+
+
+
+
 
 
 

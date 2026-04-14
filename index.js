@@ -1236,7 +1236,32 @@ app.get('/orders/:id/invoice', async (req, res) => {
 app.get('/settings', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM shop_settings LIMIT 1');
-    res.json(result.rows[0] || { cod_enabled: true });
+    const settings = result.rows[0] || { cod_enabled: true };
+    let heroSlides = [];
+
+    try {
+      const parsedHero = JSON.parse(settings.hero_img || '[]');
+      if (Array.isArray(parsedHero)) {
+        heroSlides = parsedHero.filter((slide) => slide && typeof slide === 'object');
+      }
+    } catch (err) {
+      if (settings.hero_img) {
+        heroSlides = [{
+          id: 'legacy-hero',
+          image: settings.hero_img,
+          bgColor: '#FFFFFF',
+          textColor: '#000000',
+          title: settings.hero_title || '',
+          sub: settings.hero_sub || '',
+          target: '',
+        }];
+      }
+    }
+
+    res.json({
+      ...settings,
+      hero_slides: heroSlides,
+    });
   } catch (err) { res.status(500).json({ error: 'Greška postavki' }); }
 });
 
@@ -1249,14 +1274,28 @@ app.post('/settings/cod', async (req, res) => {
 
 app.post('/settings/hero', async (req, res) => {
   try {
-    const { title, sub, img } = req.body;
+    const rawSlides = Array.isArray(req.body?.slides) ? req.body.slides : [];
+    const heroSlides = rawSlides
+      .filter((slide) => slide && typeof slide === 'object')
+      .map((slide, index) => ({
+        id: String(slide.id || `slide-${index + 1}`),
+        image: String(slide.image || '').trim(),
+        bgColor: String(slide.bgColor || '#FFFFFF').trim() || '#FFFFFF',
+        textColor: String(slide.textColor || '#000000').trim() || '#000000',
+        title: String(slide.title || '').trim(),
+        sub: String(slide.sub || '').trim(),
+        target: String(slide.target || '').trim(),
+      }))
+      .filter((slide) => slide.image);
+    const heroImg = JSON.stringify(heroSlides);
+    const primarySlide = heroSlides[0] || null;
     const check = await pool.query('SELECT * FROM shop_settings LIMIT 1');
     if (check.rows.length === 0) {
-      await pool.query('INSERT INTO shop_settings (cod_enabled, hero_title, hero_sub, hero_img) VALUES (true, $1, $2, $3)', [title, sub, img]);
+      await pool.query('INSERT INTO shop_settings (cod_enabled, hero_title, hero_sub, hero_img) VALUES (true, $1, $2, $3)', [primarySlide?.title || '', primarySlide?.sub || '', heroImg]);
     } else {
-      await pool.query('UPDATE shop_settings SET hero_title = $1, hero_sub = $2, hero_img = $3', [title, sub, img]);
+      await pool.query('UPDATE shop_settings SET hero_title = $1, hero_sub = $2, hero_img = $3', [primarySlide?.title || '', primarySlide?.sub || '', heroImg]);
     }
-    res.json({ message: 'Ažurirano!' });
+    res.json({ message: 'Ažurirano!', hero_slides: heroSlides });
   } catch (err) { res.status(500).json({ error: 'Greška.' }); }
 });
 
@@ -1404,3 +1443,6 @@ app.get('/brisanje-baze', async (req, res) => {
     res.status(500).send('Greška pri brisanju: ' + err.message); 
   }
 });
+
+
+

@@ -110,6 +110,37 @@ const escapeHtml = (v) => {
 
 const toNumberSafe = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
 
+const normalizeHeroSlides = (slides) => {
+  if (!Array.isArray(slides)) return [];
+
+  return slides
+    .filter((slide) => slide && typeof slide === 'object')
+    .map((slide, index) => ({
+      id: String(slide.id || `slide-${index + 1}`),
+      image: String(slide.image || '').trim(),
+      bgColor: String(slide.bgColor || '#FFFFFF').trim() || '#FFFFFF',
+      textColor: String(slide.textColor || '#000000').trim() || '#000000',
+      title: String(slide.title || '').trim(),
+      sub: String(slide.sub || '').trim(),
+      target: String(slide.target || '').trim(),
+    }))
+    .filter((slide) => slide.image);
+};
+
+const buildLegacyHeroSlides = (settings) => {
+  if (!settings?.hero_img) return [];
+
+  return [{
+    id: 'legacy-hero',
+    image: settings.hero_img,
+    bgColor: '#FFFFFF',
+    textColor: '#000000',
+    title: settings.hero_title || '',
+    sub: settings.hero_sub || '',
+    target: '',
+  }];
+};
+
 const fixText = (text) => {
   if (!text) return '';
   return String(text)
@@ -1241,21 +1272,9 @@ app.get('/settings', async (req, res) => {
 
     try {
       const parsedHero = JSON.parse(settings.hero_img || '[]');
-      if (Array.isArray(parsedHero)) {
-        heroSlides = parsedHero.filter((slide) => slide && typeof slide === 'object');
-      }
+      heroSlides = normalizeHeroSlides(parsedHero);
     } catch (err) {
-      if (settings.hero_img) {
-        heroSlides = [{
-          id: 'legacy-hero',
-          image: settings.hero_img,
-          bgColor: '#FFFFFF',
-          textColor: '#000000',
-          title: settings.hero_title || '',
-          sub: settings.hero_sub || '',
-          target: '',
-        }];
-      }
+      heroSlides = buildLegacyHeroSlides(settings);
     }
 
     res.json({
@@ -1274,19 +1293,7 @@ app.post('/settings/cod', async (req, res) => {
 
 app.post('/settings/hero', async (req, res) => {
   try {
-    const rawSlides = Array.isArray(req.body?.slides) ? req.body.slides : [];
-    const heroSlides = rawSlides
-      .filter((slide) => slide && typeof slide === 'object')
-      .map((slide, index) => ({
-        id: String(slide.id || `slide-${index + 1}`),
-        image: String(slide.image || '').trim(),
-        bgColor: String(slide.bgColor || '#FFFFFF').trim() || '#FFFFFF',
-        textColor: String(slide.textColor || '#000000').trim() || '#000000',
-        title: String(slide.title || '').trim(),
-        sub: String(slide.sub || '').trim(),
-        target: String(slide.target || '').trim(),
-      }))
-      .filter((slide) => slide.image);
+    const heroSlides = normalizeHeroSlides(req.body?.slides);
     const heroImg = JSON.stringify(heroSlides);
     const primarySlide = heroSlides[0] || null;
     const check = await pool.query('SELECT * FROM shop_settings LIMIT 1');

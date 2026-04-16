@@ -1857,7 +1857,7 @@ pool.query('ALTER TABLE products ALTER COLUMN cost_price TYPE NUMERIC(10,2)').ca
 server.listen(PORT, '0.0.0.0', () => { 
   console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`); 
 });
-render
+
 
 
 

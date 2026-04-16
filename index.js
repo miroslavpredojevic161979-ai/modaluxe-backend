@@ -689,51 +689,88 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
     const orderId = session.client_reference_id || session.metadata?.orderId || null;
     const sessionId = session.id || null;
 
-    if (orderId || sessionId) {
-      try {
-        let existingOrderResult;
+    if (!orderId && !sessionId) {
+      console.error('Stripe webhook: nedostaje referenca na narudžbu.', { sessionId });
+      return res.status(500).json({ error: 'Stripe webhook nema referencu na narudžbu.' });
+    }
 
-        if (orderId) {
-          existingOrderResult = await pool.query(
-            'SELECT * FROM orders WHERE id = $1 LIMIT 1',
-            [orderId]
-          );
-        } else {
-          existingOrderResult = await pool.query(
-            'SELECT * FROM orders WHERE stripe_session_id = $1 LIMIT 1',
-            [sessionId]
-          );
-        }
+    try {
+      let existingOrderResult;
 
-        const existingOrder = existingOrderResult.rows[0];
-        if (!existingOrder) {
-          console.error('Stripe webhook: narudžba nije pronaðena.', { orderId, sessionId });
-          return res.json({ received: true });
-        }
+      if (orderId) {
+        existingOrderResult = await pool.query(
+          'SELECT * FROM orders WHERE id = $1 LIMIT 1',
+          [orderId]
+        );
+      } else {
+        existingOrderResult = await pool.query(
+          'SELECT * FROM orders WHERE stripe_session_id = $1 LIMIT 1',
+          [sessionId]
+        );
+      }
 
-        const updateResult = await pool.query(
+      const existingOrder = existingOrderResult.rows[0];
+      if (!existingOrder) {
+        console.error('Stripe webhook: narudžba nije pronaðena.', { orderId, sessionId });
+        return res.status(500).json({ error: 'Stripe webhook nije pronašao narudžbu.' });
+      }
+
+      if (existingOrder.invoice_url) {
+        const finalizeResult = await pool.query(
           "UPDATE orders SET status = 'PAID', stripe_session_id = COALESCE($2, stripe_session_id), paid_at = COALESCE(paid_at, NOW()) WHERE id = $1 RETURNING *",
           [existingOrder.id, sessionId]
         );
-        const updatedOrder = updateResult.rows[0];
-        const shouldFinalizeOrder = existingOrder.status !== 'PAID' || !existingOrder.invoice_url;
+        const finalizedOrder = finalizeResult.rows[0];
 
-        if (updatedOrder && shouldFinalizeOrder) {
-          const soloRacun = await createSoloInvoice(updatedOrder, true);
-          const invoiceUrl = soloRacun ? soloRacun.pdf : null;
-          const invoiceNumber = soloRacun ? soloRacun.broj_racuna : invoiceNumberFromOrderId(existingOrder.id);
+        if (!finalizedOrder || finalizedOrder.status !== 'PAID' || !finalizedOrder.invoice_url) {
+          console.error('Stripe webhook: postojeæi invoice_url nije potvrðen uz status PAID.', { orderId: existingOrder.id, sessionId });
+          return res.status(500).json({ error: 'Postojeæi invoice_url nije potvrðen uz status PAID.' });
+        }
+      } else {
+        const orderForInvoice = {
+          ...existingOrder,
+          status: 'PAID',
+          stripe_session_id: sessionId || existingOrder.stripe_session_id || null,
+          paid_at: existingOrder.paid_at || new Date().toISOString(),
+        };
 
-          await pool.query(
-            "UPDATE orders SET invoice_url = $1 WHERE id = $2",
-            [invoiceUrl, existingOrder.id]
-          );
+        const soloRacun = await createSoloInvoice(orderForInvoice, true);
+        if (!soloRacun || !soloRacun.pdf) {
+          console.error('Stripe webhook: Solo raèun nije uspješno generiran.', { orderId: existingOrder.id, sessionId, soloRacun });
+          return res.status(500).json({ error: 'Solo raèun nije uspješno generiran.' });
+        }
 
-          sendPackingSlipsToSuppliers(updatedOrder, parseJsonSafe(updatedOrder.items, [])).catch(e => console.error("X Greška dobavljaèi Stripe:", e));
-          req.app.get('io').emit('nova_narudzba', { id: existingOrder.id, name: updatedOrder.name });
-          if (updatedOrder.email && invoiceUrl) {
+        const finalizeResult = await pool.query(
+          "UPDATE orders SET status = 'PAID', stripe_session_id = COALESCE($2, stripe_session_id), paid_at = COALESCE(paid_at, NOW()), invoice_url = $3 WHERE id = $1 RETURNING *",
+          [existingOrder.id, sessionId, soloRacun.pdf]
+        );
+        const finalizedOrder = finalizeResult.rows[0];
+
+        if (!finalizedOrder || finalizedOrder.status !== 'PAID' || !finalizedOrder.invoice_url) {
+          console.error('Stripe webhook: status PAID ili invoice_url nisu uspješno spremljeni.', { orderId: existingOrder.id, sessionId });
+          return res.status(500).json({ error: 'Status PAID ili invoice_url nisu uspješno spremljeni.' });
+        }
+
+        const verifyResult = await pool.query(
+          'SELECT * FROM orders WHERE id = $1 LIMIT 1',
+          [existingOrder.id]
+        );
+        const verifiedOrder = verifyResult.rows[0];
+
+        if (!verifiedOrder || verifiedOrder.status !== 'PAID' || !verifiedOrder.invoice_url) {
+          console.error('Stripe webhook: završna provjera nije potvrdila PAID i invoice_url.', { orderId: existingOrder.id, sessionId });
+          return res.status(500).json({ error: 'Završna provjera nije potvrdila PAID i invoice_url.' });
+        }
+
+        sendPackingSlipsToSuppliers(verifiedOrder, parseJsonSafe(verifiedOrder.items, [])).catch((e) => console.error('X Greška dobavljaèi Stripe:', e));
+        req.app.get('io').emit('nova_narudzba', { id: existingOrder.id, name: verifiedOrder.name });
+
+        if (verifiedOrder.email) {
+          try {
+            const invoiceNumber = soloRacun.broj_racuna || invoiceNumberFromOrderId(existingOrder.id);
             await transporter.sendMail({
               from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
-              to: updatedOrder.email,
+              to: verifiedOrder.email,
               bcc: process.env.EMAIL_USER,
               subject: `Fiskalizirani raèun za narudžbu br. ${invoiceNumber}`,
               html: `
@@ -741,21 +778,24 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
                   <h2>Hvala na kupnji!</h2>
                   <p>Vaša uplata je uspješno obraðena.</p>
                   <p>Službeni fiskalizirani raèun nalazi se u <strong>privitku ovog e-maila</strong>, a možete ga preuzeti i klikom na gumb ispod:</p>
-                  <a href="${invoiceUrl}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block; margin: 20px 0;">PREUZMI PDF RAÈUN</a>
+                  <a href="${verifiedOrder.invoice_url}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block; margin: 20px 0;">PREUZMI PDF RAÈUN</a>
                 </div>
               `,
               attachments: [
                 {
                   filename: `Racun_Kisfaluba_${invoiceNumber.replace(/\//g, '_')}.pdf`,
-                  path: invoiceUrl
+                  path: verifiedOrder.invoice_url
                 }
               ]
             });
+          } catch (mailErr) {
+            console.error('Stripe webhook: raèun je spremljen, ali slanje maila nije uspjelo.', mailErr);
           }
         }
-      } catch (dbErr) {
-        console.error('Greška pri ažuriranju baze:', dbErr);
       }
+    } catch (dbErr) {
+      console.error('Stripe webhook finalizacija nije uspjela:', dbErr);
+      return res.status(500).json({ error: 'Stripe webhook finalizacija nije uspjela.' });
     }
   }
   res.json({ received: true });

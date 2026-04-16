@@ -1,4 +1,4 @@
-Ôªøconst express = require('express');
+const express = require('express');
 const axios = require('axios');
 const rateLimit = require('express-rate-limit');
 require('dotenv').config();
@@ -64,11 +64,6 @@ const initDB = async () => {
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount JSONB DEFAULT '{\"amount\": 0}'::jsonb");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS stripe_session_id VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_at TIMESTAMP");
-    await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS stripe_processing_at TIMESTAMP");
-    await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS stripe_stock_deducted_at TIMESTAMP");
-    await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS stripe_supplier_emailed_at TIMESTAMP");
-    await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS stripe_customer_emailed_at TIMESTAMP");
-    await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS stripe_finalized_at TIMESTAMP");
     await pool.query("ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS coupons JSONB DEFAULT '[]'::jsonb");
     await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS fit_info TEXT");
     await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS material_info TEXT");
@@ -167,212 +162,13 @@ const calcTotals = (items) => {
   return Number(sum.toFixed(2));
 };
 
-const isStripeOrderFullyFinalized = (order) => {
-  return !!order &&
-    order.status === 'PAID' &&
-    !!order.invoice_url &&
-    !!order.stripe_stock_deducted_at &&
-    !!order.stripe_finalized_at;
-};
-
-const markStripeOrderStepComplete = async (orderId, columnName) => {
-  const allowedColumns = new Set([
-    'stripe_stock_deducted_at',
-    'stripe_supplier_emailed_at',
-    'stripe_customer_emailed_at'
-  ]);
-
-  if (!allowedColumns.has(columnName)) {
-    throw new Error(`Nepoznat Stripe marker: ${columnName}`);
-  }
-
-  const result = await pool.query(
-    `UPDATE orders SET ${columnName} = COALESCE(${columnName}, NOW()) WHERE id = $1 RETURNING *`,
-    [orderId]
-  );
-
-  return result.rows[0] || null;
-};
-
-const clearStripeProcessingLock = async (orderId) => {
-  await pool.query('UPDATE orders SET stripe_processing_at = NULL WHERE id = $1', [orderId]);
-};
-
-const STRIPE_SHIPPING_METHODS = {
-  PICKUP: { price: 0 },
-  POSTA: { price: 4.5 },
-  GLS: { price: 5.5 },
-  DPD: { price: 6.0 },
-  WORLD: { price: 15.0 },
-};
-
-const FREE_SHIPPING_THRESHOLD = 500;
-
-const CHECKOUT_EU_COUNTRIES = [
-  'austria', 'belgium', 'bulgaria', 'croatia', 'cyprus', 'czech republic',
-  'denmark', 'estonia', 'finland', 'france', 'germany', 'greece', 'hungary',
-  'ireland', 'italy', 'latvia', 'lithuania', 'luxembourg', 'malta',
-  'netherlands', 'poland', 'portugal', 'romania', 'slovakia', 'slovenia',
-  'spain', 'sweden', 'hrvatska', 'slovenija', 'njemacka', 'austrija',
-  'italija', 'francuska', 'spanjolska', 'madarska'
-];
-
-const roundCurrency = (value) => Number(toNumberSafe(value).toFixed(2));
-
-const normalizeTextForMatch = (value) =>
-  String(value || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .trim();
-
-const isEuCountryForCheckout = (countryName) => {
-  const normalized = normalizeTextForMatch(countryName);
-  if (!normalized) return true;
-  return CHECKOUT_EU_COUNTRIES.some((country) => normalized.includes(country) || country === normalized);
-};
-
-const resolveStripeShippingMethod = (shippingMethodId, countryName) => {
-  let resolved = String(shippingMethodId || 'POSTA').toUpperCase();
-  if (!STRIPE_SHIPPING_METHODS[resolved]) resolved = 'POSTA';
-
-  if (!isEuCountryForCheckout(countryName) && resolved !== 'PICKUP') {
-    return 'WORLD';
-  }
-
-  if (isEuCountryForCheckout(countryName) && resolved === 'WORLD') {
-    return 'POSTA';
-  }
-
-  return resolved;
-};
-
-const appendQueryParams = (rawUrl, params) => {
-  try {
-    const url = new URL(rawUrl);
-    Object.entries(params || {}).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== '') {
-        url.searchParams.set(key, String(value));
-      }
-    });
-    return url.toString();
-  } catch (err) {
-    const searchParams = new URLSearchParams();
-    Object.entries(params || {}).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== '') {
-        searchParams.set(key, String(value));
-      }
-    });
-    const separator = String(rawUrl).includes('?') ? '&' : '?';
-    return `${rawUrl}${separator}${searchParams.toString()}`;
-  }
-};
-
-const buildStripeOrderPricing = async ({ items, customer, shippingMethodId, couponCode }) => {
-  const normalizedItems = parseJsonSafe(items, []);
-  if (!Array.isArray(normalizedItems) || normalizedItems.length === 0) {
-    throw new Error('Kosarica je prazna.');
-  }
-
-  const itemIds = normalizedItems.map((item) => String(item.id || '').trim()).filter(Boolean);
-  if (itemIds.length !== normalizedItems.length) {
-    throw new Error('Kosarica sadrzi neispravan artikl.');
-  }
-
-  const dbProductsResult = await pool.query('SELECT id, price FROM products WHERE id = ANY($1)', [itemIds]);
-  const dbPrices = {};
-  dbProductsResult.rows.forEach((row) => {
-    dbPrices[String(row.id)] = toNumberSafe(row.price);
-  });
-
-  const isExport = !isEuCountryForCheckout(customer?.country || '');
-  let subtotal = 0;
-  const validatedItems = normalizedItems.map((item) => {
-    const itemId = String(item.id || '').trim();
-    if (!Object.prototype.hasOwnProperty.call(dbPrices, itemId)) {
-      throw new Error(`Artikl ${itemId} nije pronadjen.`);
-    }
-
-    const qty = Math.max(1, Math.trunc(toNumberSafe(item.qty || item.quantity || 1)));
-    const basePrice = roundCurrency(dbPrices[itemId]);
-    const finalPrice = isExport ? roundCurrency(basePrice / 1.25) : basePrice;
-    subtotal = roundCurrency(subtotal + (finalPrice * qty));
-
-    return { ...item, id: itemId, price: finalPrice, qty };
-  });
-
-  const resolvedShippingMethodId = resolveStripeShippingMethod(shippingMethodId, customer?.country || '');
-  const shippingPrice = subtotal >= FREE_SHIPPING_THRESHOLD ? 0 : STRIPE_SHIPPING_METHODS[resolvedShippingMethodId].price;
-
-  let resolvedDiscount = { amount: 0 };
-  const normalizedCouponCode = String(couponCode || '').trim().toUpperCase();
-  if (normalizedCouponCode) {
-    const settingsResult = await pool.query('SELECT coupons FROM shop_settings LIMIT 1');
-    const availableCoupons = parseJsonSafe(settingsResult.rows[0]?.coupons, []);
-    const coupon = Array.isArray(availableCoupons)
-      ? availableCoupons.find((item) => String(item.code || '').trim().toUpperCase() === normalizedCouponCode)
-      : null;
-
-    if (!coupon) {
-      throw new Error('Kupon nije vazeci.');
-    }
-
-    let discountAmount = 0;
-    if (coupon.type === 'PERCENT') discountAmount = subtotal * (toNumberSafe(coupon.value) / 100);
-    if (coupon.type === 'FIX') discountAmount = toNumberSafe(coupon.value);
-    resolvedDiscount = {
-      code: normalizedCouponCode,
-      amount: roundCurrency(Math.min(discountAmount, subtotal)),
-    };
-  }
-
-  const totalAmount = roundCurrency(Math.max(0, subtotal - toNumberSafe(resolvedDiscount.amount) + shippingPrice));
-
-  return {
-    validatedItems,
-    subtotal,
-    shippingPrice: roundCurrency(shippingPrice),
-    discount: resolvedDiscount,
-    totalAmount,
-  };
-};
-
-const buildInvoiceItemsForOrder = (orderData) => {
-  const items = parseJsonSafe(orderData.items, []);
-  const discountObj = parseJsonSafe(orderData.discount, { amount: 0 });
-  const subtotal = roundCurrency(items.reduce((acc, item) => {
-    return acc + (toNumberSafe(item.price) * toNumberSafe(item.qty || item.quantity || 1));
-  }, 0));
-  const shippingAmount = roundCurrency(Math.max(0, toNumberSafe(orderData.total) - subtotal + toNumberSafe(discountObj.amount)));
-
-  if (shippingAmount <= 0) return items;
-
-  return [
-    ...items,
-    { name: 'Dostava', price: shippingAmount, qty: 1, discountable: false }
-  ];
-};
-
 // --- SOLO.HR FISKALIZACIJA ---
 const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
-  const soloMeta = {
-    orderId: orderData?.id || null,
-    isPaid: !!isPaid,
-    isStorno: !!isStorno
-  };
-
   try {
     const token = process.env.SOLO_API_TOKEN;
-    if (!token) {
-      console.error('Solo.hr: SOLO_API_TOKEN nije postavljen.', soloMeta);
-      return null;
-    }
+    if (!token) return null;
 
-    const items = buildInvoiceItemsForOrder(orderData);
-    console.log('Solo.hr: saljem zahtjev za racun.', {
-      ...soloMeta,
-      itemCount: items.length
-    });
+    const items = parseJsonSafe(orderData.items, []);
     
     const params = new URLSearchParams();
     params.append('token', token);
@@ -385,15 +181,14 @@ const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
     params.append('fiskalizacija', '1');
     
     if (isStorno) {
-      params.append('napomena', `Storno ra√Ñ≈§una za narudƒπƒæbu ${orderData.id}. Povrat sredstava kupcu.`);
+      params.append('napomena', `Storno raƒçuna za narud≈æbu ${orderData.id}. Povrat sredstava kupcu.`);
     }
 
     const popustObj = parseJsonSafe(orderData.discount, { amount: 0 });
     let popustPostotak = '0';
 
     if (popustObj && popustObj.amount > 0) {
-      const discountableItems = items.filter((item) => item.discountable !== false);
-      let ukupnoArtikli = discountableItems.reduce((acc, item) => acc + (Number(item.price || 0) * Number(item.qty || 1)), 0);
+      let ukupnoArtikli = items.reduce((acc, item) => acc + (Number(item.price || 0) * Number(item.qty || 1)), 0);
       if (ukupnoArtikli > 0) {
         let izracunatiPostotak = (Number(popustObj.amount) / ukupnoArtikli) * 100;
         popustPostotak = izracunatiPostotak.toFixed(2); 
@@ -405,6 +200,7 @@ const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
       let naziv = `${item.brand || ''} ${item.name || ''}`.trim();
       if (!naziv || naziv === 'undefined') naziv = 'Artikl';
 
+      // ZA SOLO STORNO: Koliƒçina mora biti pozitivna, a CIJENA ide u minus!
       let kolicina = Number(item.qty || 1);
       let cijena = Number(item.price || 0);
       
@@ -417,49 +213,22 @@ const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
       params.append(`kolicina_${i}`, String(kolicina));
       params.append(`cijena_${i}`, String(cijena));
       params.append(`porez_stopa_${i}`, '0');
-      params.append(`popust_${i}`, item.discountable === false ? '0' : popustPostotak); 
+      params.append(`popust_${i}`, popustPostotak); 
     });
     
     const res = await axios.post('https://api.solo.com.hr/racun', params.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     });
 
-    console.log('Solo.hr: odgovor zaprimljen.', {
-      ...soloMeta,
-      httpStatus: res?.status ?? null,
-      hasData: !!res?.data,
-      hasRacun: !!res?.data?.racun,
-      hasPdf: !!res?.data?.racun?.pdf
-    });
-
-    if (res?.data?.racun) { 
-      if (res.data.racun.pdf) {
-        console.log(`Solo ${isStorno ? 'STORNO ' : ''}racun uspjesno kreiran! PDF: ` + res.data.racun.pdf);
-      } else {
-        console.error('Solo.hr: odgovor sadrzi racun bez pdf-a.', {
-          ...soloMeta,
-          httpStatus: res?.status ?? null,
-          response: JSON.stringify(res.data)
-        });
-      }
+    if (res.data && res.data.racun) { 
+      console.log(`Solo ${isStorno ? 'STORNO ' : ''}raƒçun uspje≈°no kreiran! PDF: ` + res.data.racun.pdf);
       return res.data.racun;
     } else {
-      console.error('Solo.hr: odgovor nema polje racun.', {
-        ...soloMeta,
-        httpStatus: res?.status ?? null,
-        hasData: !!res?.data,
-        response: JSON.stringify(res?.data ?? null)
-      });
+      console.error("Solo.hr odbio raƒçun. Detalji:", JSON.stringify(res.data));
       return null;
     }
   } catch (err) {
-    console.error('Solo.hr: greska pri spajanju ili kreiranju racuna.', {
-      ...soloMeta,
-      message: err.message,
-      httpStatus: err?.response?.status ?? null,
-      hasData: !!err?.response?.data,
-      response: JSON.stringify(err?.response?.data ?? null)
-    });
+    console.error("Gre≈°ka pri spajanju sa Solo.hr:", err.message);
     return null;
   }
 };
@@ -522,8 +291,7 @@ const transporter = nodemailer.createTransport({
 });
 
 // --- SLANJE NALOGA DOBAVLJAƒåIMA (DROPSHIPPING) ---
-const sendPackingSlipsToSuppliers = async (order, items, options = {}) => {
-  const { throwOnError = false } = options;
+const sendPackingSlipsToSuppliers = async (order, items) => {
   try {
     const supplierGroups = {};
     
@@ -604,13 +372,11 @@ const sendPackingSlipsToSuppliers = async (order, items, options = {}) => {
     }
   } catch (error) {
     console.error("Gre≈°ka pri slanju maila dobavljaƒçima:", error);
-    if (throwOnError) throw error;
   }
 };
 
 // --- SKIDANJE ZALIHE ---
-const deductStock = async (items, options = {}) => {
-  const { throwOnError = false } = options;
+const deductStock = async (items) => {
   try {
     for (const item of items) {
       if (!item.id) continue;
@@ -636,7 +402,6 @@ const deductStock = async (items, options = {}) => {
     }
   } catch (e) {
     console.error('Gre≈°ka pri trajnom skidanju zalihe:', e);
-    if (throwOnError) throw e;
   }
 };
 
@@ -915,209 +680,84 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error('Webhook greska potpisivanja:', err.message);
+    console.error('Webhook gre≈°ka potpisivanja:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
-
+  
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const orderId = session.client_reference_id || session.metadata?.orderId || null;
     const sessionId = session.id || null;
-    let lockedOrderId = null;
 
-    if (!orderId && !sessionId) {
-      console.error('Stripe webhook: nedostaje referenca na narudzbu.', { sessionId });
-      return res.status(500).json({ error: 'Stripe webhook nema referencu na narudzbu.' });
-    }
+    if (orderId || sessionId) {
+      try {
+        let existingOrderResult;
 
-    try {
-      let existingOrderResult;
+        if (orderId) {
+          existingOrderResult = await pool.query(
+            'SELECT * FROM orders WHERE id = $1 LIMIT 1',
+            [orderId]
+          );
+        } else {
+          existingOrderResult = await pool.query(
+            'SELECT * FROM orders WHERE stripe_session_id = $1 LIMIT 1',
+            [sessionId]
+          );
+        }
 
-      if (orderId) {
-        existingOrderResult = await pool.query(
-          'SELECT * FROM orders WHERE id = $1 LIMIT 1',
-          [orderId]
-        );
-      } else {
-        existingOrderResult = await pool.query(
-          'SELECT * FROM orders WHERE stripe_session_id = $1 LIMIT 1',
-          [sessionId]
-        );
-      }
-
-      const existingOrder = existingOrderResult.rows[0];
-      if (!existingOrder) {
-        console.error('Stripe webhook: narudzba nije pronadjena.', { orderId, sessionId });
-        return res.status(500).json({ error: 'Stripe webhook nije pronasao narudzbu.' });
-      }
-
-      if (isStripeOrderFullyFinalized(existingOrder)) {
-        return res.json({ received: true });
-      }
-
-      const lockResult = await pool.query(
-        `UPDATE orders
-         SET stripe_processing_at = NOW(),
-             stripe_session_id = COALESCE($2, stripe_session_id),
-             paid_at = COALESCE(paid_at, NOW())
-         WHERE id = $1
-           AND stripe_finalized_at IS NULL
-           AND (stripe_processing_at IS NULL OR stripe_processing_at < NOW() - INTERVAL '10 minutes')
-         RETURNING *`,
-        [existingOrder.id, sessionId]
-      );
-
-      if (lockResult.rows.length === 0) {
-        const currentOrderResult = await pool.query(
-          'SELECT * FROM orders WHERE id = $1 LIMIT 1',
-          [existingOrder.id]
-        );
-        const currentOrder = currentOrderResult.rows[0];
-
-        if (isStripeOrderFullyFinalized(currentOrder)) {
+        const existingOrder = existingOrderResult.rows[0];
+        if (!existingOrder) {
+          console.error('Stripe webhook: narudûba nije pronaena.', { orderId, sessionId });
           return res.json({ received: true });
         }
 
-        return res.status(409).json({ error: 'Stripe webhook finalizacija je vec u tijeku.' });
-      }
-
-      let workingOrder = lockResult.rows[0];
-      lockedOrderId = workingOrder.id;
-      let invoiceNumber = invoiceNumberFromOrderId(workingOrder.id);
-
-      if (!workingOrder.invoice_url) {
-        const orderForInvoice = {
-          ...workingOrder,
-          status: 'PAID',
-          stripe_session_id: sessionId || workingOrder.stripe_session_id || null,
-          paid_at: workingOrder.paid_at || new Date().toISOString(),
-        };
-
-        const soloRacun = await createSoloInvoice(orderForInvoice, true);
-        if (!soloRacun) {
-          console.error('Stripe webhook: Solo racun nije generiran.', { orderId: workingOrder.id, sessionId });
-          throw new Error('Stripe webhook: Solo racun nije generiran.');
-        }
-
-        if (!soloRacun.pdf) {
-          console.error('Stripe webhook: Solo racun je vracen bez pdf-a.', { orderId: workingOrder.id, sessionId, soloRacun });
-          throw new Error('Stripe webhook: Solo racun je vracen bez pdf-a.');
-        }
-
-        invoiceNumber = soloRacun.broj_racuna || invoiceNumber;
-        const invoiceResult = await pool.query(
-          "UPDATE orders SET status = 'PAID', stripe_session_id = COALESCE($2, stripe_session_id), paid_at = COALESCE(paid_at, NOW()), invoice_url = $3 WHERE id = $1 RETURNING *",
-          [workingOrder.id, sessionId, soloRacun.pdf]
-        );
-        workingOrder = invoiceResult.rows[0];
-
-        if (!workingOrder || workingOrder.status !== 'PAID' || !workingOrder.invoice_url) {
-          console.error('Stripe webhook: status PAID ili invoice_url nisu uspjesno spremljeni.', { orderId: existingOrder.id, sessionId, invoiceUrl: soloRacun.pdf });
-          throw new Error('Stripe webhook: status PAID ili invoice_url nisu uspjesno spremljeni.');
-        }
-      } else if (workingOrder.status !== 'PAID') {
-        const paidResult = await pool.query(
+        const updateResult = await pool.query(
           "UPDATE orders SET status = 'PAID', stripe_session_id = COALESCE($2, stripe_session_id), paid_at = COALESCE(paid_at, NOW()) WHERE id = $1 RETURNING *",
-          [workingOrder.id, sessionId]
+          [existingOrder.id, sessionId]
         );
-        workingOrder = paidResult.rows[0];
+        const updatedOrder = updateResult.rows[0];
+        const shouldFinalizeOrder = existingOrder.status !== 'PAID' || !existingOrder.invoice_url;
 
-        if (!workingOrder || workingOrder.status !== 'PAID' || !workingOrder.invoice_url) {
-          console.error('Stripe webhook: postojeci invoice_url nije potvrdjen uz status PAID.', { orderId: existingOrder.id, sessionId });
-          throw new Error('Stripe webhook: postojeci invoice_url nije potvrdjen uz status PAID.');
-        }
-      }
+        if (updatedOrder && shouldFinalizeOrder) {
+          const soloRacun = await createSoloInvoice(updatedOrder, true);
+          const invoiceUrl = soloRacun ? soloRacun.pdf : null;
+          const invoiceNumber = soloRacun ? soloRacun.broj_racuna : invoiceNumberFromOrderId(existingOrder.id);
 
-      if (!workingOrder.stripe_stock_deducted_at) {
-        await deductStock(parseJsonSafe(workingOrder.items, []), { throwOnError: true });
-        workingOrder = await markStripeOrderStepComplete(workingOrder.id, 'stripe_stock_deducted_at');
+          await pool.query(
+            "UPDATE orders SET invoice_url = $1 WHERE id = $2",
+            [invoiceUrl, existingOrder.id]
+          );
 
-        if (!workingOrder?.stripe_stock_deducted_at) {
-          console.error('Stripe webhook: marker skidanja robe nije spremljen.', { orderId: workingOrder.id, sessionId });
-          throw new Error('Stripe webhook nije potvrdio skidanje robe.');
-        }
-      }
-
-      if (!workingOrder.stripe_supplier_emailed_at) {
-        try {
-          await sendPackingSlipsToSuppliers(workingOrder, parseJsonSafe(workingOrder.items, []), { throwOnError: true });
-          workingOrder = await markStripeOrderStepComplete(workingOrder.id, 'stripe_supplier_emailed_at');
-
-          if (!workingOrder?.stripe_supplier_emailed_at) {
-            console.error('Stripe webhook: marker dobavljackog maila nije spremljen.', { orderId: workingOrder.id, sessionId });
-          }
-        } catch (supplierMailErr) {
-          console.error('Stripe webhook: racun je spremljen, ali slanje dobavljackog maila nije uspjelo.', {
-            orderId: workingOrder.id,
-            sessionId,
-            error: supplierMailErr?.message || supplierMailErr
-          });
-        }
-      }
-
-      if (!workingOrder.stripe_customer_emailed_at) {
-        if (workingOrder.email) {
-          try {
+          sendPackingSlipsToSuppliers(updatedOrder, parseJsonSafe(updatedOrder.items, [])).catch(e => console.error("X Greöka dobavljaËi Stripe:", e));
+          req.app.get('io').emit('nova_narudzba', { id: existingOrder.id, name: updatedOrder.name });
+          if (updatedOrder.email && invoiceUrl) {
             await transporter.sendMail({
-              from: `"KISFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
-              to: workingOrder.email,
+              from: `"KIäFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
+              to: updatedOrder.email,
               bcc: process.env.EMAIL_USER,
-              subject: `Fiskalizirani racun za narudzbu br. ${invoiceNumber}`,
+              subject: `Fiskalizirani raËun za narudûbu br. ${invoiceNumber}`,
               html: `
                 <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #D4AF37; text-align: center;">
                   <h2>Hvala na kupnji!</h2>
-                  <p>Vasa uplata je uspjesno obradjena.</p>
-                  <p>Sluzbeni fiskalizirani racun nalazi se u <strong>privitku ovog e-maila</strong>, a mozete ga preuzeti i klikom na gumb ispod:</p>
-                  <a href="${workingOrder.invoice_url}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block; margin: 20px 0;">PREUZMI PDF RACUN</a>
+                  <p>Vaöa uplata je uspjeöno obraena.</p>
+                  <p>Sluûbeni fiskalizirani raËun nalazi se u <strong>privitku ovog e-maila</strong>, a moûete ga preuzeti i klikom na gumb ispod:</p>
+                  <a href="${invoiceUrl}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block; margin: 20px 0;">PREUZMI PDF RA»UN</a>
                 </div>
               `,
               attachments: [
                 {
                   filename: `Racun_Kisfaluba_${invoiceNumber.replace(/\//g, '_')}.pdf`,
-                  path: workingOrder.invoice_url
+                  path: invoiceUrl
                 }
               ]
             });
-            workingOrder = await markStripeOrderStepComplete(workingOrder.id, 'stripe_customer_emailed_at');
-          } catch (customerMailErr) {
-            console.error('Stripe webhook: racun je spremljen, ali slanje maila kupcu nije uspjelo.', {
-              orderId: workingOrder.id,
-              sessionId,
-              error: customerMailErr?.message || customerMailErr
-            });
           }
-        } else {
-          console.warn('Stripe webhook: order nema email kupca, mail s racunom nije poslan.', { orderId: workingOrder.id, sessionId });
-          workingOrder = await markStripeOrderStepComplete(workingOrder.id, 'stripe_customer_emailed_at');
         }
+      } catch (dbErr) {
+        console.error('Greöka pri aûuriranju baze:', dbErr);
       }
-
-      const finalResult = await pool.query(
-        'UPDATE orders SET stripe_finalized_at = COALESCE(stripe_finalized_at, NOW()), stripe_processing_at = NULL WHERE id = $1 RETURNING *',
-        [workingOrder.id]
-      );
-      const finalizedOrder = finalResult.rows[0];
-
-      if (!isStripeOrderFullyFinalized(finalizedOrder)) {
-        console.error('Stripe webhook: zavrsna provjera nije potvrdila puni Stripe finalni tok.', { orderId: workingOrder.id, sessionId });
-        throw new Error('Stripe webhook: zavrsna provjera nije potvrdila puni Stripe finalni tok.');
-      }
-
-      req.app.get('io').emit('nova_narudzba', { id: finalizedOrder.id, name: finalizedOrder.name });
-      return res.json({ received: true });
-    } catch (dbErr) {
-      if (lockedOrderId) {
-        try {
-          await clearStripeProcessingLock(lockedOrderId);
-        } catch (unlockErr) {
-          console.error('Stripe webhook: oslobadjanje processing locka nije uspjelo.', { orderId: lockedOrderId, unlockErr });
-        }
-      }
-      console.error('Stripe webhook finalizacija nije uspjela:', dbErr);
-      return res.status(500).json({ error: 'Stripe webhook finalizacija nije uspjela.' });
     }
   }
-
   res.json({ received: true });
 });
 
@@ -1158,46 +798,48 @@ const authGuard = (req, res, next) => {
 // --- STRIPE CHECKOUT ---
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    const { items, customer = {}, isApp, discount, shippingMethodId } = req.body;
-    const couponCode = discount && discount.code ? discount.code : null;
+    const { items, customer, isApp, discount, shippingPrice } = req.body; 
+    const normalizedItems = parseJsonSafe(items, []);
 
-    const {
-      validatedItems,
-      discount: resolvedDiscount,
-      totalAmount,
-    } = await buildStripeOrderPricing({
-      items,
-      customer,
-      shippingMethodId,
-      couponCode,
+    if (normalizedItems.length === 0) {
+      return res.status(400).json({ error: 'Ko≈°arica je prazna.' });
+    }
+
+    const itemIds = normalizedItems.map(item => String(item.id));
+    const dbProductsResult = await pool.query('SELECT id, price FROM products WHERE id = ANY($1)', [itemIds]);
+    
+    const dbPrices = {};
+    dbProductsResult.rows.forEach(row => {
+      dbPrices[row.id] = Number(row.price);
     });
 
-    const totalInCents = Math.round(totalAmount * 100);
-    const address = customer.address || `${customer.street || ''}, ${customer.postalCode || ''} ${customer.city || ''}, ${customer.country || ''}`;
-    const name = `${customer.firstName || ''} ${customer.lastName || ''}`.trim() || 'Nepoznat kupac';
+    let safeSubtotal = 0;
+    const validatedItems = normalizedItems.map(item => {
+      const realPrice = dbPrices[item.id] || 0;
+      const qty = toNumberSafe(item.qty || item.quantity || 1);
+      safeSubtotal += realPrice * qty;
+      return { ...item, price: realPrice, qty };
+    });
 
+    const safeShipping = toNumberSafe(shippingPrice || 0); 
+    const safeDiscount = discount && discount.amount ? toNumberSafe(discount.amount) : 0;
+
+    let totalAmount = safeSubtotal + safeShipping - safeDiscount;
+    if (totalAmount < 0) totalAmount = 0;
+
+    const totalInCents = Math.round(totalAmount * 100);
+
+    const address = customer.address || `${customer.street}, ${customer.postalCode} ${customer.city}, ${customer.country}`; 
+    const name = `${customer.firstName} ${customer.lastName}`;
+    
     const newOrder = await pool.query(
       'INSERT INTO orders (name, address, phone, email, total, items, status, discount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
-      [
-        name,
-        address,
-        customer.phone || '',
-        customer.email || '',
-        totalAmount,
-        JSON.stringify(validatedItems),
-        'NEW',
-        JSON.stringify(resolvedDiscount),
-      ]
+      [name, address, customer.phone || '', customer.email || '', totalAmount, JSON.stringify(validatedItems), 'NEW', JSON.stringify(discount || { amount: 0 })]
     );
     const orderId = newOrder.rows[0].id;
-
-    const fallbackSuccessUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-success?app=true` : `${req.protocol}://${req.get('host')}/payment-success`;
-    const fallbackCancelUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-cancel?app=true` : `${req.protocol}://${req.get('host')}/payment-cancel`;
-    const baseSuccessUrl = req.body.returnUrl ? req.body.returnUrl : fallbackSuccessUrl;
-    const baseCancelUrl = req.body.returnUrl ? req.body.returnUrl.replace('payment-success', 'payment-cancel') : fallbackCancelUrl;
-    const successUrl = appendQueryParams(baseSuccessUrl, { orderId: String(orderId) });
-    const cancelUrl = appendQueryParams(baseCancelUrl, { orderId: String(orderId) });
-
+    const successUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-success?app=true` : `${req.protocol}://${req.get('host')}/payment-success`;
+    const cancelUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-cancel?app=true` : `${req.protocol}://${req.get('host')}/payment-cancel`;
+    
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       client_reference_id: String(orderId),
@@ -1208,25 +850,26 @@ app.post('/create-checkout-session', async (req, res) => {
       line_items: [{
         price_data: {
           currency: 'eur',
-          product_data: { name: 'Kisfaluba narudzba', description: `Kupac: ${name}` },
+          product_data: { name: 'Ki≈°faluba narud≈æba', description: `Kupac: ${name}` },
           unit_amount: totalInCents,
         },
         quantity: 1
       }],
       mode: 'payment',
-      success_url: successUrl,
-      cancel_url: cancelUrl,
+      success_url: req.body.returnUrl ? req.body.returnUrl : successUrl,
+      cancel_url: req.body.returnUrl ? req.body.returnUrl.replace('payment-success', 'payment-cancel') : cancelUrl,
     });
 
     await pool.query(
       'UPDATE orders SET stripe_session_id = $1 WHERE id = $2',
       [session.id, orderId]
     );
-
+    await deductStock(validatedItems);
+    
     res.json({ url: session.url, orderId: String(orderId) });
   } catch (err) {
-    console.error('Stripe greska:', err.message);
-    res.status(500).json({ error: err.message || 'Greska pri povezivanju sa Stripeom.' });
+    console.error('Stripe gre≈°ka:', err.message);
+    res.status(500).json({ error: 'Gre≈°ka pri povezivanju sa Stripeom.' });
   }
 });
 
@@ -1462,28 +1105,24 @@ app.get('/orders/:id/payment-status', async (req, res) => {
   try {
     const orderId = String(req.params.id).split('-')[0];
     const result = await pool.query(
-      'SELECT id, status, invoice_url, paid_at, stripe_processing_at, stripe_stock_deducted_at, stripe_supplier_emailed_at, stripe_customer_emailed_at, stripe_finalized_at FROM orders WHERE id = $1 LIMIT 1',
+      'SELECT id, status, invoice_url, paid_at FROM orders WHERE id = $1 LIMIT 1',
       [orderId]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'NarudÔøΩba nije pronaÔøΩena.' });
+      return res.status(404).json({ error: 'Narudûba nije pronaena.' });
     }
 
     const order = result.rows[0];
-    const isFinalized = isStripeOrderFullyFinalized(order);
     res.json({
       id: order.id,
       status: order.status,
       invoiceUrl: order.invoice_url,
       paidAt: order.paid_at,
-      stripeFinalizedAt: order.stripe_finalized_at,
-      isProcessing: !!order.stripe_processing_at && !order.stripe_finalized_at,
-      isPaid: isFinalized,
-      isFinalized
+      isPaid: order.status === 'PAID'
     });
   } catch (err) {
-    res.status(500).json({ error: 'GreÔøΩka servera' });
+    res.status(500).json({ error: 'Greöka servera' });
   }
 });
 
@@ -1857,9 +1496,16 @@ pool.query('ALTER TABLE products ALTER COLUMN cost_price TYPE NUMERIC(10,2)').ca
 server.listen(PORT, '0.0.0.0', () => { 
   console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`); 
 });
-
-
-
+// PRIVREMENA METLA ZA BRISANJE SVEGA
+app.get('/brisanje-baze', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM orders');
+    await pool.query('DELETE FROM inbound_invoices');
+    res.send('<h1>Sve narud≈æbe i ulazni raƒçuni su uspje≈°no obrisani! üßπ</h1><p>Sada se vrati u VS Code, OBRISI ovaj kod i ponovno stisni Sync Changes kako ti nitko drugi ne bi mogao obrisati bazu.</p>');
+  } catch (err) { 
+    res.status(500).send('Gre≈°ka pri brisanju: ' + err.message); 
+  }
+});
 
 
 

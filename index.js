@@ -357,11 +357,24 @@ const buildInvoiceItemsForOrder = (orderData) => {
 
 // --- SOLO.HR FISKALIZACIJA ---
 const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
+  const soloMeta = {
+    orderId: orderData?.id || null,
+    isPaid: !!isPaid,
+    isStorno: !!isStorno
+  };
+
   try {
     const token = process.env.SOLO_API_TOKEN;
-    if (!token) return null;
+    if (!token) {
+      console.error('Solo.hr: SOLO_API_TOKEN nije postavljen.', soloMeta);
+      return null;
+    }
 
     const items = buildInvoiceItemsForOrder(orderData);
+    console.log('Solo.hr: saljem zahtjev za racun.', {
+      ...soloMeta,
+      itemCount: items.length
+    });
     
     const params = new URLSearchParams();
     params.append('token', token);
@@ -374,7 +387,7 @@ const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
     params.append('fiskalizacija', '1');
     
     if (isStorno) {
-      params.append('napomena', `Storno računa za narudžbu ${orderData.id}. Povrat sredstava kupcu.`);
+      params.append('napomena', `Storno raÄŤuna za narudĹľbu ${orderData.id}. Povrat sredstava kupcu.`);
     }
 
     const popustObj = parseJsonSafe(orderData.discount, { amount: 0 });
@@ -394,7 +407,6 @@ const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
       let naziv = `${item.brand || ''} ${item.name || ''}`.trim();
       if (!naziv || naziv === 'undefined') naziv = 'Artikl';
 
-      // ZA SOLO STORNO: Količina mora biti pozitivna, a CIJENA ide u minus!
       let kolicina = Number(item.qty || 1);
       let cijena = Number(item.price || 0);
       
@@ -408,21 +420,48 @@ const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
       params.append(`cijena_${i}`, String(cijena));
       params.append(`porez_stopa_${i}`, '0');
       params.append(`popust_${i}`, item.discountable === false ? '0' : popustPostotak); 
-});
+    });
     
     const res = await axios.post('https://api.solo.com.hr/racun', params.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     });
 
-    if (res.data && res.data.racun) { 
-      console.log(`Solo ${isStorno ? 'STORNO ' : ''}račun uspješno kreiran! PDF: ` + res.data.racun.pdf);
+    console.log('Solo.hr: odgovor zaprimljen.', {
+      ...soloMeta,
+      httpStatus: res?.status ?? null,
+      hasData: !!res?.data,
+      hasRacun: !!res?.data?.racun,
+      hasPdf: !!res?.data?.racun?.pdf
+    });
+
+    if (res?.data?.racun) { 
+      if (res.data.racun.pdf) {
+        console.log(`Solo ${isStorno ? 'STORNO ' : ''}racun uspjesno kreiran! PDF: ` + res.data.racun.pdf);
+      } else {
+        console.error('Solo.hr: odgovor sadrzi racun bez pdf-a.', {
+          ...soloMeta,
+          httpStatus: res?.status ?? null,
+          response: JSON.stringify(res.data)
+        });
+      }
       return res.data.racun;
     } else {
-      console.error("Solo.hr odbio račun. Detalji:", JSON.stringify(res.data));
+      console.error('Solo.hr: odgovor nema polje racun.', {
+        ...soloMeta,
+        httpStatus: res?.status ?? null,
+        hasData: !!res?.data,
+        response: JSON.stringify(res?.data ?? null)
+      });
       return null;
     }
   } catch (err) {
-    console.error("Greška pri spajanju sa Solo.hr:", err.message);
+    console.error('Solo.hr: greska pri spajanju ili kreiranju racuna.', {
+      ...soloMeta,
+      message: err.message,
+      httpStatus: err?.response?.status ?? null,
+      hasData: !!err?.response?.data,
+      response: JSON.stringify(err?.response?.data ?? null)
+    });
     return null;
   }
 };
@@ -957,9 +996,14 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         };
 
         const soloRacun = await createSoloInvoice(orderForInvoice, true);
-        if (!soloRacun || !soloRacun.pdf) {
-          console.error('Stripe webhook: Solo racun nije uspjesno generiran.', { orderId: workingOrder.id, sessionId, soloRacun });
-          return res.status(500).json({ error: 'Solo racun nije uspjesno generiran.' });
+        if (!soloRacun) {
+          console.error('Stripe webhook: Solo racun nije generiran.', { orderId: workingOrder.id, sessionId });
+          throw new Error('Stripe webhook: Solo racun nije generiran.');
+        }
+
+        if (!soloRacun.pdf) {
+          console.error('Stripe webhook: Solo racun je vracen bez pdf-a.', { orderId: workingOrder.id, sessionId, soloRacun });
+          throw new Error('Stripe webhook: Solo racun je vracen bez pdf-a.');
         }
 
         invoiceNumber = soloRacun.broj_racuna || invoiceNumber;
@@ -970,8 +1014,8 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         workingOrder = invoiceResult.rows[0];
 
         if (!workingOrder || workingOrder.status !== 'PAID' || !workingOrder.invoice_url) {
-          console.error('Stripe webhook: status PAID ili invoice_url nisu uspjesno spremljeni.', { orderId: existingOrder.id, sessionId });
-          return res.status(500).json({ error: 'Status PAID ili invoice_url nisu uspjesno spremljeni.' });
+          console.error('Stripe webhook: status PAID ili invoice_url nisu uspjesno spremljeni.', { orderId: existingOrder.id, sessionId, invoiceUrl: soloRacun.pdf });
+          throw new Error('Stripe webhook: status PAID ili invoice_url nisu uspjesno spremljeni.');
         }
       } else if (workingOrder.status !== 'PAID') {
         const paidResult = await pool.query(
@@ -982,7 +1026,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
 
         if (!workingOrder || workingOrder.status !== 'PAID' || !workingOrder.invoice_url) {
           console.error('Stripe webhook: postojeci invoice_url nije potvrdjen uz status PAID.', { orderId: existingOrder.id, sessionId });
-          return res.status(500).json({ error: 'Postojeci invoice_url nije potvrdjen uz status PAID.' });
+          throw new Error('Stripe webhook: postojeci invoice_url nije potvrdjen uz status PAID.');
         }
       }
 
@@ -991,7 +1035,8 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         workingOrder = await markStripeOrderStepComplete(workingOrder.id, 'stripe_stock_deducted_at');
 
         if (!workingOrder?.stripe_stock_deducted_at) {
-          return res.status(500).json({ error: 'Stripe webhook nije potvrdio skidanje robe.' });
+          console.error('Stripe webhook: marker skidanja robe nije spremljen.', { orderId: workingOrder.id, sessionId });
+          throw new Error('Stripe webhook nije potvrdio skidanje robe.');
         }
       }
 
@@ -1000,7 +1045,8 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         workingOrder = await markStripeOrderStepComplete(workingOrder.id, 'stripe_supplier_emailed_at');
 
         if (!workingOrder?.stripe_supplier_emailed_at) {
-          return res.status(500).json({ error: 'Stripe webhook nije potvrdio slanje dobavljackog maila.' });
+          console.error('Stripe webhook: marker dobavljackog maila nije spremljen.', { orderId: workingOrder.id, sessionId });
+          throw new Error('Stripe webhook nije potvrdio slanje dobavljackog maila.');
         }
       }
 
@@ -1026,12 +1072,15 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
               }
             ]
           });
+        } else {
+          console.warn('Stripe webhook: order nema email kupca, mail s racunom nije poslan.', { orderId: workingOrder.id, sessionId });
         }
 
         workingOrder = await markStripeOrderStepComplete(workingOrder.id, 'stripe_customer_emailed_at');
 
         if (!workingOrder?.stripe_customer_emailed_at) {
-          return res.status(500).json({ error: 'Stripe webhook nije potvrdio slanje maila kupcu.' });
+          console.error('Stripe webhook: marker maila kupcu nije spremljen.', { orderId: workingOrder.id, sessionId });
+          throw new Error('Stripe webhook nije potvrdio slanje maila kupcu.');
         }
       }
 
@@ -1043,7 +1092,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
 
       if (!isStripeOrderFullyFinalized(finalizedOrder)) {
         console.error('Stripe webhook: zavrsna provjera nije potvrdila puni Stripe finalni tok.', { orderId: workingOrder.id, sessionId });
-        return res.status(500).json({ error: 'Zavrsna provjera nije potvrdila puni Stripe finalni tok.' });
+        throw new Error('Stripe webhook: zavrsna provjera nije potvrdila puni Stripe finalni tok.');
       }
 
       req.app.get('io').emit('nova_narudzba', { id: finalizedOrder.id, name: finalizedOrder.name });
@@ -1053,7 +1102,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         try {
           await clearStripeProcessingLock(lockedOrderId);
         } catch (unlockErr) {
-          console.error('Stripe webhook: oslobadjanje processing locka nije uspjelo.', unlockErr);
+          console.error('Stripe webhook: oslobadjanje processing locka nije uspjelo.', { orderId: lockedOrderId, unlockErr });
         }
       }
       console.error('Stripe webhook finalizacija nije uspjela:', dbErr);
@@ -1810,6 +1859,7 @@ app.get('/brisanje-baze', async (req, res) => {
     res.status(500).send('Greška pri brisanju: ' + err.message); 
   }
 });
+
 
 
 

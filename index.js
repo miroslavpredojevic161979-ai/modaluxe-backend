@@ -172,8 +172,6 @@ const isStripeOrderFullyFinalized = (order) => {
     order.status === 'PAID' &&
     !!order.invoice_url &&
     !!order.stripe_stock_deducted_at &&
-    !!order.stripe_supplier_emailed_at &&
-    !!order.stripe_customer_emailed_at &&
     !!order.stripe_finalized_at;
 };
 
@@ -1041,46 +1039,56 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
       }
 
       if (!workingOrder.stripe_supplier_emailed_at) {
-        await sendPackingSlipsToSuppliers(workingOrder, parseJsonSafe(workingOrder.items, []), { throwOnError: true });
-        workingOrder = await markStripeOrderStepComplete(workingOrder.id, 'stripe_supplier_emailed_at');
+        try {
+          await sendPackingSlipsToSuppliers(workingOrder, parseJsonSafe(workingOrder.items, []), { throwOnError: true });
+          workingOrder = await markStripeOrderStepComplete(workingOrder.id, 'stripe_supplier_emailed_at');
 
-        if (!workingOrder?.stripe_supplier_emailed_at) {
-          console.error('Stripe webhook: marker dobavljackog maila nije spremljen.', { orderId: workingOrder.id, sessionId });
-          throw new Error('Stripe webhook nije potvrdio slanje dobavljackog maila.');
+          if (!workingOrder?.stripe_supplier_emailed_at) {
+            console.error('Stripe webhook: marker dobavljackog maila nije spremljen.', { orderId: workingOrder.id, sessionId });
+          }
+        } catch (supplierMailErr) {
+          console.error('Stripe webhook: racun je spremljen, ali slanje dobavljackog maila nije uspjelo.', {
+            orderId: workingOrder.id,
+            sessionId,
+            error: supplierMailErr?.message || supplierMailErr
+          });
         }
       }
 
       if (!workingOrder.stripe_customer_emailed_at) {
         if (workingOrder.email) {
-          await transporter.sendMail({
-            from: `"KISFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
-            to: workingOrder.email,
-            bcc: process.env.EMAIL_USER,
-            subject: `Fiskalizirani racun za narudzbu br. ${invoiceNumber}`,
-            html: `
-              <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #D4AF37; text-align: center;">
-                <h2>Hvala na kupnji!</h2>
-                <p>Vasa uplata je uspjesno obradjena.</p>
-                <p>Sluzbeni fiskalizirani racun nalazi se u <strong>privitku ovog e-maila</strong>, a mozete ga preuzeti i klikom na gumb ispod:</p>
-                <a href="${workingOrder.invoice_url}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block; margin: 20px 0;">PREUZMI PDF RACUN</a>
-              </div>
-            `,
-            attachments: [
-              {
-                filename: `Racun_Kisfaluba_${invoiceNumber.replace(/\//g, '_')}.pdf`,
-                path: workingOrder.invoice_url
-              }
-            ]
-          });
+          try {
+            await transporter.sendMail({
+              from: `"KISFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
+              to: workingOrder.email,
+              bcc: process.env.EMAIL_USER,
+              subject: `Fiskalizirani racun za narudzbu br. ${invoiceNumber}`,
+              html: `
+                <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #D4AF37; text-align: center;">
+                  <h2>Hvala na kupnji!</h2>
+                  <p>Vasa uplata je uspjesno obradjena.</p>
+                  <p>Sluzbeni fiskalizirani racun nalazi se u <strong>privitku ovog e-maila</strong>, a mozete ga preuzeti i klikom na gumb ispod:</p>
+                  <a href="${workingOrder.invoice_url}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block; margin: 20px 0;">PREUZMI PDF RACUN</a>
+                </div>
+              `,
+              attachments: [
+                {
+                  filename: `Racun_Kisfaluba_${invoiceNumber.replace(/\//g, '_')}.pdf`,
+                  path: workingOrder.invoice_url
+                }
+              ]
+            });
+            workingOrder = await markStripeOrderStepComplete(workingOrder.id, 'stripe_customer_emailed_at');
+          } catch (customerMailErr) {
+            console.error('Stripe webhook: racun je spremljen, ali slanje maila kupcu nije uspjelo.', {
+              orderId: workingOrder.id,
+              sessionId,
+              error: customerMailErr?.message || customerMailErr
+            });
+          }
         } else {
           console.warn('Stripe webhook: order nema email kupca, mail s racunom nije poslan.', { orderId: workingOrder.id, sessionId });
-        }
-
-        workingOrder = await markStripeOrderStepComplete(workingOrder.id, 'stripe_customer_emailed_at');
-
-        if (!workingOrder?.stripe_customer_emailed_at) {
-          console.error('Stripe webhook: marker maila kupcu nije spremljen.', { orderId: workingOrder.id, sessionId });
-          throw new Error('Stripe webhook nije potvrdio slanje maila kupcu.');
+          workingOrder = await markStripeOrderStepComplete(workingOrder.id, 'stripe_customer_emailed_at');
         }
       }
 
@@ -1859,6 +1867,7 @@ app.get('/brisanje-baze', async (req, res) => {
     res.status(500).send('Greška pri brisanju: ' + err.message); 
   }
 });
+
 
 
 

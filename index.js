@@ -162,13 +162,168 @@ const calcTotals = (items) => {
   return Number(sum.toFixed(2));
 };
 
+const STRIPE_SHIPPING_METHODS = {
+  PICKUP: { price: 0 },
+  POSTA: { price: 4.5 },
+  GLS: { price: 5.5 },
+  DPD: { price: 6.0 },
+  WORLD: { price: 15.0 },
+};
+
+const FREE_SHIPPING_THRESHOLD = 500;
+
+const CHECKOUT_EU_COUNTRIES = [
+  'austria', 'belgium', 'bulgaria', 'croatia', 'cyprus', 'czech republic',
+  'denmark', 'estonia', 'finland', 'france', 'germany', 'greece', 'hungary',
+  'ireland', 'italy', 'latvia', 'lithuania', 'luxembourg', 'malta',
+  'netherlands', 'poland', 'portugal', 'romania', 'slovakia', 'slovenia',
+  'spain', 'sweden', 'hrvatska', 'slovenija', 'njemacka', 'austrija',
+  'italija', 'francuska', 'spanjolska', 'madarska'
+];
+
+const roundCurrency = (value) => Number(toNumberSafe(value).toFixed(2));
+
+const normalizeTextForMatch = (value) =>
+  String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+
+const isEuCountryForCheckout = (countryName) => {
+  const normalized = normalizeTextForMatch(countryName);
+  if (!normalized) return true;
+  return CHECKOUT_EU_COUNTRIES.some((country) => normalized.includes(country) || country === normalized);
+};
+
+const resolveStripeShippingMethod = (shippingMethodId, countryName) => {
+  let resolved = String(shippingMethodId || 'POSTA').toUpperCase();
+  if (!STRIPE_SHIPPING_METHODS[resolved]) resolved = 'POSTA';
+
+  if (!isEuCountryForCheckout(countryName) && resolved !== 'PICKUP') {
+    return 'WORLD';
+  }
+
+  if (isEuCountryForCheckout(countryName) && resolved === 'WORLD') {
+    return 'POSTA';
+  }
+
+  return resolved;
+};
+
+const appendQueryParams = (rawUrl, params) => {
+  try {
+    const url = new URL(rawUrl);
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        url.searchParams.set(key, String(value));
+      }
+    });
+    return url.toString();
+  } catch (err) {
+    const searchParams = new URLSearchParams();
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        searchParams.set(key, String(value));
+      }
+    });
+    const separator = String(rawUrl).includes('?') ? '&' : '?';
+    return `${rawUrl}${separator}${searchParams.toString()}`;
+  }
+};
+
+const buildStripeOrderPricing = async ({ items, customer, shippingMethodId, couponCode }) => {
+  const normalizedItems = parseJsonSafe(items, []);
+  if (!Array.isArray(normalizedItems) || normalizedItems.length === 0) {
+    throw new Error('Kosarica je prazna.');
+  }
+
+  const itemIds = normalizedItems.map((item) => String(item.id || '').trim()).filter(Boolean);
+  if (itemIds.length !== normalizedItems.length) {
+    throw new Error('Kosarica sadrzi neispravan artikl.');
+  }
+
+  const dbProductsResult = await pool.query('SELECT id, price FROM products WHERE id = ANY($1)', [itemIds]);
+  const dbPrices = {};
+  dbProductsResult.rows.forEach((row) => {
+    dbPrices[String(row.id)] = toNumberSafe(row.price);
+  });
+
+  const isExport = !isEuCountryForCheckout(customer?.country || '');
+  let subtotal = 0;
+  const validatedItems = normalizedItems.map((item) => {
+    const itemId = String(item.id || '').trim();
+    if (!Object.prototype.hasOwnProperty.call(dbPrices, itemId)) {
+      throw new Error(`Artikl ${itemId} nije pronadjen.`);
+    }
+
+    const qty = Math.max(1, Math.trunc(toNumberSafe(item.qty || item.quantity || 1)));
+    const basePrice = roundCurrency(dbPrices[itemId]);
+    const finalPrice = isExport ? roundCurrency(basePrice / 1.25) : basePrice;
+    subtotal = roundCurrency(subtotal + (finalPrice * qty));
+
+    return { ...item, id: itemId, price: finalPrice, qty };
+  });
+
+  const resolvedShippingMethodId = resolveStripeShippingMethod(shippingMethodId, customer?.country || '');
+  const shippingPrice = subtotal >= FREE_SHIPPING_THRESHOLD ? 0 : STRIPE_SHIPPING_METHODS[resolvedShippingMethodId].price;
+
+  let resolvedDiscount = { amount: 0 };
+  const normalizedCouponCode = String(couponCode || '').trim().toUpperCase();
+  if (normalizedCouponCode) {
+    const settingsResult = await pool.query('SELECT coupons FROM shop_settings LIMIT 1');
+    const availableCoupons = parseJsonSafe(settingsResult.rows[0]?.coupons, []);
+    const coupon = Array.isArray(availableCoupons)
+      ? availableCoupons.find((item) => String(item.code || '').trim().toUpperCase() === normalizedCouponCode)
+      : null;
+
+    if (!coupon) {
+      throw new Error('Kupon nije vazeci.');
+    }
+
+    let discountAmount = 0;
+    if (coupon.type === 'PERCENT') discountAmount = subtotal * (toNumberSafe(coupon.value) / 100);
+    if (coupon.type === 'FIX') discountAmount = toNumberSafe(coupon.value);
+    resolvedDiscount = {
+      code: normalizedCouponCode,
+      amount: roundCurrency(Math.min(discountAmount, subtotal)),
+    };
+  }
+
+  const totalAmount = roundCurrency(Math.max(0, subtotal - toNumberSafe(resolvedDiscount.amount) + shippingPrice));
+
+  return {
+    validatedItems,
+    subtotal,
+    shippingPrice: roundCurrency(shippingPrice),
+    discount: resolvedDiscount,
+    totalAmount,
+  };
+};
+
+const buildInvoiceItemsForOrder = (orderData) => {
+  const items = parseJsonSafe(orderData.items, []);
+  const discountObj = parseJsonSafe(orderData.discount, { amount: 0 });
+  const subtotal = roundCurrency(items.reduce((acc, item) => {
+    return acc + (toNumberSafe(item.price) * toNumberSafe(item.qty || item.quantity || 1));
+  }, 0));
+  const shippingAmount = roundCurrency(Math.max(0, toNumberSafe(orderData.total) - subtotal + toNumberSafe(discountObj.amount)));
+
+  if (shippingAmount <= 0) return items;
+
+  return [
+    ...items,
+    { name: 'Dostava', price: shippingAmount, qty: 1, discountable: false }
+  ];
+};
+
 // --- SOLO.HR FISKALIZACIJA ---
 const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
   try {
     const token = process.env.SOLO_API_TOKEN;
     if (!token) return null;
 
-    const items = parseJsonSafe(orderData.items, []);
+    const items = buildInvoiceItemsForOrder(orderData);
     
     const params = new URLSearchParams();
     params.append('token', token);
@@ -188,7 +343,8 @@ const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
     let popustPostotak = '0';
 
     if (popustObj && popustObj.amount > 0) {
-      let ukupnoArtikli = items.reduce((acc, item) => acc + (Number(item.price || 0) * Number(item.qty || 1)), 0);
+      const discountableItems = items.filter((item) => item.discountable !== false);
+      let ukupnoArtikli = discountableItems.reduce((acc, item) => acc + (Number(item.price || 0) * Number(item.qty || 1)), 0);
       if (ukupnoArtikli > 0) {
         let izracunatiPostotak = (Number(popustObj.amount) / ukupnoArtikli) * 100;
         popustPostotak = izracunatiPostotak.toFixed(2); 
@@ -213,8 +369,8 @@ const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
       params.append(`kolicina_${i}`, String(kolicina));
       params.append(`cijena_${i}`, String(cijena));
       params.append(`porez_stopa_${i}`, '0');
-      params.append(`popust_${i}`, popustPostotak); 
-    });
+      params.append(`popust_${i}`, item.discountable === false ? '0' : popustPostotak); 
+});
     
     const res = await axios.post('https://api.solo.com.hr/racun', params.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
@@ -680,18 +836,18 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error('Webhook greÅ¡ka potpisivanja:', err.message);
+    console.error('Webhook greska potpisivanja:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
-  
+
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const orderId = session.client_reference_id || session.metadata?.orderId || null;
     const sessionId = session.id || null;
 
     if (!orderId && !sessionId) {
-      console.error('Stripe webhook: nedostaje referenca na narudžbu.', { sessionId });
-      return res.status(500).json({ error: 'Stripe webhook nema referencu na narudžbu.' });
+      console.error('Stripe webhook: nedostaje referenca na narudzbu.', { sessionId });
+      return res.status(500).json({ error: 'Stripe webhook nema referencu na narudzbu.' });
     }
 
     try {
@@ -711,8 +867,8 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
 
       const existingOrder = existingOrderResult.rows[0];
       if (!existingOrder) {
-        console.error('Stripe webhook: narudžba nije pronaðena.', { orderId, sessionId });
-        return res.status(500).json({ error: 'Stripe webhook nije pronašao narudžbu.' });
+        console.error('Stripe webhook: narudzba nije pronadjena.', { orderId, sessionId });
+        return res.status(500).json({ error: 'Stripe webhook nije pronasao narudzbu.' });
       }
 
       if (existingOrder.invoice_url) {
@@ -723,81 +879,87 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         const finalizedOrder = finalizeResult.rows[0];
 
         if (!finalizedOrder || finalizedOrder.status !== 'PAID' || !finalizedOrder.invoice_url) {
-          console.error('Stripe webhook: postojeæi invoice_url nije potvrðen uz status PAID.', { orderId: existingOrder.id, sessionId });
-          return res.status(500).json({ error: 'Postojeæi invoice_url nije potvrðen uz status PAID.' });
-        }
-      } else {
-        const orderForInvoice = {
-          ...existingOrder,
-          status: 'PAID',
-          stripe_session_id: sessionId || existingOrder.stripe_session_id || null,
-          paid_at: existingOrder.paid_at || new Date().toISOString(),
-        };
-
-        const soloRacun = await createSoloInvoice(orderForInvoice, true);
-        if (!soloRacun || !soloRacun.pdf) {
-          console.error('Stripe webhook: Solo raèun nije uspješno generiran.', { orderId: existingOrder.id, sessionId, soloRacun });
-          return res.status(500).json({ error: 'Solo raèun nije uspješno generiran.' });
+          console.error('Stripe webhook: postojeci invoice_url nije potvrdjen uz status PAID.', { orderId: existingOrder.id, sessionId });
+          return res.status(500).json({ error: 'Postojeci invoice_url nije potvrdjen uz status PAID.' });
         }
 
-        const finalizeResult = await pool.query(
-          "UPDATE orders SET status = 'PAID', stripe_session_id = COALESCE($2, stripe_session_id), paid_at = COALESCE(paid_at, NOW()), invoice_url = $3 WHERE id = $1 RETURNING *",
-          [existingOrder.id, sessionId, soloRacun.pdf]
-        );
-        const finalizedOrder = finalizeResult.rows[0];
+        return res.json({ received: true });
+      }
 
-        if (!finalizedOrder || finalizedOrder.status !== 'PAID' || !finalizedOrder.invoice_url) {
-          console.error('Stripe webhook: status PAID ili invoice_url nisu uspješno spremljeni.', { orderId: existingOrder.id, sessionId });
-          return res.status(500).json({ error: 'Status PAID ili invoice_url nisu uspješno spremljeni.' });
-        }
+      const orderForInvoice = {
+        ...existingOrder,
+        status: 'PAID',
+        stripe_session_id: sessionId || existingOrder.stripe_session_id || null,
+        paid_at: existingOrder.paid_at || new Date().toISOString(),
+      };
 
-        const verifyResult = await pool.query(
-          'SELECT * FROM orders WHERE id = $1 LIMIT 1',
-          [existingOrder.id]
-        );
-        const verifiedOrder = verifyResult.rows[0];
+      const soloRacun = await createSoloInvoice(orderForInvoice, true);
+      if (!soloRacun || !soloRacun.pdf) {
+        console.error('Stripe webhook: Solo racun nije uspjesno generiran.', { orderId: existingOrder.id, sessionId, soloRacun });
+        return res.status(500).json({ error: 'Solo racun nije uspjesno generiran.' });
+      }
 
-        if (!verifiedOrder || verifiedOrder.status !== 'PAID' || !verifiedOrder.invoice_url) {
-          console.error('Stripe webhook: završna provjera nije potvrdila PAID i invoice_url.', { orderId: existingOrder.id, sessionId });
-          return res.status(500).json({ error: 'Završna provjera nije potvrdila PAID i invoice_url.' });
-        }
+      const finalizeResult = await pool.query(
+        "UPDATE orders SET status = 'PAID', stripe_session_id = COALESCE($2, stripe_session_id), paid_at = COALESCE(paid_at, NOW()), invoice_url = $3 WHERE id = $1 RETURNING *",
+        [existingOrder.id, sessionId, soloRacun.pdf]
+      );
+      const finalizedOrder = finalizeResult.rows[0];
 
-        sendPackingSlipsToSuppliers(verifiedOrder, parseJsonSafe(verifiedOrder.items, [])).catch((e) => console.error('X Greška dobavljaèi Stripe:', e));
-        req.app.get('io').emit('nova_narudzba', { id: existingOrder.id, name: verifiedOrder.name });
+      if (!finalizedOrder || finalizedOrder.status !== 'PAID' || !finalizedOrder.invoice_url) {
+        console.error('Stripe webhook: status PAID ili invoice_url nisu uspjesno spremljeni.', { orderId: existingOrder.id, sessionId });
+        return res.status(500).json({ error: 'Status PAID ili invoice_url nisu uspjesno spremljeni.' });
+      }
 
-        if (verifiedOrder.email) {
-          try {
-            const invoiceNumber = soloRacun.broj_racuna || invoiceNumberFromOrderId(existingOrder.id);
-            await transporter.sendMail({
-              from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
-              to: verifiedOrder.email,
-              bcc: process.env.EMAIL_USER,
-              subject: `Fiskalizirani raèun za narudžbu br. ${invoiceNumber}`,
-              html: `
-                <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #D4AF37; text-align: center;">
-                  <h2>Hvala na kupnji!</h2>
-                  <p>Vaša uplata je uspješno obraðena.</p>
-                  <p>Službeni fiskalizirani raèun nalazi se u <strong>privitku ovog e-maila</strong>, a možete ga preuzeti i klikom na gumb ispod:</p>
-                  <a href="${verifiedOrder.invoice_url}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block; margin: 20px 0;">PREUZMI PDF RAÈUN</a>
-                </div>
-              `,
-              attachments: [
-                {
-                  filename: `Racun_Kisfaluba_${invoiceNumber.replace(/\//g, '_')}.pdf`,
-                  path: verifiedOrder.invoice_url
-                }
-              ]
-            });
-          } catch (mailErr) {
-            console.error('Stripe webhook: raèun je spremljen, ali slanje maila nije uspjelo.', mailErr);
-          }
+      const verifyResult = await pool.query(
+        'SELECT * FROM orders WHERE id = $1 LIMIT 1',
+        [existingOrder.id]
+      );
+      const verifiedOrder = verifyResult.rows[0];
+
+      if (!verifiedOrder || verifiedOrder.status !== 'PAID' || !verifiedOrder.invoice_url) {
+        console.error('Stripe webhook: zavrsna provjera nije potvrdila PAID i invoice_url.', { orderId: existingOrder.id, sessionId });
+        return res.status(500).json({ error: 'Zavrsna provjera nije potvrdila PAID i invoice_url.' });
+      }
+
+      await deductStock(parseJsonSafe(verifiedOrder.items, []));
+      sendPackingSlipsToSuppliers(verifiedOrder, parseJsonSafe(verifiedOrder.items, [])).catch((e) => console.error('X Greska dobavljaci Stripe:', e));
+      req.app.get('io').emit('nova_narudzba', { id: existingOrder.id, name: verifiedOrder.name });
+
+      if (verifiedOrder.email) {
+        try {
+          const invoiceNumber = soloRacun.broj_racuna || invoiceNumberFromOrderId(existingOrder.id);
+          await transporter.sendMail({
+            from: `"KISFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
+            to: verifiedOrder.email,
+            bcc: process.env.EMAIL_USER,
+            subject: `Fiskalizirani racun za narudzbu br. ${invoiceNumber}`,
+            html: `
+              <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #D4AF37; text-align: center;">
+                <h2>Hvala na kupnji!</h2>
+                <p>Vasa uplata je uspjesno obradjena.</p>
+                <p>Sluzbeni fiskalizirani racun nalazi se u <strong>privitku ovog e-maila</strong>, a mozete ga preuzeti i klikom na gumb ispod:</p>
+                <a href="${verifiedOrder.invoice_url}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block; margin: 20px 0;">PREUZMI PDF RACUN</a>
+              </div>
+            `,
+            attachments: [
+              {
+                filename: `Racun_Kisfaluba_${invoiceNumber.replace(/\//g, '_')}.pdf`,
+                path: verifiedOrder.invoice_url
+              }
+            ]
+          });
+        } catch (mailErr) {
+          console.error('Stripe webhook: racun je spremljen, ali slanje maila nije uspjelo.', mailErr);
         }
       }
+
+      return res.json({ received: true });
     } catch (dbErr) {
       console.error('Stripe webhook finalizacija nije uspjela:', dbErr);
       return res.status(500).json({ error: 'Stripe webhook finalizacija nije uspjela.' });
     }
   }
+
   res.json({ received: true });
 });
 
@@ -838,48 +1000,46 @@ const authGuard = (req, res, next) => {
 // --- STRIPE CHECKOUT ---
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    const { items, customer, isApp, discount, shippingPrice } = req.body; 
-    const normalizedItems = parseJsonSafe(items, []);
+    const { items, customer = {}, isApp, discount, shippingMethodId } = req.body;
+    const couponCode = discount && discount.code ? discount.code : null;
 
-    if (normalizedItems.length === 0) {
-      return res.status(400).json({ error: 'KoÅ¡arica je prazna.' });
-    }
-
-    const itemIds = normalizedItems.map(item => String(item.id));
-    const dbProductsResult = await pool.query('SELECT id, price FROM products WHERE id = ANY($1)', [itemIds]);
-    
-    const dbPrices = {};
-    dbProductsResult.rows.forEach(row => {
-      dbPrices[row.id] = Number(row.price);
+    const {
+      validatedItems,
+      discount: resolvedDiscount,
+      totalAmount,
+    } = await buildStripeOrderPricing({
+      items,
+      customer,
+      shippingMethodId,
+      couponCode,
     });
-
-    let safeSubtotal = 0;
-    const validatedItems = normalizedItems.map(item => {
-      const realPrice = dbPrices[item.id] || 0;
-      const qty = toNumberSafe(item.qty || item.quantity || 1);
-      safeSubtotal += realPrice * qty;
-      return { ...item, price: realPrice, qty };
-    });
-
-    const safeShipping = toNumberSafe(shippingPrice || 0); 
-    const safeDiscount = discount && discount.amount ? toNumberSafe(discount.amount) : 0;
-
-    let totalAmount = safeSubtotal + safeShipping - safeDiscount;
-    if (totalAmount < 0) totalAmount = 0;
 
     const totalInCents = Math.round(totalAmount * 100);
+    const address = customer.address || `${customer.street || ''}, ${customer.postalCode || ''} ${customer.city || ''}, ${customer.country || ''}`;
+    const name = `${customer.firstName || ''} ${customer.lastName || ''}`.trim() || 'Nepoznat kupac';
 
-    const address = customer.address || `${customer.street}, ${customer.postalCode} ${customer.city}, ${customer.country}`; 
-    const name = `${customer.firstName} ${customer.lastName}`;
-    
     const newOrder = await pool.query(
       'INSERT INTO orders (name, address, phone, email, total, items, status, discount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
-      [name, address, customer.phone || '', customer.email || '', totalAmount, JSON.stringify(validatedItems), 'NEW', JSON.stringify(discount || { amount: 0 })]
+      [
+        name,
+        address,
+        customer.phone || '',
+        customer.email || '',
+        totalAmount,
+        JSON.stringify(validatedItems),
+        'NEW',
+        JSON.stringify(resolvedDiscount),
+      ]
     );
     const orderId = newOrder.rows[0].id;
-    const successUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-success?app=true` : `${req.protocol}://${req.get('host')}/payment-success`;
-    const cancelUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-cancel?app=true` : `${req.protocol}://${req.get('host')}/payment-cancel`;
-    
+
+    const fallbackSuccessUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-success?app=true` : `${req.protocol}://${req.get('host')}/payment-success`;
+    const fallbackCancelUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-cancel?app=true` : `${req.protocol}://${req.get('host')}/payment-cancel`;
+    const baseSuccessUrl = req.body.returnUrl ? req.body.returnUrl : fallbackSuccessUrl;
+    const baseCancelUrl = req.body.returnUrl ? req.body.returnUrl.replace('payment-success', 'payment-cancel') : fallbackCancelUrl;
+    const successUrl = appendQueryParams(baseSuccessUrl, { orderId: String(orderId) });
+    const cancelUrl = appendQueryParams(baseCancelUrl, { orderId: String(orderId) });
+
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       client_reference_id: String(orderId),
@@ -890,26 +1050,25 @@ app.post('/create-checkout-session', async (req, res) => {
       line_items: [{
         price_data: {
           currency: 'eur',
-          product_data: { name: 'KiÅ¡faluba narudÅ¾ba', description: `Kupac: ${name}` },
+          product_data: { name: 'Kisfaluba narudzba', description: `Kupac: ${name}` },
           unit_amount: totalInCents,
         },
         quantity: 1
       }],
       mode: 'payment',
-      success_url: req.body.returnUrl ? req.body.returnUrl : successUrl,
-      cancel_url: req.body.returnUrl ? req.body.returnUrl.replace('payment-success', 'payment-cancel') : cancelUrl,
+      success_url: successUrl,
+      cancel_url: cancelUrl,
     });
 
     await pool.query(
       'UPDATE orders SET stripe_session_id = $1 WHERE id = $2',
       [session.id, orderId]
     );
-    await deductStock(validatedItems);
-    
+
     res.json({ url: session.url, orderId: String(orderId) });
   } catch (err) {
-    console.error('Stripe greÅ¡ka:', err.message);
-    res.status(500).json({ error: 'GreÅ¡ka pri povezivanju sa Stripeom.' });
+    console.error('Stripe greska:', err.message);
+    res.status(500).json({ error: err.message || 'Greska pri povezivanju sa Stripeom.' });
   }
 });
 
@@ -1159,7 +1318,7 @@ app.get('/orders/:id/payment-status', async (req, res) => {
       status: order.status,
       invoiceUrl: order.invoice_url,
       paidAt: order.paid_at,
-      isPaid: order.status === 'PAID'
+      isPaid: order.status === 'PAID' && !!order.invoice_url
     });
   } catch (err) {
     res.status(500).json({ error: 'Greška servera' });

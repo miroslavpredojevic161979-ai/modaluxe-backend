@@ -402,7 +402,7 @@ const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
 const storage = new CloudinaryStorage({
   cloudinary: cloudinary,
   params: {
-    folder: 'modaluxe_slike',
+    folder: 'ana21_slike',
     resource_type: 'auto'
   }
 });
@@ -429,7 +429,7 @@ const uploadBufferToCloudinary = (buffer, filename, resourceType = 'auto') => {
   return new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
       { 
-        folder: 'kisfaluba_ura', 
+        folder: 'ana21_ura', 
         public_id: filename, 
         resource_type: resourceType
       },
@@ -493,19 +493,19 @@ const sendPackingSlipsToSuppliers = async (order, items, options = {}) => {
       }).join('');
 
       const mailOptions = {
-        from: `"Kisfaluba Moda" <${process.env.EMAIL_USER}>`,
+        from: `"Ana 21" <${process.env.EMAIL_USER}>`,
         to: supplierEmail,
         subject: 'NOVI RADNI NALOG - Narudzba #' + order.id,
         html: `
           <div style="font-family: Arial, sans-serif; color: #111; max-width: 600px; margin: auto; border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden;">
             <div style="background-color: #000; color: #D4AF37; padding: 20px; text-align: center;">
-              <h2 style="margin: 0; letter-spacing: 2px;">KISFALUBA - RADNI NALOG</h2>
+              <h2 style="margin: 0; letter-spacing: 2px;">ANA 21 - RADNI NALOG</h2>
               <p style="margin: 5px 0 0 0; font-size: 12px; color: #fff;">Sluzbeni nalog za pakiranje i slanje robe</p>
             </div>
 
             <div style="padding: 20px;">
               <p>Postovani,</p>
-              <p>Zaprimili smo novu narudzbu. Molimo vas da zapakirate sljedece proizvode u Kisfaluba ambalazu i posaljete kupcu na ovu adresu:</p>
+              <p>Zaprimili smo novu narudzbu. Molimo vas da zapakirate sljedece proizvode u Ana 21 ambalazu i posaljete kupcu na ovu adresu:</p>
 
               <div style="background-color: #f7fafc; padding: 15px; border-left: 4px solid #D4AF37; margin: 20px 0;">
                 <h3 style="margin-top: 0; color: #2b6cb0;">PODACI KUPCA ZA DOSTAVU:</h3>
@@ -525,7 +525,7 @@ const sendPackingSlipsToSuppliers = async (order, items, options = {}) => {
             </div>
 
             <div style="background-color: #f1f1f1; padding: 15px; text-align: center; font-size: 11px; color: #666;">
-              Automatski generirano iz Kisfaluba sustava. Narudzba ID: ${order.id}
+              Automatski generirano iz Ana 21 sustava. Narudzba ID: ${order.id}
             </div>
           </div>
         `
@@ -728,7 +728,7 @@ const generateUraStornoPDF = (inv, filePath) => {
     const originalInvoiceNumber = inv.invoice_number || 'N/A';
     const stornoInvoiceNumber = originalInvoiceNumber.toUpperCase().includes('STORNO') ? originalInvoiceNumber : `STORNO-${originalInvoiceNumber}`;
 
-    doc.fontSize(16).font('Helvetica-Bold').fillColor('#000000').text('KISFALUBA', { align: 'center' });
+    doc.fontSize(16).font('Helvetica-Bold').fillColor('#000000').text('ANA 21', { align: 'center' });
     doc.moveDown(2);
     doc.fontSize(10).font('Helvetica');
     doc.text(fixText(`Postovani/a ${supplierName},`));
@@ -778,7 +778,7 @@ const generateUraStornoPDF = (inv, filePath) => {
     doc.moveDown(1.5);
 
     let currentY = doc.y;
-    doc.font('Helvetica-Bold').fontSize(9).text('KISFALUBA j.d.o.o.', 40, currentY);
+    doc.font('Helvetica-Bold').fontSize(9).text('ANA 21', 40, currentY);
     doc.font('Helvetica').text('Zagorska ulica 40, 31300 Branjina, Republika Hrvatska');
     doc.text('OIB: 82125639708 | MBS: 5990572');
     doc.text('Trgovacki sud u Osijeku');
@@ -983,7 +983,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         }
 
         await transporter.sendMail({
-          from: `"KISFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
+          from: `"ANA 21" <${process.env.EMAIL_USER}>`,
           to: workingOrder.email,
           bcc: process.env.EMAIL_USER,
           subject: `Fiskalizirani racun za narudzbu br. ${invoiceNumber}`,
@@ -997,7 +997,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           `,
           attachments: [
             {
-              filename: `Racun_Kisfaluba_${invoiceNumber.replace(/\//g, '_')}.pdf`,
+              filename: `Racun_Ana21_${invoiceNumber.replace(/\//g, '_')}.pdf`,
               path: workingOrder.invoice_url
             }
           ]
@@ -1105,7 +1105,7 @@ app.post('/create-checkout-session', async (req, res) => {
       line_items: [{
         price_data: {
           currency: 'eur',
-          product_data: { name: 'KiĹˇfaluba narudĹľba', description: `Kupac: ${name}` },
+          product_data: { name: 'Ana 21 narudzba', description: `Kupac: ${name}` },
           unit_amount: totalInCents,
         },
         quantity: 1
@@ -1167,7 +1167,7 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
       const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
       const filePath = path.join(__dirname, 'uploads', fileName);
       await generateUraStornoPDF(invData, filePath); 
-      const uploadResult = await cloudinary.uploader.upload(filePath, { folder: 'kisfaluba_ura', resource_type: 'image' });
+  const uploadResult = await cloudinary.uploader.upload(filePath, { folder: 'ana21_ura', resource_type: 'image' });
       await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [uploadResult.secure_url, id]);
       invData.storno_url = uploadResult.secure_url;
     }
@@ -1423,7 +1423,7 @@ if (email && invoiceUrl) {
         `,
         attachments: [
           {
-            filename: `Racun_Kisfaluba_${invoiceNumber.replace(/\//g, '_')}.pdf`,
+        filename: `Racun_Ana21_${invoiceNumber.replace(/\//g, '_')}.pdf`,
             path: invoiceUrl
           }
         ]
@@ -1521,7 +1521,7 @@ app.post('/orders/:id/send-storno', async (req, res) => {
 
     const emailHtml = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; color: #333; line-height: 1.5; border: 1px solid #eee; border-radius: 5px;">
-        <h2 style="text-align: center; color: #e53e3e; margin-bottom: 20px;">STORNO RAÄŚUN - KISFALUBA</h2>
+        <h2 style="text-align: center; color: #e53e3e; margin-bottom: 20px;">STORNO RAÄŚUN - ANA 21</h2>
         <p>PoĹˇtovani/a <b>${escapeHtml(orderData.name)}</b>,</p>
         <p>ObavjeĹˇtavamo Vas da smo uspjeĹˇno obradili VaĹˇ povrat robe/sredstava.</p>
         <p>U nastavku se nalazi poveznica na VaĹˇ sluĹľbeni Storno raÄŤun.</p>
@@ -1536,11 +1536,11 @@ await transporter.sendMail({
       from: `"KIĹ FALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
       to: orderData.email,
       bcc: process.env.EMAIL_USER, // <-- TEBI STIĹ˝E SKRIVENA KOPIJA STORNA!
-      subject: `Storno raÄŤun i obavijest o povratu - KISFALUBA`,
+      subject: `Storno raÄŤun i obavijest o povratu - ANA 21`,
       html: emailHtml,
       attachments: [
         {
-          filename: `Storno_Racun_Kisfaluba_${orderId}.pdf`,
+        filename: `Storno_Racun_Ana21_${orderId}.pdf`,
           path: pdfLinkZaKupca
         }
       ]
@@ -1680,15 +1680,15 @@ app.get('/racun/:filename', (req, res) => {
 
 app.get('/payment-success', (req, res) => {
   const isApp = req.query.app === 'true';
-  res.send(`<!DOCTYPE html><html lang="hr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>UspjeĹˇna kupnja KISFALUBA</title><style>body { margin: 0; padding: 0; background-color: #050505; background-image: url('https://images.unsplash.com/photo-1490481651871-ab68de25d43d?q=80&w=2070&auto=format&fit=crop'); background-size: cover; background-position: center; background-attachment: fixed; height: 100vh; display: flex; justify-content: center; align-items: center; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; text-align: center; }.overlay {position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.80); z-index: 1;} .content { position: relative; z-index: 2; background: rgba(15, 15, 15, 0.65); padding: 50px 40px; border-radius: 12px; border: 1px solid #D4AF37; box-shadow: 0 15px 40px rgba(0,0,0,0.8); max-width: 480px; width: 85%; backdrop-filter: blur(8px); } h1 { color: #D4AF37; font-size: 26px; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 2px 4px rgba(0,0,0,0.8); } p { color: #e0e0e0; font-size: 15px; line-height: 1.6; margin-bottom: 35px; } .gold-line { width: 60px; height: 2px; background: #D4AF37; margin: 0 auto 20px auto; border-radius: 2px; } .btn { display: inline-block; background: linear-gradient(135deg, #E5C058 0%, #B8860B 100%); color: #000; text-decoration: none; padding: 16px 35px; font-size: 15px; font-weight: bold; border-radius: 4px; text-transform: uppercase; border: none; cursor: pointer; transition: all 0.3s ease; box-shadow: 0 4px 15px rgba(212, 175, 55, 0.2); } .btn:hover { transform: translateY(-3px); box-shadow: 0 6px 20px rgba(212, 175, 55, 0.4); } .icon { font-size: 45px; margin-bottom: 10px; text-shadow: 0 0 15px rgba(212, 175, 55, 0.5); }</style></head><body><div class="overlay"></div><div class="content"><div class="icon"></div><h1>UspjeĹˇna kupnja</h1><div class="gold-line"></div><p>Zahvaljujemo Vam na povjerenju.<br>VaĹˇa transakcija je provedena struÄŤno i profesionalno.<br><br>Svi detalji narudĹľbe te elektroniÄŤki raÄŤun uspjeĹˇno su poslani na VaĹˇu e-mail adresu.</p><button class="btn" onclick="goBack()">POVRATAK U TRGOVINU</button></div><script>if (${isApp}) { setTimeout(function() { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); }, 3000); } function goBack() { if (${isApp}) { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); } else { window.location.href = "http://localhost:8081?clearCart=true"; } }</script></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="hr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>UspjeĹˇna kupnja ANA 21</title><style>body { margin: 0; padding: 0; background-color: #050505; background-image: url('https://images.unsplash.com/photo-1490481651871-ab68de25d43d?q=80&w=2070&auto=format&fit=crop'); background-size: cover; background-position: center; background-attachment: fixed; height: 100vh; display: flex; justify-content: center; align-items: center; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; text-align: center; }.overlay {position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.80); z-index: 1;} .content { position: relative; z-index: 2; background: rgba(15, 15, 15, 0.65); padding: 50px 40px; border-radius: 12px; border: 1px solid #D4AF37; box-shadow: 0 15px 40px rgba(0,0,0,0.8); max-width: 480px; width: 85%; backdrop-filter: blur(8px); } h1 { color: #D4AF37; font-size: 26px; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 2px 4px rgba(0,0,0,0.8); } p { color: #e0e0e0; font-size: 15px; line-height: 1.6; margin-bottom: 35px; } .gold-line { width: 60px; height: 2px; background: #D4AF37; margin: 0 auto 20px auto; border-radius: 2px; } .btn { display: inline-block; background: linear-gradient(135deg, #E5C058 0%, #B8860B 100%); color: #000; text-decoration: none; padding: 16px 35px; font-size: 15px; font-weight: bold; border-radius: 4px; text-transform: uppercase; border: none; cursor: pointer; transition: all 0.3s ease; box-shadow: 0 4px 15px rgba(212, 175, 55, 0.2); } .btn:hover { transform: translateY(-3px); box-shadow: 0 6px 20px rgba(212, 175, 55, 0.4); } .icon { font-size: 45px; margin-bottom: 10px; text-shadow: 0 0 15px rgba(212, 175, 55, 0.5); }</style></head><body><div class="overlay"></div><div class="content"><div class="icon"></div><h1>UspjeĹˇna kupnja</h1><div class="gold-line"></div><p>Zahvaljujemo Vam na povjerenju.<br>VaĹˇa transakcija je provedena struÄŤno i profesionalno.<br><br>Svi detalji narudĹľbe te elektroniÄŤki raÄŤun uspjeĹˇno su poslani na VaĹˇu e-mail adresu.</p><button class="btn" onclick="goBack()">POVRATAK U TRGOVINU</button></div><script>if (${isApp}) { setTimeout(function() { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); }, 3000); } function goBack() { if (${isApp}) { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); } else { window.location.href = "http://localhost:8081?clearCart=true"; } }</script></body></html>`);
 });
 
 app.get('/payment-cancel', (req, res) => {
   const isApp = req.query.app === 'true';
-  res.send(`<!DOCTYPE html><html lang="hr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Kupnja prekinuta KISFALUBA</title><style>body { margin: 0; background-color: #0a0a0a; height: 100vh; display: flex; justify-content: center; align-items: center; font-family: 'Helvetica Neue', sans-serif; text-align: center; color: #fff;} .content { background: #151515; padding: 40px; border-radius: 8px; border: 1px solid #333; max-width: 400px; width: 85%; } h1 { color: #aaa; font-size: 20px; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px;} p { color: #777; font-size: 15px; margin-bottom: 25px; line-height: 1.5;} .btn { background: #2a2a2a; color: #fff; padding: 14px 30px; border-radius: 4px; text-transform: uppercase; font-size: 13px; font-weight: bold; border: none; cursor: pointer; transition: 0.3s; } .btn:hover { background: #444; }</style></head><body><div class="content"><h1>Kupnja prekinuta</h1><p>Postupak plaÄ‡anja je otkazan. Bez brige, VaĹˇa koĹˇarica je ostala saÄŤuvana.</p><button class="btn" onclick="goBack()">NAZAD U TRGOVINU</button></div><script>function goBack() { if (${isApp}) { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); } else { window.location.href = "http://localhost:8081"; } }</script></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="hr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Kupnja prekinuta ANA 21</title><style>body { margin: 0; background-color: #0a0a0a; height: 100vh; display: flex; justify-content: center; align-items: center; font-family: 'Helvetica Neue', sans-serif; text-align: center; color: #fff;} .content { background: #151515; padding: 40px; border-radius: 8px; border: 1px solid #333; max-width: 400px; width: 85%; } h1 { color: #aaa; font-size: 20px; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px;} p { color: #777; font-size: 15px; margin-bottom: 25px; line-height: 1.5;} .btn { background: #2a2a2a; color: #fff; padding: 14px 30px; border-radius: 4px; text-transform: uppercase; font-size: 13px; font-weight: bold; border: none; cursor: pointer; transition: 0.3s; } .btn:hover { background: #444; }</style></head><body><div class="content"><h1>Kupnja prekinuta</h1><p>Postupak plaÄ‡anja je otkazan. Bez brige, VaĹˇa koĹˇarica je ostala saÄŤuvana.</p><button class="btn" onclick="goBack()">NAZAD U TRGOVINU</button></div><script>function goBack() { if (${isApp}) { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); } else { window.location.href = "http://localhost:8081"; } }</script></body></html>`);
 });
 
-app.get('/', (req, res) => res.send('KISFALUBA Backend Online!'));
+app.get('/', (req, res) => res.send('ANA 21 Backend Online!'));
 
 // --- RUTE ZA PRIGOVORE ---
 
@@ -1750,7 +1750,7 @@ pool.query('ALTER TABLE products ALTER COLUMN price TYPE NUMERIC(10,2)').catch(e
 pool.query('ALTER TABLE products ALTER COLUMN cost_price TYPE NUMERIC(10,2)').catch(e => console.log('Cost update:', e.message));
 
 server.listen(PORT, '0.0.0.0', () => { 
-  console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`); 
+  console.log(`ANA 21 SERVER RADI NA PORTU ${PORT}`); 
 });
 // PRIVREMENA METLA ZA BRISANJE SVEGA
 app.get('/brisanje-baze', async (req, res) => {

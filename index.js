@@ -21,7 +21,42 @@ const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
 const app = express();
-app.use(cors());
+
+const DEFAULT_ALLOWED_ORIGINS = [
+  process.env.STOREFRONT_URL,
+  process.env.ADMIN_URL,
+  'https://moda-luxe-trgovina.vercel.app',
+  'https://www.kisfaluba.hr',
+  'https://kisfaluba.hr',
+  'https://moda-luxe-admin.vercel.app',
+  'https://modaluxe-admin.vercel.app',
+  'http://localhost:8081',
+  'http://127.0.0.1:8081',
+  'http://localhost:19006',
+  'http://127.0.0.1:19006',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+].filter(Boolean);
+
+const allowedOrigins = Array.from(
+  new Set(
+    (process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : DEFAULT_ALLOWED_ORIGINS)
+      .map((origin) => String(origin).trim())
+      .filter(Boolean)
+  )
+);
+
+const isAllowedOrigin = (origin) => !origin || allowedOrigins.includes(origin);
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (isAllowedOrigin(origin)) return callback(null, true);
+    return callback(new Error('Origin nije dopušten.'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+};
+
+app.use(cors(corsOptions));
 
 // --- SOCKET.IO DODATAK ---
 const http = require('http');
@@ -29,10 +64,7 @@ const { Server } = require('socket.io');
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: "*", // Dozvoljava spajanje svih uređaja
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH"]
-  }
+  cors: corsOptions
 });
 
 app.set('io', io); // Spremamo io instancu da je možemo koristiti bilo gdje!
@@ -41,6 +73,11 @@ app.set('io', io); // Spremamo io instancu da je možemo koristiti bilo gdje!
 // --- KONFIGURACIJA ---
 const PORT = process.env.PORT || 10000;
 const INVOICE_SECRET = process.env.INVOICE_SECRET;
+const STOREFRONT_URL = process.env.STOREFRONT_URL || 'https://moda-luxe-trgovina.vercel.app';
+const PAYMENT_SUCCESS_WEB_URL = process.env.PAYMENT_SUCCESS_WEB_URL || `${STOREFRONT_URL}?clearCart=true`;
+const PAYMENT_CANCEL_WEB_URL = process.env.PAYMENT_CANCEL_WEB_URL || STOREFRONT_URL;
+const PAYMENT_SUCCESS_APP_URL = process.env.PAYMENT_SUCCESS_APP_URL || 'modaluxe://payment-success';
+const PAYMENT_CANCEL_APP_URL = process.env.PAYMENT_CANCEL_APP_URL || 'modaluxe://payment-cancel';
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -716,7 +753,12 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
           [existingOrder.id, sessionId]
         );
         const updatedOrder = updateResult.rows[0];
-        const shouldFinalizeOrder = existingOrder.status !== 'PAID' || !existingOrder.invoice_url;
+        const isFirstPaidTransition = existingOrder.status !== 'PAID';
+        const shouldFinalizeOrder = isFirstPaidTransition || !existingOrder.invoice_url;
+
+        if (updatedOrder && isFirstPaidTransition) {
+          await deductStock(parseJsonSafe(updatedOrder.items, []));
+        }
 
         if (updatedOrder && shouldFinalizeOrder) {
           const soloRacun = await createSoloInvoice(updatedOrder, true);
@@ -867,7 +909,6 @@ app.post('/create-checkout-session', async (req, res) => {
       'UPDATE orders SET stripe_session_id = $1 WHERE id = $2',
       [session.id, orderId]
     );
-    await deductStock(validatedItems);
     
     res.json({ url: session.url, orderId: String(orderId) });
   } catch (err) {
@@ -877,20 +918,20 @@ app.post('/create-checkout-session', async (req, res) => {
 });
 
 // --- RUTE ZA ULAZNE RAČUNE (URA) ---
-app.post('/inbound-invoices/fetch-email', async (req, res) => {
+app.post('/inbound-invoices/fetch-email', authGuard, async (req, res) => {
   console.log("Ručno pokrenuta provjera mailova...");
   await fetchInboundInvoicesFromEmail();
   res.json({ success: true, message: 'Provjera pošte završena.' });
 });
 
-app.get('/inbound-invoices', async (req, res) => {
+app.get('/inbound-invoices', authGuard, async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM inbound_invoices ORDER BY id DESC");
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: "Greška servera" }); }
 });
 
-app.patch('/inbound-invoices/:id/status', async (req, res) => {
+app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
   try {
     const { status } = req.body;
     const id = String(req.params.id).split('-')[0];
@@ -928,7 +969,7 @@ app.patch('/inbound-invoices/:id/status', async (req, res) => {
   }
 });
 
-app.post('/inbound-invoices/archive', async (req, res) => {
+app.post('/inbound-invoices/archive', authGuard, async (req, res) => {
   try {
     const { invoiceIds } = req.body;
     if (!invoiceIds || !Array.isArray(invoiceIds) || invoiceIds.length === 0) {
@@ -946,7 +987,7 @@ app.post('/inbound-invoices/archive', async (req, res) => {
   }
 });
 
-app.delete('/inbound-invoices/:id', async (req, res) => {
+app.delete('/inbound-invoices/:id', authGuard, async (req, res) => {
   try {
     const id = String(req.params.id).split('-')[0];
     await pool.query('DELETE FROM inbound_invoices WHERE id = $1', [id]);
@@ -954,7 +995,7 @@ app.delete('/inbound-invoices/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Greška pri brisanju' }); }
 });
 
-app.patch('/inbound-invoices/:id/file', async (req, res) => {
+app.patch('/inbound-invoices/:id/file', authGuard, async (req, res) => {
   try {
     const id = String(req.params.id).split('-')[0];
     const { fileUrl } = req.body;
@@ -1083,7 +1124,7 @@ app.post('/upload-invoice', authGuard, upload.single('invoice'), async (req, res
   }
 });
 // --- RUTE ZA NARUDŽBE ---
-app.get('/all-orders', async (req, res) => {
+app.get('/all-orders', authGuard, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM orders ORDER BY id DESC');
     res.json(result.rows.map(o => ({ 
@@ -1188,7 +1229,7 @@ if (email && invoiceUrl) {
   }
 });
 
-app.post('/orders/archive', async (req, res) => {
+app.post('/orders/archive', authGuard, async (req, res) => {
   try {
     const { orderIds } = req.body;
     if (!orderIds || !Array.isArray(orderIds) || orderIds.length === 0) return res.json({ success: true, message: 'Nema narudžbi.' });
@@ -1209,7 +1250,7 @@ app.delete('/orders/:id', authGuard, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Greška u bazi.' }); }
 });
 
-app.patch('/orders/:id/status', async (req, res) => {
+app.patch('/orders/:id/status', authGuard, async (req, res) => {
   try {
     const { status } = req.body;
     const orderId = String(req.params.id).split('-')[0];
@@ -1251,7 +1292,7 @@ if (status === 'REFUND') {
   }
 });
 
-app.post('/orders/:id/send-storno', async (req, res) => {
+app.post('/orders/:id/send-storno', authGuard, async (req, res) => {
   try {
     const orderId = String(req.params.id).split('-')[0];
     const result = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
@@ -1300,7 +1341,7 @@ await transporter.sendMail({
   }
 });
 
-app.patch('/orders/:id/invoice', async (req, res) => {
+app.patch('/orders/:id/invoice', authGuard, async (req, res) => {
   try {
     const id = String(req.params.id).split('-')[0];
     await pool.query('UPDATE orders SET invoice_url = $1 WHERE id = $2', [req.body.invoiceUrl, id]);
@@ -1343,14 +1384,14 @@ app.get('/settings', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Greška postavki' }); }
 });
 
-app.post('/settings/cod', async (req, res) => {
+app.post('/settings/cod', authGuard, async (req, res) => {
   try {
     const result = await pool.query('UPDATE shop_settings SET cod_enabled = $1 RETURNING *', [req.body.cod_enabled]);
     res.json({ message: 'Postavke ažurirane!', settings: result.rows[0] });
   } catch (err) { res.status(500).json({ error: 'Greška ažuriranja' }); }
 });
 
-app.post('/settings/hero', async (req, res) => {
+app.post('/settings/hero', authGuard, async (req, res) => {
   try {
     const heroSlides = normalizeHeroSlides(req.body?.slides);
     const heroImg = JSON.stringify(heroSlides);
@@ -1365,7 +1406,7 @@ app.post('/settings/hero', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Greška.' }); }
 });
 
-app.post('/settings/coupons', async (req, res) => {
+app.post('/settings/coupons', authGuard, async (req, res) => {
   try {
     const { coupons } = req.body;
     const check = await pool.query('SELECT * FROM shop_settings LIMIT 1');
@@ -1391,7 +1432,7 @@ app.get('/api/categories', async (req, res) => {
   }
 });
 
-app.post('/api/categories', async (req, res) => {
+app.post('/api/categories', authGuard, async (req, res) => {
   const { id, name } = req.body;
   try {
     await pool.query('INSERT INTO categories (id, name) VALUES ($1, $2)', [id, name]);
@@ -1402,7 +1443,7 @@ app.post('/api/categories', async (req, res) => {
   }
 });
 
-app.delete('/api/categories/:id', async (req, res) => {
+app.delete('/api/categories/:id', authGuard, async (req, res) => {
   const { id } = req.params;
   try {
     await pool.query('DELETE FROM categories WHERE id = $1', [id]);
@@ -1427,19 +1468,19 @@ app.get('/racun/:filename', (req, res) => {
 
 app.get('/payment-success', (req, res) => {
   const isApp = req.query.app === 'true';
-  res.send(`<!DOCTYPE html><html lang="hr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Uspješna kupnja KISFALUBA</title><style>body { margin: 0; padding: 0; background-color: #050505; background-image: url('https://images.unsplash.com/photo-1490481651871-ab68de25d43d?q=80&w=2070&auto=format&fit=crop'); background-size: cover; background-position: center; background-attachment: fixed; height: 100vh; display: flex; justify-content: center; align-items: center; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; text-align: center; }.overlay {position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.80); z-index: 1;} .content { position: relative; z-index: 2; background: rgba(15, 15, 15, 0.65); padding: 50px 40px; border-radius: 12px; border: 1px solid #D4AF37; box-shadow: 0 15px 40px rgba(0,0,0,0.8); max-width: 480px; width: 85%; backdrop-filter: blur(8px); } h1 { color: #D4AF37; font-size: 26px; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 2px 4px rgba(0,0,0,0.8); } p { color: #e0e0e0; font-size: 15px; line-height: 1.6; margin-bottom: 35px; } .gold-line { width: 60px; height: 2px; background: #D4AF37; margin: 0 auto 20px auto; border-radius: 2px; } .btn { display: inline-block; background: linear-gradient(135deg, #E5C058 0%, #B8860B 100%); color: #000; text-decoration: none; padding: 16px 35px; font-size: 15px; font-weight: bold; border-radius: 4px; text-transform: uppercase; border: none; cursor: pointer; transition: all 0.3s ease; box-shadow: 0 4px 15px rgba(212, 175, 55, 0.2); } .btn:hover { transform: translateY(-3px); box-shadow: 0 6px 20px rgba(212, 175, 55, 0.4); } .icon { font-size: 45px; margin-bottom: 10px; text-shadow: 0 0 15px rgba(212, 175, 55, 0.5); }</style></head><body><div class="overlay"></div><div class="content"><div class="icon"></div><h1>Uspješna kupnja</h1><div class="gold-line"></div><p>Zahvaljujemo Vam na povjerenju.<br>Vaša transakcija je provedena stručno i profesionalno.<br><br>Svi detalji narudžbe te elektronički račun uspješno su poslani na Vašu e-mail adresu.</p><button class="btn" onclick="goBack()">POVRATAK U TRGOVINU</button></div><script>if (${isApp}) { setTimeout(function() { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); }, 3000); } function goBack() { if (${isApp}) { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); } else { window.location.href = "http://localhost:8081?clearCart=true"; } }</script></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="hr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Uspješna kupnja KISFALUBA</title><style>body { margin: 0; padding: 0; background-color: #050505; background-image: url('https://images.unsplash.com/photo-1490481651871-ab68de25d43d?q=80&w=2070&auto=format&fit=crop'); background-size: cover; background-position: center; background-attachment: fixed; height: 100vh; display: flex; justify-content: center; align-items: center; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; text-align: center; }.overlay {position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.80); z-index: 1;} .content { position: relative; z-index: 2; background: rgba(15, 15, 15, 0.65); padding: 50px 40px; border-radius: 12px; border: 1px solid #D4AF37; box-shadow: 0 15px 40px rgba(0,0,0,0.8); max-width: 480px; width: 85%; backdrop-filter: blur(8px); } h1 { color: #D4AF37; font-size: 26px; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 2px 4px rgba(0,0,0,0.8); } p { color: #e0e0e0; font-size: 15px; line-height: 1.6; margin-bottom: 35px; } .gold-line { width: 60px; height: 2px; background: #D4AF37; margin: 0 auto 20px auto; border-radius: 2px; } .btn { display: inline-block; background: linear-gradient(135deg, #E5C058 0%, #B8860B 100%); color: #000; text-decoration: none; padding: 16px 35px; font-size: 15px; font-weight: bold; border-radius: 4px; text-transform: uppercase; border: none; cursor: pointer; transition: all 0.3s ease; box-shadow: 0 4px 15px rgba(212, 175, 55, 0.2); } .btn:hover { transform: translateY(-3px); box-shadow: 0 6px 20px rgba(212, 175, 55, 0.4); } .icon { font-size: 45px; margin-bottom: 10px; text-shadow: 0 0 15px rgba(212, 175, 55, 0.5); }</style></head><body><div class="overlay"></div><div class="content"><div class="icon"></div><h1>Uspješna kupnja</h1><div class="gold-line"></div><p>Zahvaljujemo Vam na povjerenju.<br>Vaša transakcija je provedena stručno i profesionalno.<br><br>Svi detalji narudžbe te elektronički račun uspješno su poslani na Vašu e-mail adresu.</p><button class="btn" onclick="goBack()">POVRATAK U TRGOVINU</button></div><script>if (${isApp}) { setTimeout(function() { window.location.replace(${JSON.stringify(PAYMENT_SUCCESS_APP_URL)}); setTimeout(function(){ window.close(); }, 300); }, 3000); } function goBack() { if (${isApp}) { window.location.replace(${JSON.stringify(PAYMENT_SUCCESS_APP_URL)}); setTimeout(function(){ window.close(); }, 300); } else { window.location.href = ${JSON.stringify(PAYMENT_SUCCESS_WEB_URL)}; } }</script></body></html>`);
 });
 
 app.get('/payment-cancel', (req, res) => {
   const isApp = req.query.app === 'true';
-  res.send(`<!DOCTYPE html><html lang="hr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Kupnja prekinuta KISFALUBA</title><style>body { margin: 0; background-color: #0a0a0a; height: 100vh; display: flex; justify-content: center; align-items: center; font-family: 'Helvetica Neue', sans-serif; text-align: center; color: #fff;} .content { background: #151515; padding: 40px; border-radius: 8px; border: 1px solid #333; max-width: 400px; width: 85%; } h1 { color: #aaa; font-size: 20px; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px;} p { color: #777; font-size: 15px; margin-bottom: 25px; line-height: 1.5;} .btn { background: #2a2a2a; color: #fff; padding: 14px 30px; border-radius: 4px; text-transform: uppercase; font-size: 13px; font-weight: bold; border: none; cursor: pointer; transition: 0.3s; } .btn:hover { background: #444; }</style></head><body><div class="content"><h1>Kupnja prekinuta</h1><p>Postupak plaćanja je otkazan. Bez brige, Vaša košarica je ostala sačuvana.</p><button class="btn" onclick="goBack()">NAZAD U TRGOVINU</button></div><script>function goBack() { if (${isApp}) { window.location.replace("exp://192.168.0.14:8081/--"); setTimeout(function(){ window.close(); }, 300); } else { window.location.href = "http://localhost:8081"; } }</script></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="hr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Kupnja prekinuta KISFALUBA</title><style>body { margin: 0; background-color: #0a0a0a; height: 100vh; display: flex; justify-content: center; align-items: center; font-family: 'Helvetica Neue', sans-serif; text-align: center; color: #fff;} .content { background: #151515; padding: 40px; border-radius: 8px; border: 1px solid #333; max-width: 400px; width: 85%; } h1 { color: #aaa; font-size: 20px; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px;} p { color: #777; font-size: 15px; margin-bottom: 25px; line-height: 1.5;} .btn { background: #2a2a2a; color: #fff; padding: 14px 30px; border-radius: 4px; text-transform: uppercase; font-size: 13px; font-weight: bold; border: none; cursor: pointer; transition: 0.3s; } .btn:hover { background: #444; }</style></head><body><div class="content"><h1>Kupnja prekinuta</h1><p>Postupak plaćanja je otkazan. Bez brige, Vaša košarica je ostala sačuvana.</p><button class="btn" onclick="goBack()">NAZAD U TRGOVINU</button></div><script>function goBack() { if (${isApp}) { window.location.replace(${JSON.stringify(PAYMENT_CANCEL_APP_URL)}); setTimeout(function(){ window.close(); }, 300); } else { window.location.href = ${JSON.stringify(PAYMENT_CANCEL_WEB_URL)}; } }</script></body></html>`);
 });
 
 app.get('/', (req, res) => res.send('KISFALUBA Backend Online!'));
 
 // --- RUTE ZA PRIGOVORE ---
 
-app.get('/api/complaints', async (req, res) => {
+app.get('/api/complaints', authGuard, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM complaints ORDER BY created_at DESC');
     res.json(result.rows);
@@ -1463,7 +1504,7 @@ app.post('/api/complaints', async (req, res) => {
   }
 });
 
-app.patch('/api/complaints/:id', async (req, res) => {
+app.patch('/api/complaints/:id', authGuard, async (req, res) => {
   const { id } = req.params;
   const { status, adminNote } = req.body;
   try {
@@ -1480,7 +1521,7 @@ app.patch('/api/complaints/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/complaints/:id', async (req, res) => {
+app.delete('/api/complaints/:id', authGuard, async (req, res) => {
   const { id } = req.params;
   try {
     await pool.query('DELETE FROM complaints WHERE id = $1', [id]);

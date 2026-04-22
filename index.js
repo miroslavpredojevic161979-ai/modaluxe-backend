@@ -78,6 +78,7 @@ const PAYMENT_SUCCESS_WEB_URL = process.env.PAYMENT_SUCCESS_WEB_URL || `${STOREF
 const PAYMENT_CANCEL_WEB_URL = process.env.PAYMENT_CANCEL_WEB_URL || STOREFRONT_URL;
 const PAYMENT_SUCCESS_APP_URL = process.env.PAYMENT_SUCCESS_APP_URL || 'modaluxe://payment-success';
 const PAYMENT_CANCEL_APP_URL = process.env.PAYMENT_CANCEL_APP_URL || 'modaluxe://payment-cancel';
+const SOLO_DEFAULT_KPD = (process.env.SOLO_DEFAULT_KPD || '').trim();
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -199,26 +200,94 @@ const calcTotals = (items) => {
   return Number(sum.toFixed(2));
 };
 
+const normalizeText = (value = '') => String(value ?? '').trim();
+
+const getSoloPaymentType = (paymentMethod, isPaid) => {
+  const normalized = normalizeText(paymentMethod).toUpperCase();
+
+  if (normalized === 'TRANSAKCIJSKI') return '1';
+  if (normalized === 'GOTOVINA') return '2';
+  if (normalized === 'KARTICE' || normalized === 'KARTICA' || normalized === 'STRIPE' || normalized === 'CARD') return '3';
+
+  return isPaid ? '3' : '2';
+};
+
+const getSoloCustomerData = (orderData = {}) => {
+  const companyName = normalizeText(orderData.companyName);
+  const oib = normalizeText(orderData.oib);
+  const name = normalizeText(orderData.name) || 'Gost';
+  const address = normalizeText(orderData.address);
+  const isB2B = Boolean(companyName && oib);
+
+  return { companyName, oib, name, address, isB2B };
+};
+
+const buildBlagajnaOrderData = (body = {}) => {
+  const rawItems = parseJsonSafe(body.items, []);
+  const normalizedItems = Array.isArray(rawItems)
+    ? rawItems
+        .map((item) => {
+          const description = normalizeText(item.description || item.name);
+          const qty = toNumberSafe(item.qty || item.quantity || 1);
+          const price = toNumberSafe(String(item.price ?? 0).replace(',', '.'));
+
+          if (!description || qty <= 0 || price < 0) return null;
+
+          return {
+            brand: normalizeText(item.brand),
+            name: description,
+            qty,
+            price,
+            kpd: normalizeText(item.kpd),
+          };
+        })
+        .filter(Boolean)
+    : [];
+
+  return {
+    id: body.reference || `BLAGAJNA-${Date.now()}`,
+    name: normalizeText(body.name || body.customerName),
+    companyName: normalizeText(body.companyName),
+    oib: normalizeText(body.oib),
+    address: normalizeText(body.address),
+    phone: normalizeText(body.phone),
+    email: normalizeText(body.email),
+    paymentMethod: normalizeText(body.paymentMethod || 'TRANSAKCIJSKI'),
+    note: normalizeText(body.note),
+    items: JSON.stringify(normalizedItems),
+    total: calcTotals(normalizedItems),
+    discount: JSON.stringify({ amount: 0 }),
+  };
+};
+
 // --- SOLO.HR FISKALIZACIJA ---
-const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
+const createSoloInvoice = async (orderData, isPaid, isStorno = false, paymentMethodOverride = '') => {
   try {
     const token = process.env.SOLO_API_TOKEN;
     if (!token) return null;
 
     const items = parseJsonSafe(orderData.items, []);
+    const { companyName, oib, name, address, isB2B } = getSoloCustomerData(orderData);
     
     const params = new URLSearchParams();
     params.append('token', token);
-    params.append('tip_racuna', '1');
+    params.append('tip_racuna', isB2B ? '2' : '1');
     params.append('tip_usluge', '1');
-    params.append('kupac_naziv', orderData.name || 'Gost');
-    params.append('kupac_adresa', orderData.address || '');
-    params.append('nacin_placanja', isPaid ? '3' : '2'); 
+    params.append('tip_kupca', isB2B ? '2' : '1');
+    params.append('kupac_naziv', isB2B ? companyName : name);
+    params.append('kupac_adresa', address);
+    if (isB2B) {
+      params.append('kupac_oib', oib);
+    }
+    params.append('nacin_placanja', getSoloPaymentType(paymentMethodOverride || orderData.paymentMethod, isPaid)); 
     params.append('prikazi_porez', '0'); 
     params.append('fiskalizacija', '1');
     
     if (isStorno) {
-      params.append('napomena', `Storno računa za narudžbu ${orderData.id}. Povrat sredstava kupcu.`);
+      const stornoNote = orderData.note
+        ? `Storno računa. ${orderData.note}`
+        : `Storno računa za narudžbu ${orderData.id}. Povrat sredstava kupcu.`;
+      params.append('napomena', stornoNote);
     }
 
     const popustObj = parseJsonSafe(orderData.discount, { amount: 0 });
@@ -243,6 +312,14 @@ const createSoloInvoice = async (orderData, isPaid, isStorno = false) => {
       
       if (isStorno) {
         cijena = -Math.abs(cijena);
+      }
+
+      if (isB2B) {
+        const kpd = normalizeText(item.kpd || SOLO_DEFAULT_KPD);
+        if (!kpd) {
+          throw new Error('R1/B2B račun traži KPD oznaku. Postavi SOLO_DEFAULT_KPD u .env ili pošalji item.kpd.');
+        }
+        params.append(`kpd_${i}`, kpd);
       }
 
       params.append('usluga', String(i)); 
@@ -761,7 +838,14 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         }
 
         if (updatedOrder && shouldFinalizeOrder) {
-          const soloRacun = await createSoloInvoice(updatedOrder, true);
+          const soloRacun = await createSoloInvoice(
+            {
+              ...updatedOrder,
+              companyName: session.metadata?.companyName || '',
+              oib: session.metadata?.oib || '',
+            },
+            true
+          );
           const invoiceUrl = soloRacun ? soloRacun.pdf : null;
           const invoiceNumber = soloRacun ? soloRacun.broj_racuna : invoiceNumberFromOrderId(existingOrder.id);
 
@@ -837,6 +921,68 @@ const authGuard = (req, res, next) => {
   });
 };
 
+app.post('/api/blagajna/invoice', authGuard, async (req, res) => {
+  try {
+    const orderData = buildBlagajnaOrderData(req.body);
+    const items = parseJsonSafe(orderData.items, []);
+    const isR1Customer = Boolean(orderData.companyName && orderData.oib);
+
+    if (items.length === 0) {
+      return res.status(400).json({ error: 'Blagajna mora imati barem jednu stavku.' });
+    }
+
+    if (isR1Customer && !SOLO_DEFAULT_KPD && items.some((item) => !normalizeText(item.kpd))) {
+      return res.status(400).json({ error: 'Za R1/B2B račun postavi SOLO_DEFAULT_KPD u .env ili pošalji kpd po stavci.' });
+    }
+
+    const soloRacun = await createSoloInvoice(orderData, true, false, orderData.paymentMethod);
+
+    if (!soloRacun || !soloRacun.pdf) {
+      return res.status(500).json({ error: 'Solo.hr nije vratio PDF računa.' });
+    }
+
+    return res.json({
+      success: true,
+      documentUrl: soloRacun.pdf,
+      invoiceNumber: soloRacun.broj_racuna || null,
+    });
+  } catch (err) {
+    console.error('Blagajna račun greška:', err.message);
+    return res.status(500).json({ error: err.message || 'Greška pri izdavanju računa kroz Blagajnu.' });
+  }
+});
+
+app.post('/api/blagajna/storno', authGuard, async (req, res) => {
+  try {
+    const orderData = buildBlagajnaOrderData(req.body);
+    const items = parseJsonSafe(orderData.items, []);
+    const isR1Customer = Boolean(orderData.companyName && orderData.oib);
+
+    if (items.length === 0) {
+      return res.status(400).json({ error: 'Blagajna storno mora imati barem jednu stavku.' });
+    }
+
+    if (isR1Customer && !SOLO_DEFAULT_KPD && items.some((item) => !normalizeText(item.kpd))) {
+      return res.status(400).json({ error: 'Za R1/B2B storno postavi SOLO_DEFAULT_KPD u .env ili pošalji kpd po stavci.' });
+    }
+
+    const soloStorno = await createSoloInvoice(orderData, true, true, orderData.paymentMethod);
+
+    if (!soloStorno || !soloStorno.pdf) {
+      return res.status(500).json({ error: 'Solo.hr nije vratio PDF storna.' });
+    }
+
+    return res.json({
+      success: true,
+      documentUrl: soloStorno.pdf,
+      invoiceNumber: soloStorno.broj_racuna || null,
+    });
+  } catch (err) {
+    console.error('Blagajna storno greška:', err.message);
+    return res.status(500).json({ error: err.message || 'Greška pri izradi storna kroz Blagajnu.' });
+  }
+});
+
 // --- STRIPE CHECKOUT ---
 app.post('/create-checkout-session', async (req, res) => {
   try {
@@ -873,6 +1019,13 @@ app.post('/create-checkout-session', async (req, res) => {
 
     const address = customer.address || `${customer.street}, ${customer.postalCode} ${customer.city}, ${customer.country}`; 
     const name = `${customer.firstName} ${customer.lastName}`;
+    const companyName = normalizeText(customer.companyName);
+    const oib = normalizeText(customer.oib);
+    const isR1Customer = Boolean(companyName && oib);
+
+    if (isR1Customer && !SOLO_DEFAULT_KPD) {
+      return res.status(400).json({ error: 'R1/B2B račun traži SOLO_DEFAULT_KPD u backend .env postavkama.' });
+    }
     
     const newOrder = await pool.query(
       'INSERT INTO orders (name, address, phone, email, total, items, status, discount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
@@ -890,6 +1043,8 @@ app.post('/create-checkout-session', async (req, res) => {
       client_reference_id: String(orderId),
       metadata: {
         orderId: String(orderId),
+        companyName,
+        oib,
       },
       customer_email: customer.email || undefined,
       line_items: [{
@@ -1173,9 +1328,13 @@ app.get('/orders/:id/payment-status', async (req, res) => {
 // --- POUZEĆE ---
 app.post('/orders', async (req, res) => {
   try {
-    const { name, address, phone, total, items, email, discount } = req.body; 
+    const { name, address, phone, total, items, email, discount, companyName, oib } = req.body; 
     const normalizedItems = parseJsonSafe(items, []);
     const totalAmount = Number((Number.isFinite(Number(total)) ? Number(total) : calcTotals(normalizedItems)).toFixed(2));
+
+    if (companyName && oib && !SOLO_DEFAULT_KPD) {
+      return res.status(400).json({ error: 'R1/B2B račun traži SOLO_DEFAULT_KPD u backend .env postavkama.' });
+    }
     
     const newOrder = await pool.query(
       'INSERT INTO orders (name, address, phone, email, total, items, status, discount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
@@ -1186,7 +1345,7 @@ app.post('/orders', async (req, res) => {
     const orderId = orderData.id;
     await deductStock(normalizedItems);
     
-    const soloRacun = await createSoloInvoice(orderData, false);
+    const soloRacun = await createSoloInvoice({ ...orderData, companyName, oib }, false);
     const invoiceUrl = soloRacun ? soloRacun.pdf : null;
     const invoiceNumber = soloRacun ? soloRacun.broj_racuna : invoiceNumberFromOrderId(orderId);
     

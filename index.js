@@ -1004,7 +1004,7 @@ app.patch('/inbound-invoices/:id/file', authGuard, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Greška u bazi.' }); }
 });
 
-app.post('/api/send-ura-storno', async (req, res) => {
+app.post('/api/send-ura-storno', authGuard, async (req, res) => {
   const { id, supplierEmail } = req.body;
   try {
     const cleanId = String(id).split('-')[0];
@@ -1138,7 +1138,7 @@ app.get('/all-orders', authGuard, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Greška servera' }); }
 });
 
-app.get('/orders', async (req, res) => {
+app.get('/orders', authGuard, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM orders ORDER BY id DESC');
     res.json(result.rows.map(o => ({ ...o, items: parseJsonSafe(o.items, []), })));

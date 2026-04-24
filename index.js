@@ -102,6 +102,8 @@ const initDB = async () => {
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount JSONB DEFAULT '{\"amount\": 0}'::jsonb");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS stripe_session_id VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_at TIMESTAMP");
+    await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS company_name VARCHAR(255)");
+    await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS company_oib VARCHAR(64)");
     await pool.query("ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS coupons JSONB DEFAULT '[]'::jsonb");
     await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS fit_info TEXT");
     await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS material_info TEXT");
@@ -443,7 +445,7 @@ const sendPackingSlipsToSuppliers = async (order, items) => {
       }).join('');
 
       const mailOptions = {
-        from: `"Kišfaluba Moda" <${process.env.EMAIL_USER}>`,
+        from: `"Kišfaluba Tradicija" <${process.env.EMAIL_USER}>`,
         to: supplierEmail,
         subject: "NOVI RADNI NALOG - Narudžba #" + order.id,
         html: `
@@ -941,10 +943,55 @@ app.post('/api/blagajna/invoice', authGuard, async (req, res) => {
       return res.status(500).json({ error: 'Solo.hr nije vratio PDF računa.' });
     }
 
+    const invoiceUrl = soloRacun.pdf;
+    const invoiceNumber = soloRacun.broj_racuna || null;
+    const savedOrderResult = await pool.query(
+      "INSERT INTO orders (name, address, phone, email, total, items, status, discount, invoice_url, paid_at, company_name, company_oib) VALUES ($1, $2, $3, $4, $5, $6, 'PAID', $7, $8, NOW(), $9, $10) RETURNING *",
+      [
+        orderData.name || orderData.companyName || 'Blagajna kupac',
+        orderData.address || '',
+        orderData.phone || '',
+        orderData.email || '',
+        calcTotals(items),
+        JSON.stringify(items),
+        orderData.discount || JSON.stringify({ amount: 0 }),
+        invoiceUrl,
+        orderData.companyName || '',
+        orderData.oib || ''
+      ]
+    );
+    const savedOrder = savedOrderResult.rows[0];
+
+    if (orderData.email && invoiceUrl) {
+      await transporter.sendMail({
+        from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
+        to: orderData.email,
+        bcc: process.env.EMAIL_USER,
+        subject: `Fiskalizirani račun br. ${invoiceNumber || savedOrder.id}`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #eee; text-align: center;">
+            <h2 style="color: #000;">Vaš račun je uspješno izdan</h2>
+            <p>U privitku ovog e-maila nalazi se službeni fiskalizirani račun.</p>
+            <div style="margin: 30px 0;">
+              <a href="${invoiceUrl}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block;">PREUZMI PDF RAČUN</a>
+            </div>
+            <p style="font-size: 11px; color: #777;">Račun je izdan automatski kroz Blagajnu i fiskaliziran u Solo.hr.</p>
+          </div>
+        `,
+        attachments: [
+          {
+            filename: `Racun_Kisfaluba_${String(invoiceNumber || savedOrder.id).replace(/\//g, '_')}.pdf`,
+            path: invoiceUrl
+          }
+        ]
+      }).catch((e) => console.error('X Greška slanja blagajna računa:', e));
+    }
+
     return res.json({
       success: true,
-      documentUrl: soloRacun.pdf,
-      invoiceNumber: soloRacun.broj_racuna || null,
+      documentUrl: invoiceUrl,
+      invoiceNumber,
+      orderId: savedOrder.id,
     });
   } catch (err) {
     console.error('Blagajna račun greška:', err.message);
@@ -1028,8 +1075,8 @@ app.post('/create-checkout-session', async (req, res) => {
     }
     
     const newOrder = await pool.query(
-      'INSERT INTO orders (name, address, phone, email, total, items, status, discount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
-      [name, address, customer.phone || '', customer.email || '', totalAmount, JSON.stringify(validatedItems), 'NEW', JSON.stringify(discount || { amount: 0 })]
+      'INSERT INTO orders (name, address, phone, email, total, items, status, discount, company_name, company_oib) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id',
+      [name, address, customer.phone || '', customer.email || '', totalAmount, JSON.stringify(validatedItems), 'NEW', JSON.stringify(discount || { amount: 0 }), companyName || '', oib || '']
     );
     const orderId = newOrder.rows[0].id;
     const successUrl = isApp ? `${req.protocol}://${req.get('host')}/payment-success?app=true` : `${req.protocol}://${req.get('host')}/payment-success`;
@@ -1337,8 +1384,8 @@ app.post('/orders', async (req, res) => {
     }
     
     const newOrder = await pool.query(
-      'INSERT INTO orders (name, address, phone, email, total, items, status, discount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [name || 'Nepoznat', address || '', phone || '', email || '', totalAmount, JSON.stringify(normalizedItems), 'NEW', JSON.stringify(discount || { amount: 0 })]
+      'INSERT INTO orders (name, address, phone, email, total, items, status, discount, company_name, company_oib) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *',
+      [name || 'Nepoznat', address || '', phone || '', email || '', totalAmount, JSON.stringify(normalizedItems), 'NEW', JSON.stringify(discount || { amount: 0 }), companyName || '', oib || '']
     );
     
     const orderData = newOrder.rows[0];

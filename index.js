@@ -507,8 +507,10 @@ const sendPackingSlipsToSuppliers = async (order, items) => {
 const soloInvoiceQueue = [];
 let soloInvoiceProcessing = false;
 const SOLO_INVOICE_DELAY_MS = 12000;
+let soloQueueJobCounter = 0;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const createSoloJobId = () => `solo-job-${Date.now()}-${++soloQueueJobCounter}`;
 
 const sendPaidInvoiceEmailToCustomer = async (order, invoiceUrl, invoiceNumber) => {
   if (!order?.email || !invoiceUrl) return;
@@ -535,37 +537,228 @@ const sendPaidInvoiceEmailToCustomer = async (order, invoiceUrl, invoiceNumber) 
   });
 };
 
+const sendBlagajnaInvoiceEmailToCustomer = async (orderData, invoiceUrl, invoiceNumber, savedOrderId) => {
+  if (!orderData?.email || !invoiceUrl) return;
+
+  await transporter.sendMail({
+    from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
+    to: orderData.email,
+    bcc: process.env.EMAIL_USER,
+    subject: `Fiskalizirani račun br. ${invoiceNumber || savedOrderId}`,
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #eee; text-align: center;">
+        <h2 style="color: #000;">Vaš račun je uspješno izdan</h2>
+        <p>U privitku ovog e-maila nalazi se službeni fiskalizirani račun.</p>
+        <div style="margin: 30px 0;">
+          <a href="${invoiceUrl}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block;">PREUZMI PDF RAČUN</a>
+        </div>
+        <p style="font-size: 11px; color: #777;">Račun je izdan automatski kroz Blagajnu i fiskaliziran u Solo.hr.</p>
+      </div>
+    `,
+    attachments: [
+      {
+        filename: `Racun_Kisfaluba_${String(invoiceNumber || savedOrderId).replace(/\//g, '_')}.pdf`,
+        path: invoiceUrl
+      }
+    ]
+  });
+};
+
 const normalizeQueuedOrderId = (orderId) => {
   const parsed = parseInt(String(orderId || '').split('-')[0], 10);
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const enqueueSoloInvoice = async (orderId) => {
-  const normalizedOrderId = normalizeQueuedOrderId(orderId);
-  if (!normalizedOrderId) return;
+const settleSoloJob = (job, result, error = null) => {
+  if (!job || job.settled) return;
+  job.settled = true;
 
-  try {
+  if (error) {
+    if (typeof job.reject === 'function') job.reject(error);
+    return;
+  }
+
+  if (typeof job.resolve === 'function') job.resolve(result);
+};
+
+const saveBlagajnaInvoiceOrder = async (orderData, items, invoiceUrl) => {
+  const savedOrderResult = await pool.query(
+    "INSERT INTO orders (name, address, phone, email, total, items, status, discount, invoice_url, paid_at, company_name, company_oib) VALUES ($1, $2, $3, $4, $5, $6, 'PAID', $7, $8, NOW(), $9, $10) RETURNING *",
+    [
+      orderData.name || orderData.companyName || 'Blagajna kupac',
+      orderData.address || '',
+      orderData.phone || '',
+      orderData.email || '',
+      calcTotals(items),
+      JSON.stringify(items),
+      orderData.discount || JSON.stringify({ amount: 0 }),
+      invoiceUrl,
+      orderData.companyName || '',
+      orderData.oib || ''
+    ]
+  );
+
+  return savedOrderResult.rows[0];
+};
+
+const processOrderSoloJob = async (job) => {
+  const orderResult = await pool.query(
+    'SELECT * FROM orders WHERE id = $1 LIMIT 1',
+    [job.orderId]
+  );
+  const order = orderResult.rows[0];
+
+  if (!order) {
+    return { status: 'skip' };
+  }
+
+  if (order.invoice_url) {
+    console.log(`[SOLO QUEUE] Preskačem jer invoice_url već postoji za orderId ${job.orderId}`);
+    return { status: 'skip' };
+  }
+
+  const soloResult = await createSoloInvoiceDetailed(
+    {
+      ...order,
+      companyName: order.company_name || '',
+      oib: order.company_oib || '',
+    },
+    true
+  );
+
+  if (soloResult.invoice && soloResult.invoice.pdf) {
+    const invoiceUrl = soloResult.invoice.pdf;
+    const invoiceNumber = soloResult.invoice.broj_racuna || invoiceNumberFromOrderId(job.orderId);
+
+    const updatedResult = await pool.query(
+      'UPDATE orders SET invoice_url = $1 WHERE id = $2 RETURNING *',
+      [invoiceUrl, job.orderId]
+    );
+
+    const updatedOrder = updatedResult.rows[0] || { ...order, invoice_url: invoiceUrl };
+    await sendPaidInvoiceEmailToCustomer(updatedOrder, invoiceUrl, invoiceNumber).catch((err) => {
+      console.error(`[SOLO QUEUE] Greška slanja računa kupcu za orderId ${job.orderId}:`, err);
+    });
+    await sendPackingSlipsToSuppliers(updatedOrder, parseJsonSafe(updatedOrder.items, []));
+
+    return { status: 'success' };
+  }
+
+  if (soloResult.rateLimited) {
+    return { status: 'retry' };
+  }
+
+  return { status: 'error', error: new Error(`Solo nije izdao račun za orderId ${job.orderId}`) };
+};
+
+const processBlagajnaInvoiceJob = async (job) => {
+  const orderData = buildBlagajnaOrderData(job.payload);
+  const items = parseJsonSafe(orderData.items, []);
+  const soloResult = await createSoloInvoiceDetailed(orderData, true, false, orderData.paymentMethod);
+
+  if (soloResult.invoice && soloResult.invoice.pdf) {
+    const invoiceUrl = soloResult.invoice.pdf;
+    const invoiceNumber = soloResult.invoice.broj_racuna || null;
+    const savedOrder = await saveBlagajnaInvoiceOrder(orderData, items, invoiceUrl);
+
+    await sendBlagajnaInvoiceEmailToCustomer(orderData, invoiceUrl, invoiceNumber, savedOrder.id).catch((err) => {
+      console.error(`[SOLO QUEUE] Greška slanja blagajna računa kupcu za job ${job.id}:`, err);
+    });
+
+    return {
+      status: 'success',
+      response: {
+        success: true,
+        documentUrl: invoiceUrl,
+        invoiceNumber,
+        orderId: savedOrder.id,
+      }
+    };
+  }
+
+  if (soloResult.rateLimited) {
+    return { status: 'retry' };
+  }
+
+  return { status: 'error', error: new Error('Solo.hr nije vratio PDF računa.') };
+};
+
+const processBlagajnaStornoJob = async (job) => {
+  const orderData = buildBlagajnaOrderData(job.payload);
+  const soloResult = await createSoloInvoiceDetailed(orderData, true, true, orderData.paymentMethod);
+
+  if (soloResult.invoice && soloResult.invoice.pdf) {
+    return {
+      status: 'success',
+      response: {
+        success: true,
+        documentUrl: soloResult.invoice.pdf,
+        invoiceNumber: soloResult.invoice.broj_racuna || null,
+      }
+    };
+  }
+
+  if (soloResult.rateLimited) {
+    return { status: 'retry' };
+  }
+
+  return { status: 'error', error: new Error('Solo.hr nije vratio PDF storna.') };
+};
+
+const enqueueSoloJob = async (jobInput) => {
+  if (!jobInput || !jobInput.type) return null;
+
+  if (jobInput.type === 'order') {
+    const normalizedOrderId = normalizeQueuedOrderId(jobInput.orderId);
+    if (!normalizedOrderId) return null;
+
     const result = await pool.query(
       'SELECT id, invoice_url FROM orders WHERE id = $1 LIMIT 1',
       [normalizedOrderId]
     );
     const order = result.rows[0];
 
-    if (!order) return;
+    if (!order) return null;
     if (order.invoice_url) {
       console.log(`[SOLO QUEUE] Preskačem jer invoice_url već postoji za orderId ${normalizedOrderId}`);
-      return;
+      return { queued: false, skipped: true };
     }
-    if (soloInvoiceQueue.includes(normalizedOrderId)) return;
+    if (soloInvoiceQueue.some((queuedJob) => queuedJob.type === 'order' && queuedJob.orderId === normalizedOrderId)) {
+      return { queued: true, duplicate: true };
+    }
 
-    soloInvoiceQueue.push(normalizedOrderId);
-    console.log(`[SOLO QUEUE] Dodan orderId ${normalizedOrderId}`);
+    const job = {
+      id: createSoloJobId(),
+      type: 'order',
+      orderId: normalizedOrderId,
+      settled: false,
+    };
+
+    soloInvoiceQueue.push(job);
+    console.log(`[SOLO QUEUE] Dodan job ${job.type} (${normalizedOrderId})`);
     processSoloInvoiceQueue().catch((err) => {
       console.error('[SOLO QUEUE] Neočekivana greška pri pokretanju queue worker-a:', err);
     });
-  } catch (err) {
-    console.error('[SOLO QUEUE] Greška pri dodavanju u queue:', err);
+    return { queued: true };
   }
+
+  return await new Promise((resolve, reject) => {
+    const job = {
+      id: createSoloJobId(),
+      type: jobInput.type,
+      payload: jobInput.payload,
+      resolve,
+      reject,
+      settled: false,
+    };
+
+    soloInvoiceQueue.push(job);
+    console.log(`[SOLO QUEUE] Dodan job ${job.type} (${job.id})`);
+    processSoloInvoiceQueue().catch((err) => {
+      console.error('[SOLO QUEUE] Neočekivana greška pri pokretanju queue worker-a:', err);
+      settleSoloJob(job, null, err);
+    });
+  });
 };
 
 const processSoloInvoiceQueue = async () => {
@@ -574,67 +767,45 @@ const processSoloInvoiceQueue = async () => {
 
   try {
     while (soloInvoiceQueue.length > 0) {
-      const orderId = soloInvoiceQueue[0];
-      console.log(`[SOLO QUEUE] Obrađujem orderId ${orderId}`);
+      const job = soloInvoiceQueue[0];
+      console.log(`[SOLO QUEUE] Obrađujem job ${job.type} (${job.orderId || job.id})`);
+
+      let outcome = { status: 'skip' };
 
       try {
-        const orderResult = await pool.query(
-          'SELECT * FROM orders WHERE id = $1 LIMIT 1',
-          [orderId]
-        );
-        const order = orderResult.rows[0];
-
-        if (!order) {
-          soloInvoiceQueue.shift();
-          continue;
-        }
-
-        if (order.invoice_url) {
-          console.log(`[SOLO QUEUE] Preskačem jer invoice_url već postoji za orderId ${orderId}`);
-          soloInvoiceQueue.shift();
+        if (job.type === 'order') {
+          outcome = await processOrderSoloJob(job);
+        } else if (job.type === 'blagajna-invoice') {
+          outcome = await processBlagajnaInvoiceJob(job);
+        } else if (job.type === 'blagajna-storno') {
+          outcome = await processBlagajnaStornoJob(job);
         } else {
-          const soloResult = await createSoloInvoiceDetailed(
-            {
-              ...order,
-              companyName: order.company_name || '',
-              oib: order.company_oib || '',
-            },
-            true
-          );
-
-          if (soloResult.invoice && soloResult.invoice.pdf) {
-            const invoiceUrl = soloResult.invoice.pdf;
-            const invoiceNumber = soloResult.invoice.broj_racuna || invoiceNumberFromOrderId(orderId);
-
-            const updatedResult = await pool.query(
-              'UPDATE orders SET invoice_url = $1 WHERE id = $2 RETURNING *',
-              [invoiceUrl, orderId]
-            );
-
-            const updatedOrder = updatedResult.rows[0] || { ...order, invoice_url: invoiceUrl };
-            await sendPaidInvoiceEmailToCustomer(updatedOrder, invoiceUrl, invoiceNumber).catch((err) => {
-              console.error(`[SOLO QUEUE] Greška slanja računa kupcu za orderId ${orderId}:`, err);
-            });
-            await sendPackingSlipsToSuppliers(updatedOrder, parseJsonSafe(updatedOrder.items, []));
-            soloInvoiceQueue.shift();
-          } else if (soloResult.rateLimited) {
-            soloInvoiceQueue.shift();
-            if (!soloInvoiceQueue.includes(orderId)) {
-              soloInvoiceQueue.push(orderId);
-            }
-            console.log(`[SOLO QUEUE] Solo rate limit, vraćam u queue orderId ${orderId}`);
-          } else {
-            console.log(`[SOLO QUEUE] Solo nije izdao račun za orderId ${orderId}`);
-            soloInvoiceQueue.shift();
-          }
+          outcome = { status: 'error', error: new Error(`Nepoznat Solo job tip: ${job.type}`) };
         }
       } catch (err) {
-        console.error(`[SOLO QUEUE] Greška pri obradi orderId ${orderId}:`, err);
-        soloInvoiceQueue.shift();
+        outcome = { status: 'error', error: err };
+      }
+
+      soloInvoiceQueue.shift();
+
+      if (outcome.status === 'retry') {
+        console.log(`[SOLO QUEUE] Rate limit, vraćam job u queue ${job.type} (${job.orderId || job.id})`);
+        soloInvoiceQueue.push(job);
+      } else if (outcome.status === 'success') {
+        console.log(`[SOLO QUEUE] Job uspješan ${job.type} (${job.orderId || job.id})`);
+        settleSoloJob(job, outcome.response || { success: true });
+      } else if (outcome.status === 'error') {
+        console.log(`[SOLO QUEUE] Job hard fail ${job.type} (${job.orderId || job.id})`);
+        if (outcome.error) {
+          console.error(outcome.error);
+        }
+        settleSoloJob(job, null, outcome.error || new Error('Solo queue job nije uspio.'));
+      } else {
+        settleSoloJob(job, outcome.response || { success: true });
       }
 
       if (soloInvoiceQueue.length > 0) {
-        console.log(`[SOLO QUEUE] Gotovo, čekam ${SOLO_INVOICE_DELAY_MS} ms`);
+        console.log(`[SOLO QUEUE] Čekam ${SOLO_INVOICE_DELAY_MS} ms`);
         await sleep(SOLO_INVOICE_DELAY_MS);
       }
     }
@@ -997,7 +1168,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         }
 
         if (updatedOrder && shouldFinalizeOrder) {
-          await enqueueSoloInvoice(existingOrder.id);
+          await enqueueSoloJob({ type: 'order', orderId: existingOrder.id });
         }
 
         req.app.get('io').emit('nova_narudzba', { id: existingOrder.id, name: updatedOrder.name });
@@ -1057,62 +1228,12 @@ app.post('/api/blagajna/invoice', authGuard, async (req, res) => {
       return res.status(400).json({ error: 'Za R1/B2B račun postavi SOLO_DEFAULT_KPD u .env ili pošalji kpd po stavci.' });
     }
 
-    const soloRacun = await createSoloInvoice(orderData, true, false, orderData.paymentMethod);
-
-    if (!soloRacun || !soloRacun.pdf) {
-      return res.status(500).json({ error: 'Solo.hr nije vratio PDF računa.' });
-    }
-
-    const invoiceUrl = soloRacun.pdf;
-    const invoiceNumber = soloRacun.broj_racuna || null;
-    const savedOrderResult = await pool.query(
-      "INSERT INTO orders (name, address, phone, email, total, items, status, discount, invoice_url, paid_at, company_name, company_oib) VALUES ($1, $2, $3, $4, $5, $6, 'PAID', $7, $8, NOW(), $9, $10) RETURNING *",
-      [
-        orderData.name || orderData.companyName || 'Blagajna kupac',
-        orderData.address || '',
-        orderData.phone || '',
-        orderData.email || '',
-        calcTotals(items),
-        JSON.stringify(items),
-        orderData.discount || JSON.stringify({ amount: 0 }),
-        invoiceUrl,
-        orderData.companyName || '',
-        orderData.oib || ''
-      ]
-    );
-    const savedOrder = savedOrderResult.rows[0];
-
-    if (orderData.email && invoiceUrl) {
-      await transporter.sendMail({
-        from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
-        to: orderData.email,
-        bcc: process.env.EMAIL_USER,
-        subject: `Fiskalizirani račun br. ${invoiceNumber || savedOrder.id}`,
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #eee; text-align: center;">
-            <h2 style="color: #000;">Vaš račun je uspješno izdan</h2>
-            <p>U privitku ovog e-maila nalazi se službeni fiskalizirani račun.</p>
-            <div style="margin: 30px 0;">
-              <a href="${invoiceUrl}" style="background-color: #D4AF37; color: black; padding: 15px 25px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block;">PREUZMI PDF RAČUN</a>
-            </div>
-            <p style="font-size: 11px; color: #777;">Račun je izdan automatski kroz Blagajnu i fiskaliziran u Solo.hr.</p>
-          </div>
-        `,
-        attachments: [
-          {
-            filename: `Racun_Kisfaluba_${String(invoiceNumber || savedOrder.id).replace(/\//g, '_')}.pdf`,
-            path: invoiceUrl
-          }
-        ]
-      }).catch((e) => console.error('X Greška slanja blagajna računa:', e));
-    }
-
-    return res.json({
-      success: true,
-      documentUrl: invoiceUrl,
-      invoiceNumber,
-      orderId: savedOrder.id,
+    const queueResult = await enqueueSoloJob({
+      type: 'blagajna-invoice',
+      payload: req.body,
     });
+
+    return res.json(queueResult);
   } catch (err) {
     console.error('Blagajna račun greška:', err.message);
     return res.status(500).json({ error: err.message || 'Greška pri izdavanju računa kroz Blagajnu.' });
@@ -1133,17 +1254,12 @@ app.post('/api/blagajna/storno', authGuard, async (req, res) => {
       return res.status(400).json({ error: 'Za R1/B2B storno postavi SOLO_DEFAULT_KPD u .env ili pošalji kpd po stavci.' });
     }
 
-    const soloStorno = await createSoloInvoice(orderData, true, true, orderData.paymentMethod);
-
-    if (!soloStorno || !soloStorno.pdf) {
-      return res.status(500).json({ error: 'Solo.hr nije vratio PDF storna.' });
-    }
-
-    return res.json({
-      success: true,
-      documentUrl: soloStorno.pdf,
-      invoiceNumber: soloStorno.broj_racuna || null,
+    const queueResult = await enqueueSoloJob({
+      type: 'blagajna-storno',
+      payload: req.body,
     });
+
+    return res.json(queueResult);
   } catch (err) {
     console.error('Blagajna storno greška:', err.message);
     return res.status(500).json({ error: err.message || 'Greška pri izradi storna kroz Blagajnu.' });

@@ -819,6 +819,21 @@ const processSoloInvoiceQueue = async () => {
   }
 };
 
+const recoverPendingSoloInvoices = async () => {
+  try {
+    const pendingOrdersResult = await pool.query(
+      "SELECT id FROM orders WHERE status = 'PAID' AND (invoice_url IS NULL OR TRIM(invoice_url) = '') ORDER BY id ASC"
+    );
+
+    for (const row of pendingOrdersResult.rows) {
+      console.log(`[SOLO RECOVERY] Vraćam PAID narudžbu bez računa u queue (${row.id})`);
+      await enqueueSoloJob({ type: 'order', orderId: row.id });
+    }
+  } catch (error) {
+    console.error('[SOLO RECOVERY] Greška pri recovery-u PAID narudžbi bez računa:', error);
+  }
+};
+
 // --- SKIDANJE ZALIHE ---
 const deductStock = async (items) => {
   try {
@@ -1980,7 +1995,10 @@ pool.query('ALTER TABLE products ALTER COLUMN price TYPE NUMERIC(10,2)').catch(e
 pool.query('ALTER TABLE products ALTER COLUMN cost_price TYPE NUMERIC(10,2)').catch(e => console.log('Cost update:', e.message));
 
 server.listen(PORT, '0.0.0.0', () => { 
-  console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`); 
+  console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`);
+  recoverPendingSoloInvoices().catch((error) => {
+    console.error('[SOLO RECOVERY] Neuspješan startup recovery:', error);
+  });
 });
 // PRIVREMENA METLA ZA BRISANJE SVEGA
 app.get('/brisanje-baze', async (req, res) => {

@@ -1982,6 +1982,16 @@ pool.query('ALTER TABLE products ALTER COLUMN cost_price TYPE NUMERIC(10,2)').ca
 server.listen(PORT, '0.0.0.0', () => { 
   console.log(`KISFALUBA SERVER RADI NA PORTU ${PORT}`); 
 });
+// PRIVREMENA METLA ZA BRISANJE SVEGA
+app.get('/brisanje-baze', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM orders');
+    await pool.query('DELETE FROM inbound_invoices');
+    res.send('<h1>Sve narudžbe i ulazni računi su uspješno obrisani! 🧹</h1><p>Sada se vrati u VS Code, OBRISI ovaj kod i ponovno stisni Sync Changes kako ti nitko drugi ne bi mogao obrisati bazu.</p>');
+  } catch (err) { 
+    res.status(500).send('Greška pri brisanju: ' + err.message); 
+  }
+});
 
 
 

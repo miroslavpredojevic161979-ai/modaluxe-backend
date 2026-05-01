@@ -1035,6 +1035,144 @@ async function fetchInboundInvoicesFromEmail() {
   }
 }
 
+async function fetchInboundInvoicesFromEmailLegacy() {
+  const config = {
+    imap: {
+      user: process.env.INBOUND_EMAIL_USER,
+      password: process.env.INBOUND_EMAIL_PASS,
+      host: 'imap.gmail.com',
+      port: 993,
+      tls: true,
+      authTimeout: 10000,
+      tlsOptions: { rejectUnauthorized: false }
+    }
+  };
+
+  try {
+    console.log('Provjeravam nove racune dobavljaca...');
+    const connection = await imaps.connect(config);
+    await connection.openBox('INBOX');
+
+    const searchCriteria = ['UNSEEN'];
+    const fetchOptions = { bodies: ['HEADER', 'TEXT', ''], markSeen: true };
+    const messages = await connection.search(searchCriteria, fetchOptions);
+
+    for (let item of messages) {
+      try {
+        const all = item.parts.find(part => part.which === '');
+        const id = item.attributes.uid;
+        const idHeader = "Imap-Id: " + id + "\r\n";
+        const mail = await simpleParser(idHeader + all.body);
+
+        const senderAddress = mail.from && mail.from.value[0] ? mail.from.value[0].address : 'Nepoznato';
+        const supplierName = (mail.from && mail.from.value[0].name) ? mail.from.value[0].name : senderAddress;
+
+        if (senderAddress.toLowerCase() === process.env.EMAIL_USER.toLowerCase()) continue;
+
+        const dateStr = new Date().toLocaleDateString('hr-HR');
+        const subject = mail.subject || 'Automatski uvoz iz maila';
+
+        let extractedAmount = 0;
+        const textToSearch = (mail.text || '') + ' ' + (mail.html || '');
+        const amountRegex = /(?:ukupno|iznos|total|za platiti|iznos računa)[^\d]*([\d]+[.,]\d{2})/i;
+        const match = textToSearch.match(amountRegex);
+
+        if (match && match[1]) {
+          extractedAmount = parseFloat(match[1].replace(',', '.'));
+        } else {
+          const eurRegex = /([\d]+[.,]\d{2})\s*(?:eur|€)/gi;
+          let eurMatches = [...textToSearch.matchAll(eurRegex)];
+          if (eurMatches.length > 0) {
+            const lastMatch = eurMatches[eurMatches.length - 1][1];
+            extractedAmount = parseFloat(lastMatch.replace(',', '.'));
+          }
+        }
+        if (isNaN(extractedAmount)) extractedAmount = 0;
+
+        const validAttachments = (mail.attachments || []).filter(attr =>
+          attr.contentType === 'application/pdf' ||
+          attr.contentType?.startsWith('image/') ||
+          attr.filename?.toLowerCase().match(/\.(pdf|jpg|jpeg|png)$/)
+        );
+
+        let finalFileUrl = null;
+        let finalNote = subject;
+
+        if (validAttachments.length > 0) {
+          try {
+            const attachment = validAttachments[0];
+            const fName = `ura_doc_${Date.now()}`;
+            const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'auto');
+            finalFileUrl = uploadResult.secure_url;
+          } catch (e) {
+            console.error('Cloudinary upload greska:', e);
+          }
+        } else {
+          try {
+            console.log('Uslikavam HTML mail...');
+            const htmlContent = mail.html || `<div style="font-family: Arial; padding: 20px; white-space: pre-wrap;">${mail.text || subject}</div>`;
+            const browser = await puppeteer.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
+            });
+            const page = await browser.newPage();
+            await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 15000 });
+            const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
+            await browser.close();
+
+            const fName = `ura_sken_${Date.now()}`;
+            const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image');
+            finalFileUrl = uploadResult.secure_url;
+            finalNote = 'Iz maila (Skenirano)';
+          } catch (puppeteerErr) {
+            console.error('Puppeteer greska, spasavam kao obican tekst:', puppeteerErr);
+            try {
+              const fName = `ura_tekst_${Date.now()}`;
+              const doc = new PDFDocument({ margin: 40, size: 'A4' });
+              let buffers = [];
+              doc.on('data', buffers.push.bind(buffers));
+              const uploadPromise = new Promise((resolve, reject) => {
+                doc.on('end', async () => {
+                  try {
+                    let pdfData = Buffer.concat(buffers);
+                    const result = await uploadBufferToCloudinary(pdfData, fName, 'image');
+                    resolve(result.secure_url);
+                  } catch (err) { reject(err); }
+                });
+              });
+              doc.fontSize(16).text('Sadrzaj e-maila (Greska u skeniranju formata)', { align: 'center' }).moveDown(2);
+              doc.fontSize(10).text(fixText(mail.text || 'E-mail ne sadrzi citljiv tekst.'));
+              doc.end();
+              finalFileUrl = await uploadPromise;
+            } catch (fallbackErr) { console.error(fallbackErr); }
+          }
+        }
+
+        const invoiceNumber = finalNote === subject ? 'Iz maila' : finalNote;
+        const duplicateCheck = await pool.query(
+          "SELECT id FROM inbound_invoices WHERE supplier = $1 AND invoice_number = $2 AND amount = $3",
+          [supplierName, invoiceNumber, extractedAmount]
+        );
+
+        if (duplicateCheck.rows.length === 0) {
+          await pool.query(
+            "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false)",
+            [supplierName, senderAddress, invoiceNumber, extractedAmount, finalFileUrl, subject, dateStr]
+          );
+          console.log(`URA spremljena: ${supplierName} (${extractedAmount} EUR).`);
+        } else {
+          console.log(`Preskacem duplikat racuna od ${supplierName}.`);
+        }
+      } catch (singleMailErr) {
+        console.error('Greska pri obradi jednog maila:', singleMailErr.message);
+      }
+    }
+    if (connection) connection.end();
+  } catch (err) {
+    console.error('IMAP Greska:', err.message);
+  }
+}
+
 const generateUraStornoPDF = (inv, filePath) => {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 40, size: 'A4' });
@@ -1403,7 +1541,7 @@ app.post('/create-checkout-session', async (req, res) => {
 // --- RUTE ZA ULAZNE RAČUNE (URA) ---
 app.post('/inbound-invoices/fetch-email', authGuard, async (req, res) => {
   console.log("Ručno pokrenuta provjera mailova...");
-  await fetchInboundInvoicesFromEmail();
+  await fetchInboundInvoicesFromEmailLegacy();
   res.json({ success: true, message: 'Provjera pošte završena.' });
 });
 
@@ -1414,40 +1552,73 @@ app.get('/inbound-invoices', authGuard, async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Greška servera" }); }
 });
 
+app.post('/inbound-invoices', authGuard, async (req, res) => {
+  const { supplier, supplier_email, invoice_number, amount, file_url, note, date } = req.body;
+  try {
+    const result = await pool.query(
+      "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false) RETURNING *",
+      [supplier, supplier_email || '', invoice_number, amount, file_url, note, date]
+    );
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: "Greška u bazi." }); }
+});
+
 app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
   try {
     const { status } = req.body;
     const id = String(req.params.id).split('-')[0];
     const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
 
-    let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
-    
-    if (targetStatus === 'ARHIVIRANI') {
-        query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
-    } else if (targetStatus === 'POVRATI') {
-        query = 'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *';
-    }
- 
-    const result = await pool.query(query, [targetStatus, id]);
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Račun nije pronađen.' });
-    }
-    
-    const invData = result.rows[0];
+    if (targetStatus === 'POVRATI') {
+      const origRes = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
+      if (origRes.rows.length === 0) return res.status(404).json({ error: 'Račun nije pronađen.' });
+      const orig = origRes.rows[0];
 
-    if (targetStatus === 'POVRATI' && !invData.storno_url) {
-      const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
+      if (orig.archived === true || orig.storno_url) {
+        return res.json({ success: true, invoice: orig });
+      }
+
+      let siguranBroj = orig.invoice_number ? String(orig.invoice_number).trim() : `URA-${orig.id}`;
+      const stornoNumber = siguranBroj.toUpperCase().includes('STORNO') ? siguranBroj : `STORNO-${siguranBroj}`;
+
+      const stornoInsert = await pool.query(`
+        INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'POVRATI', false) RETURNING *
+      `, [
+        orig.supplier,
+        orig.supplier_email,
+        stornoNumber,
+        -Math.abs(Number(orig.amount)),
+        orig.file_url,
+        `Storno za račun br. ${siguranBroj}`,
+        new Date().toLocaleDateString('hr-HR')
+      ]);
+
+      let newStorno = stornoInsert.rows[0];
+
+      const fileName = `ura_storno_${newStorno.id}_${Date.now()}.pdf`;
       const filePath = path.join(__dirname, 'uploads', fileName);
-      await generateUraStornoPDF(invData, filePath); 
+      await generateUraStornoPDF(orig, filePath);
       const uploadResult = await cloudinary.uploader.upload(filePath, { folder: 'kisfaluba_ura', resource_type: 'image' });
-      await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [uploadResult.secure_url, id]);
-      invData.storno_url = uploadResult.secure_url;
+      const stornoUrl = uploadResult.secure_url;
+      try { fs.unlinkSync(filePath); } catch (e) {}
+
+      await pool.query('UPDATE inbound_invoices SET storno_url = $1, archived = true WHERE id = $2', [stornoUrl, orig.id]);
+      await pool.query('UPDATE inbound_invoices SET storno_url = $1, file_url = $2 WHERE id = $3', [stornoUrl, stornoUrl, newStorno.id]);
+
+      orig.archived = true;
+      orig.storno_url = stornoUrl;
+      return res.json({ success: true, invoice: orig });
     }
 
-    res.json({ success: true, invoice: invData });
+    let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
+    if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA') {
+      query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
+    }
+    const result = await pool.query(query, [targetStatus, id]);
+    res.json({ success: true, invoice: result.rows[0] });
   } catch (err) {
-    console.error("Greška pri ažuriranju statusa:", err);
+    console.error("Greška:", err);
     res.status(500).json({ error: 'Greška u bazi.' });
   }
 });
@@ -1483,8 +1654,11 @@ app.patch('/inbound-invoices/:id/file', authGuard, async (req, res) => {
     const id = String(req.params.id).split('-')[0];
     const { fileUrl } = req.body;
     await pool.query('UPDATE inbound_invoices SET file_url = $1 WHERE id = $2', [fileUrl, id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Greška u bazi.' }); }
+    res.json({ success: true, message: 'Dokument uspješno spremljen u bazu!' });
+  } catch (err) {
+    console.error("Greška pri spremanju PDF linka u bazu:", err);
+    res.status(500).json({ error: 'Greška u bazi.' });
+  }
 });
 
 app.post('/api/send-ura-storno', authGuard, async (req, res) => {
@@ -1501,27 +1675,15 @@ app.post('/api/send-ura-storno', authGuard, async (req, res) => {
     const finalEmail = (inv.supplier_email && inv.supplier_email.includes('@')) ? inv.supplier_email : supplierEmail;
 
     if (finalEmail && finalEmail.includes('@')) {
-      let siguranBroj = inv.invoice_number ? String(inv.invoice_number).trim() : `URA-${inv.id}`;
-      const stornoNumber = siguranBroj.toUpperCase().includes('STORNO') ? siguranBroj : `STORNO-${siguranBroj}`;
-
       await transporter.sendMail({
         from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
         to: finalEmail,
-        subject: `Storno / Povratnica - ${stornoNumber}`,
-        html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU</h2><p>Poštovani,</p><p>U privitku Vam dostavljamo službeni storno dokument za povrat robe.</p></div>`,
-        attachments: [
-          {
-            filename: `${stornoNumber}.pdf`,
-            path: pdfLink
-          }
-        ]
+        subject: `Storno / Povratnica - ${inv.invoice_number}`,
+        html: `<p>Poštovani, u privitku je dokument: <a href="${pdfLink}">PREUZMI</a></p>`
       });
     }
-    res.json({ success: true, message: 'Storno mail je uspješno poslan dobavljaču s privitkom!' });
-  } catch (error) { 
-    console.error("Greška pri slanju storno maila dobavljaču:", error);
-    res.status(500).json({ error: 'Greška servera pri slanju e-maila.' }); 
-  }
+    res.json({ success: true, message: 'Mail poslan!' });
+  } catch (error) { res.status(500).json({ error: 'Greška servera.' }); }
 });
 
 // --- RUTE ZA PROIZVODE ---

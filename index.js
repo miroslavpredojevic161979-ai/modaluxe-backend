@@ -1063,11 +1063,25 @@ async function fetchInboundInvoicesFromEmail() {
         }
         if (isNaN(extractedAmount)) extractedAmount = 0;
 
-        const validAttachments = (mail.attachments || []).filter(attr => 
-          attr.contentType === 'application/pdf' || 
-          attr.contentType?.startsWith('image/') ||
-          attr.filename?.toLowerCase().match(/\.(pdf|jpg|jpeg|png)$/)
-        );
+        const attachments = mail.attachments || [];
+        const isPdfAttachment = (attr) => {
+          const attachmentName = String(attr.filename || '').toLowerCase();
+          const attachmentType = String(attr.contentType || '').toLowerCase();
+          return attachmentType === 'application/pdf' || attachmentName.endsWith('.pdf');
+        };
+        const isImageAttachment = (attr) => {
+          const attachmentName = String(attr.filename || '').toLowerCase();
+          const attachmentType = String(attr.contentType || '').toLowerCase();
+          return attachmentType.startsWith('image/') || /\.(jpg|jpeg|png)$/i.test(attachmentName);
+        };
+
+        const pdfAttachment = attachments.find(isPdfAttachment);
+        const imageAttachment = attachments.find(isImageAttachment);
+        const hasHtmlBody = Boolean(mail.html && String(mail.html).trim());
+
+        if (pdfAttachment) console.log('Inbound invoice: PDF attachment detected');
+        if (hasHtmlBody) console.log('Inbound invoice: HTML body detected');
+        if (imageAttachment) console.log('Inbound invoice: image attachment detected');
 
         let finalFileUrl = null;
         let finalNote = subject;
@@ -1076,45 +1090,53 @@ async function fetchInboundInvoicesFromEmail() {
         let pdfPreviewUrl = null;
         let imageUrl = null;
         let sourceType = 'TEXT';
+        let hasValidSource = false;
 
-        if (mail.html) {
+        if (hasHtmlBody) {
           try {
             originalHtmlUrl = await uploadInboundHtmlSnapshot(mail.html, `ura_html_${Date.now()}`);
           } catch (htmlUploadErr) {
-            console.error("Cloudinary HTML upload greška:", htmlUploadErr);
+            console.error('Cloudinary HTML upload greška:', htmlUploadErr);
           }
         }
 
-        if (validAttachments.length > 0) {
+        if (pdfAttachment) {
           try {
-            const attachment = validAttachments[0];
-            const fName = `ura_doc_${Date.now()}`;
-            const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'auto');
+            const uploadResult = await uploadBufferToCloudinary(pdfAttachment.content, `ura_pdf_${Date.now()}`, 'auto');
             finalFileUrl = uploadResult.secure_url;
-            const attachmentName = String(attachment.filename || '').toLowerCase();
-            const attachmentType = String(attachment.contentType || '').toLowerCase();
-            if (attachmentType === 'application/pdf' || attachmentName.endsWith('.pdf')) {
-              originalPdfUrl = finalFileUrl;
-              sourceType = originalHtmlUrl ? 'PDF+HTML' : 'PDF';
-            } else if (attachmentType.startsWith('image/') || /\.(jpg|jpeg|png)$/.test(attachmentName)) {
-              imageUrl = finalFileUrl;
-              sourceType = originalHtmlUrl ? 'IMAGE+HTML' : 'IMAGE';
-            } else {
-              sourceType = originalHtmlUrl ? 'HTML' : 'PDF';
-            }
-          } catch(e) {
-            console.error("Cloudinary upload greška:", e);
+            originalPdfUrl = finalFileUrl;
+            sourceType = originalHtmlUrl ? 'PDF+HTML' : 'PDF';
+            hasValidSource = true;
+            console.log('Inbound invoice: using PDF as primary source');
+          } catch (pdfUploadErr) {
+            console.error('Cloudinary PDF upload greška:', pdfUploadErr);
           }
-        } else {
+        } else if (imageAttachment) {
           try {
-            console.log("Uslikavam HTML mail...");
-            const htmlContent = mail.html || `<div style="font-family: Arial; padding: 20px; white-space: pre-wrap;">${mail.text || subject}</div>`;
-            const browser = await puppeteer.launch({
+            const uploadResult = await uploadBufferToCloudinary(imageAttachment.content, `ura_image_${Date.now()}`, 'image');
+            finalFileUrl = uploadResult.secure_url;
+            imageUrl = finalFileUrl;
+            sourceType = originalHtmlUrl ? 'IMAGE+HTML' : 'IMAGE';
+            hasValidSource = true;
+          } catch (imageUploadErr) {
+            console.error('Cloudinary image upload greška:', imageUploadErr);
+          }
+        }
+
+        if (!hasValidSource && originalHtmlUrl) {
+          finalFileUrl = originalHtmlUrl;
+          sourceType = 'HTML';
+          hasValidSource = true;
+          console.log('Inbound invoice: using HTML as primary source');
+
+          let browser;
+          try {
+            browser = await puppeteer.launch({
               headless: true,
               args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage', 
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
                 '--single-process',
                 '--disable-gpu',
                 '--no-zygote',
@@ -1122,43 +1144,49 @@ async function fetchInboundInvoicesFromEmail() {
               ]
             });
             const page = await browser.newPage();
-            await page.setContent(htmlContent, { waitUntil: 'domcontentloaded', timeout: 20000 });
-            
+            await page.setContent(mail.html, { waitUntil: 'domcontentloaded', timeout: 20000 });
             const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
-            await browser.close();
-
-            const fName = `ura_sken_${Date.now()}`;
-            const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'auto');
-            finalFileUrl = uploadResult.secure_url;
-            pdfPreviewUrl = finalFileUrl;
-            sourceType = mail.html ? 'HTML' : 'TEXT';
-            finalNote = 'Iz maila (Skenirano)';
+            const uploadResult = await uploadBufferToCloudinary(pdfBuffer, `ura_html_preview_${Date.now()}`, 'auto');
+            pdfPreviewUrl = uploadResult.secure_url;
           } catch (puppeteerErr) {
-            console.error("Puppeteer greška, spašavam kao običan tekst:", puppeteerErr);
-            try {
-              const fName = `ura_tekst_${Date.now()}`;
-              const doc = new PDFDocument({ margin: 40, size: 'A4' });
-              let buffers = [];
-              doc.on('data', buffers.push.bind(buffers));
-              const uploadPromise = new Promise((resolve, reject) => {
-                  doc.on('end', async () => {
-                      try {
-                          let pdfData = Buffer.concat(buffers);
-                          const result = await uploadBufferToCloudinary(pdfData, fName, 'auto');
-                          resolve(result.secure_url);
-                      } catch(err) { reject(err); }
-                  });
-              });
-              doc.fontSize(16).text('Sadržaj e-maila (Tekstualni format)', { align: 'center' }).moveDown(2);
-              doc.fontSize(10).text(fixText(mail.text || 'E-mail ne sadrži HTML ili se slike nisu mogle učitati.'));
-              doc.end();
-              finalFileUrl = await uploadPromise;
-              pdfPreviewUrl = finalFileUrl;
-              sourceType = originalHtmlUrl ? 'HTML+TEXT' : 'TEXT';
-            } catch(fallbackErr) { console.error(fallbackErr); }
+            console.error('Puppeteer HTML preview greška, originalni HTML ostaje spremljen:', puppeteerErr);
+          } finally {
+            if (browser) {
+              await browser.close().catch((closeErr) => console.error('Puppeteer close greška:', closeErr));
+            }
           }
         }
 
+        if (hasValidSource) {
+          console.log('Inbound invoice: fallback skipped because valid source exists');
+        }
+
+        if (!hasValidSource) {
+          console.log('Inbound invoice: plain text fallback used');
+          try {
+            const fName = `ura_tekst_${Date.now()}`;
+            const doc = new PDFDocument({ margin: 40, size: 'A4' });
+            let buffers = [];
+            doc.on('data', buffers.push.bind(buffers));
+            const uploadPromise = new Promise((resolve, reject) => {
+              doc.on('end', async () => {
+                try {
+                  let pdfData = Buffer.concat(buffers);
+                  const result = await uploadBufferToCloudinary(pdfData, fName, 'auto');
+                  resolve(result.secure_url);
+                } catch (err) { reject(err); }
+              });
+            });
+            doc.fontSize(16).text('Sadržaj e-maila (Tekstualni format)', { align: 'center' }).moveDown(2);
+            doc.fontSize(10).text(fixText(mail.text || 'E-mail ne sadrži PDF, HTML ili sliku računa.'));
+            doc.end();
+            finalFileUrl = await uploadPromise;
+            pdfPreviewUrl = finalFileUrl;
+            sourceType = 'TEXT';
+          } catch (fallbackErr) {
+            console.error('Plain text fallback greška:', fallbackErr);
+          }
+        }
         await pool.query(
           "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived, original_pdf_url, original_html_url, pdf_preview_url, image_url, source_type) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false, $8, $9, $10, $11, $12)",
           [supplierName, senderAddress, finalNote === subject ? 'Iz maila' : finalNote, extractedAmount, finalFileUrl, subject, dateStr, originalPdfUrl, originalHtmlUrl, pdfPreviewUrl, imageUrl, sourceType]

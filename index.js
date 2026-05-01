@@ -1478,41 +1478,281 @@ app.post('/inbound-invoices', async (req, res) => {
 app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
   try {
     const { status } = req.body;
-    const id = String(req.params.id).split('-')[0];
-    const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
+    const id = parseInt(String(req.params.id).split('-')[0], 10);
 
-    let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
-    
-    if (targetStatus === 'ARHIVIRANI') {
-        query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
-    } else if (targetStatus === 'POVRATI') {
-        query = 'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *';
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ error: 'Neispravan ID računa.' });
     }
 
-    const result = await pool.query(query, [targetStatus, id]);
-    
-    if (result.rows.length === 0) {
+    const requestedStatus = String(status || '').trim().toUpperCase();
+    const targetStatus =
+      requestedStatus === 'STORNO' || requestedStatus === 'POVRAT ROBE'
+        ? 'POVRATI'
+        : requestedStatus;
+
+    const existingResult = await pool.query(
+      'SELECT * FROM inbound_invoices WHERE id = $1 LIMIT 1',
+      [id]
+    );
+
+    if (existingResult.rows.length === 0) {
       return res.status(404).json({ error: 'Račun nije pronađen.' });
     }
-    
-    const invData = result.rows[0];
 
-    if (targetStatus === 'POVRATI' && !invData.storno_url) {
+    const existingInvoice = existingResult.rows[0];
+
+    if (targetStatus === 'POVRATI') {
+      if (existingInvoice.original_invoice_id) {
+        const updatedStornoResult = await pool.query(
+          "UPDATE inbound_invoices SET status = 'POVRATI', archived = false WHERE id = $1 RETURNING *",
+          [id]
+        );
+
+        return res.json({
+          success: true,
+          invoice: updatedStornoResult.rows[0]
+        });
+      }
+
+      const existingStornoResult = await pool.query(
+        "SELECT * FROM inbound_invoices WHERE original_invoice_id = $1 ORDER BY id DESC LIMIT 1",
+        [id]
+      );
+
+      if (existingStornoResult.rows.length > 0) {
+        const existingStorno = existingStornoResult.rows[0];
+
+        await pool.query(
+          "UPDATE inbound_invoices SET status = 'ARHIVIRANI', archived = true, storno_url = $1 WHERE id = $2",
+          [existingStorno.storno_url || existingStorno.file_url || existingInvoice.storno_url || '', id]
+        );
+
+        return res.json({
+          success: true,
+          invoice: existingStorno
+        });
+      }
+
       const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
       const filePath = path.join(__dirname, 'uploads', fileName);
-      await generateUraStornoPDF(invData, filePath); 
-      const uploadResult = await cloudinary.uploader.upload(filePath, { folder: 'kisfaluba_ura', resource_type: 'image' });
-      await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [uploadResult.secure_url, id]);
-      invData.storno_url = uploadResult.secure_url;
+
+      await generateUraStornoPDF(existingInvoice, filePath);
+
+      const uploadResult = await cloudinary.uploader.upload(filePath, {
+        folder: 'kisfaluba_ura',
+        resource_type: 'auto'
+      });
+
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+
+      const stornoUrl = uploadResult.secure_url;
+      const originalInvoiceNumber = existingInvoice.invoice_number || `URA-${existingInvoice.id}`;
+      const stornoInvoiceNumber = String(originalInvoiceNumber).toUpperCase().includes('STORNO')
+        ? String(originalInvoiceNumber)
+        : `STORNO-${originalInvoiceNumber}`;
+
+      const negativeAmount = -Math.abs(toNumberSafe(existingInvoice.amount));
+      const stornoDate = new Date().toLocaleDateString('hr-HR');
+      const stornoNote = `STORNO / POVRAT za ulazni račun ${originalInvoiceNumber}`;
+
+      const stornoInsertResult = await pool.query(
+        `INSERT INTO inbound_invoices
+          (supplier, supplier_email, invoice_number, amount, file_url, storno_url, note, date, status, archived, original_invoice_id)
+         VALUES
+          ($1, $2, $3, $4, $5, $6, $7, $8, 'POVRATI', false, $9)
+         RETURNING *`,
+        [
+          existingInvoice.supplier || '',
+          existingInvoice.supplier_email || '',
+          stornoInvoiceNumber,
+          negativeAmount,
+          stornoUrl,
+          stornoUrl,
+          stornoNote,
+          stornoDate,
+          id
+        ]
+      );
+
+      await pool.query(
+        "UPDATE inbound_invoices SET status = 'ARHIVIRANI', archived = true, storno_url = $1 WHERE id = $2",
+        [stornoUrl, id]
+      );
+
+      return res.json({
+        success: true,
+        invoice: stornoInsertResult.rows[0]
+      });
     }
 
-    res.json({ success: true, invoice: invData });
+    if (targetStatus === 'STORNO ARHIVA') {
+      const result = await pool.query(
+        "UPDATE inbound_invoices SET status = 'STORNO ARHIVA', archived = true WHERE id = $1 RETURNING *",
+        [id]
+      );
+
+      return res.json({
+        success: true,
+        invoice: result.rows[0]
+      });
+    }
+
+    if (targetStatus === 'ARHIVIRANI') {
+      const result = await pool.query(
+        "UPDATE inbound_invoices SET status = 'ARHIVIRANI', archived = true WHERE id = $1 RETURNING *",
+        [id]
+      );
+
+      return res.json({
+        success: true,
+        invoice: result.rows[0]
+      });
+    }
+
+    const result = await pool.query(
+      'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *',
+      [targetStatus, id]
+    );
+
+    return res.json({
+      success: true,
+      invoice: result.rows[0]
+    });
   } catch (err) {
-    console.error("Greška pri ažuriranju statusa:", err);
+    console.error('Greška pri ažuriranju statusa URA:', err);
     res.status(500).json({ error: 'Greška u bazi.' });
   }
 });
 
+app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const id = parseInt(String(req.params.id).split('-')[0], 10);
+
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ error: 'Neispravan ID računa.' });
+    }
+
+    const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
+
+    if (targetStatus === 'POVRATI') {
+      const originalResult = await pool.query(
+        'SELECT * FROM inbound_invoices WHERE id = $1 LIMIT 1',
+        [id]
+      );
+
+      if (originalResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Račun nije pronađen.' });
+      }
+
+      const originalInvoice = originalResult.rows[0];
+
+      if (originalInvoice.original_invoice_id) {
+        const updatedStornoResult = await pool.query(
+          "UPDATE inbound_invoices SET status = 'POVRATI', archived = false WHERE id = $1 RETURNING *",
+          [id]
+        );
+
+        return res.json({
+          success: true,
+          invoice: updatedStornoResult.rows[0],
+          stornoInvoice: updatedStornoResult.rows[0]
+        });
+      }
+
+      const existingStornoResult = await pool.query(
+        'SELECT * FROM inbound_invoices WHERE original_invoice_id = $1 ORDER BY id DESC LIMIT 1',
+        [id]
+      );
+
+      if (existingStornoResult.rows.length > 0) {
+        const existingStorno = existingStornoResult.rows[0];
+
+        const updatedOriginalResult = await pool.query(
+          "UPDATE inbound_invoices SET status = 'ARHIVIRANI', archived = true, storno_url = $1 WHERE id = $2 RETURNING *",
+          [existingStorno.storno_url || existingStorno.file_url || originalInvoice.storno_url || '', id]
+        );
+
+        const updatedStornoResult = await pool.query(
+          "UPDATE inbound_invoices SET status = 'POVRATI', archived = false WHERE id = $1 RETURNING *",
+          [existingStorno.id]
+        );
+
+        return res.json({
+          success: true,
+          invoice: updatedOriginalResult.rows[0],
+          stornoInvoice: updatedStornoResult.rows[0]
+        });
+      }
+
+      const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
+      const filePath = path.join(__dirname, 'uploads', fileName);
+
+      await generateUraStornoPDF(originalInvoice, filePath);
+
+      const uploadResult = await cloudinary.uploader.upload(filePath, {
+        folder: 'kisfaluba_ura',
+        resource_type: 'image'
+      });
+
+      const stornoUrl = uploadResult.secure_url;
+      const originalInvoiceNumber = originalInvoice.invoice_number || `URA-${originalInvoice.id}`;
+      const stornoInvoiceNumber = String(originalInvoiceNumber).toUpperCase().includes('STORNO')
+        ? String(originalInvoiceNumber)
+        : `STORNO-${originalInvoiceNumber}`;
+
+      const stornoInsertResult = await pool.query(
+        `INSERT INTO inbound_invoices
+          (supplier, supplier_email, invoice_number, amount, file_url, storno_url, note, date, status, archived, original_invoice_id)
+         VALUES
+          ($1, $2, $3, $4, $5, $6, $7, $8, 'POVRATI', false, $9)
+         RETURNING *`,
+        [
+          originalInvoice.supplier || '',
+          originalInvoice.supplier_email || '',
+          stornoInvoiceNumber,
+          -Math.abs(toNumberSafe(originalInvoice.amount)),
+          stornoUrl,
+          stornoUrl,
+          `Storno / povrat za ulazni račun ${originalInvoiceNumber}. Original ID: ${originalInvoice.id}`,
+          new Date().toLocaleDateString('hr-HR'),
+          originalInvoice.id
+        ]
+      );
+
+      const stornoInvoice = stornoInsertResult.rows[0];
+
+      const updatedOriginalResult = await pool.query(
+        "UPDATE inbound_invoices SET status = 'ARHIVIRANI', archived = true, storno_url = $1 WHERE id = $2 RETURNING *",
+        [stornoUrl, id]
+      );
+
+      return res.json({
+        success: true,
+        invoice: updatedOriginalResult.rows[0],
+        stornoInvoice
+      });
+    }
+
+    const shouldArchive = targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA';
+
+    const result = await pool.query(
+      'UPDATE inbound_invoices SET status = $1, archived = $2 WHERE id = $3 RETURNING *',
+      [targetStatus, shouldArchive, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Račun nije pronađen.' });
+    }
+
+    return res.json({ success: true, invoice: result.rows[0] });
+  } catch (err) {
+    console.error('Greška pri ažuriranju statusa URA:', err);
+    res.status(500).json({ error: 'Greška u bazi.' });
+  }
+});
 app.post('/inbound-invoices/archive', authGuard, async (req, res) => {
   try {
     const { invoiceIds } = req.body;
@@ -1550,39 +1790,106 @@ app.patch('/inbound-invoices/:id/file', authGuard, async (req, res) => {
 
 app.post('/api/send-ura-storno', authGuard, async (req, res) => {
   const { id, supplierEmail } = req.body;
+
   try {
-    const cleanId = String(id).split('-')[0];
-    const result = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [cleanId]);
-    if (result.rows.length === 0) return res.status(404).json({error: 'Nema računa'});
-    const inv = result.rows[0];
+    const cleanId = parseInt(String(id).split('-')[0], 10);
 
-    const pdfLink = inv.storno_url || inv.file_url;
-    if (!pdfLink) return res.status(400).json({ error: 'Nema PDF dokumenta. Prvo storniraj račun!' });
-
-    const finalEmail = (inv.supplier_email && inv.supplier_email.includes('@')) ? inv.supplier_email : supplierEmail;
-
-    if (finalEmail && finalEmail.includes('@')) {
-      let siguranBroj = inv.invoice_number ? String(inv.invoice_number).trim() : `URA-${inv.id}`;
-      const stornoNumber = siguranBroj.toUpperCase().includes('STORNO') ? siguranBroj : `STORNO-${siguranBroj}`;
-
-      await transporter.sendMail({
-        from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
-        to: finalEmail,
-        subject: `Storno / Povratnica - ${stornoNumber}`,
-        html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU</h2><p>Poštovani,</p><p>U privitku Vam dostavljamo službeni storno dokument za povrat robe.</p></div>`,
-        attachments: [
-          {
-            filename: `${stornoNumber}.pdf`,
-            path: pdfLink
-          }
-        ]
-      });
+    if (!cleanId) {
+      return res.status(400).json({ error: 'Nedostaje ID računa.' });
     }
-    
-    res.json({ success: true, message: 'Storno mail je uspješno poslan dobavljaču s privitkom!', fileUrl: pdfLink });
-  } catch (error) { 
-    console.error("Greška pri slanju storno maila dobavljaču:", error);
-    res.status(500).json({ error: 'Greška servera pri slanju e-maila.' }); 
+
+    const invoiceResult = await pool.query(
+      'SELECT * FROM inbound_invoices WHERE id = $1 LIMIT 1',
+      [cleanId]
+    );
+
+    if (invoiceResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Račun nije pronađen.' });
+    }
+
+    const selectedInvoice = invoiceResult.rows[0];
+
+    let originalInvoice = selectedInvoice;
+    let stornoInvoice = selectedInvoice;
+
+    if (!selectedInvoice.original_invoice_id) {
+      const stornoResult = await pool.query(
+        "SELECT * FROM inbound_invoices WHERE original_invoice_id = $1 AND status IN ('POVRATI', 'STORNO ARHIVA') ORDER BY id DESC LIMIT 1",
+        [selectedInvoice.id]
+      );
+
+      if (stornoResult.rows.length === 0) {
+        return res.status(400).json({ error: 'Storno zapis nije pronađen. Prvo pošalji račun u POVRATI.' });
+      }
+
+      stornoInvoice = stornoResult.rows[0];
+      originalInvoice = selectedInvoice;
+    } else {
+      const originalResult = await pool.query(
+        'SELECT * FROM inbound_invoices WHERE id = $1 LIMIT 1',
+        [selectedInvoice.original_invoice_id]
+      );
+
+      if (originalResult.rows.length > 0) {
+        originalInvoice = originalResult.rows[0];
+      }
+    }
+
+    const pdfLink = stornoInvoice.storno_url || stornoInvoice.file_url;
+
+    if (!pdfLink) {
+      return res.status(400).json({ error: 'Storno dokument nema PDF/link. Prvo napravi storno.' });
+    }
+
+    const finalEmail =
+      originalInvoice.supplier_email && originalInvoice.supplier_email.includes('@')
+        ? originalInvoice.supplier_email
+        : supplierEmail;
+
+    if (!finalEmail || !finalEmail.includes('@')) {
+      return res.status(400).json({ error: 'Dobavljač nema ispravnu email adresu.' });
+    }
+
+    const originalNumber = originalInvoice.invoice_number
+      ? String(originalInvoice.invoice_number).trim()
+      : `URA-${originalInvoice.id}`;
+
+    const stornoNumber = stornoInvoice.invoice_number
+      ? String(stornoInvoice.invoice_number).trim()
+      : `STORNO-${originalNumber}`;
+
+    await transporter.sendMail({
+      from: `"KIŠFALUBA j.d.o.o." <${process.env.EMAIL_USER}>`,
+      to: finalEmail,
+      bcc: process.env.EMAIL_USER,
+      subject: `Storno / Povratnica - ${stornoNumber}`,
+      html: `<div style="font-family: Arial; padding: 20px;"><h2>OBAVIJEST O POVRATU</h2><p>Poštovani,</p><p>U privitku Vam dostavljamo službeni storno dokument za povrat robe.</p><p>Dokument je vezan uz ulazni račun broj: <strong>${escapeHtml(originalNumber)}</strong>.</p></div>`,
+      attachments: [
+        {
+          filename: `${stornoNumber}.pdf`,
+          path: pdfLink
+        }
+      ]
+    });
+
+    await pool.query(
+      "UPDATE inbound_invoices SET status = 'STORNO ARHIVA', archived = true WHERE id = $1",
+      [stornoInvoice.id]
+    );
+
+    await pool.query(
+      "UPDATE inbound_invoices SET archived = true, storno_url = COALESCE(storno_url, $1) WHERE id = $2",
+      [pdfLink, originalInvoice.id]
+    );
+
+    res.json({
+      success: true,
+      message: 'Storno mail je uspješno poslan dobavljaču i spremljen u STORNO ARHIVA.',
+      fileUrl: pdfLink
+    });
+  } catch (error) {
+    console.error('Greška pri slanju URA storna dobavljaču:', error);
+    res.status(500).json({ error: 'Greška servera pri slanju e-maila.' });
   }
 });
 

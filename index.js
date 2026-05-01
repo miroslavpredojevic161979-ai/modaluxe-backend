@@ -98,6 +98,7 @@ const initDB = async () => {
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS supplier_email VARCHAR(255)");
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS image_url VARCHAR(1024)");
+    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS original_invoice_id INTEGER");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount JSONB DEFAULT '{\"amount\": 0}'::jsonb");
@@ -1037,6 +1038,76 @@ async function fetchInboundInvoicesFromEmail() {
   }
 }
 
+const buildInboundStornoNumber = (invoiceNumber, originalId) => {
+  const safeNumber = String(invoiceNumber || `URA-${originalId}`).trim();
+  return safeNumber.toUpperCase().includes('STORNO') ? safeNumber : `STORNO-${safeNumber}`;
+};
+
+const ensureInboundStornoPdf = async (originalInvoice) => {
+  if (originalInvoice.storno_url) return originalInvoice.storno_url;
+
+  const fileName = `ura_storno_${originalInvoice.id}_${Date.now()}.pdf`;
+  const filePath = path.join(__dirname, 'uploads', fileName);
+  await generateUraStornoPDF(originalInvoice, filePath);
+
+  const uploadResult = await cloudinary.uploader.upload(filePath, {
+    folder: 'kisfaluba_ura',
+    resource_type: 'image'
+  });
+
+  try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
+  return uploadResult.secure_url;
+};
+
+const createOrRefreshInboundStornoRecord = async (originalInvoice, stornoUrl) => {
+  const stornoNumber = buildInboundStornoNumber(originalInvoice.invoice_number, originalInvoice.id);
+  const stornoAmount = -Math.abs(Number(originalInvoice.amount || 0));
+  const stornoDate = new Date().toLocaleDateString('hr-HR');
+  const stornoNote = originalInvoice.note
+    ? `STORNO | ${originalInvoice.note}`
+    : `STORNO za racun ${originalInvoice.invoice_number || originalInvoice.id}`;
+
+  const existingStorno = await pool.query(
+    'SELECT * FROM inbound_invoices WHERE original_invoice_id = $1 ORDER BY id DESC LIMIT 1',
+    [originalInvoice.id]
+  );
+
+  if (existingStorno.rows.length > 0) {
+    const refreshed = await pool.query(
+      "UPDATE inbound_invoices SET supplier = $1, supplier_email = $2, invoice_number = $3, amount = $4, file_url = $5, storno_url = $6, note = $7, date = $8, status = 'POVRATI', archived = false WHERE id = $9 RETURNING *",
+      [
+        originalInvoice.supplier,
+        originalInvoice.supplier_email || '',
+        stornoNumber,
+        stornoAmount,
+        stornoUrl,
+        stornoUrl,
+        stornoNote,
+        stornoDate,
+        existingStorno.rows[0].id
+      ]
+    );
+    return refreshed.rows[0];
+  }
+
+  const inserted = await pool.query(
+    "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, storno_url, note, date, status, archived, original_invoice_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'POVRATI', false, $9) RETURNING *",
+    [
+      originalInvoice.supplier,
+      originalInvoice.supplier_email || '',
+      stornoNumber,
+      stornoAmount,
+      stornoUrl,
+      stornoUrl,
+      stornoNote,
+      stornoDate,
+      originalInvoice.id
+    ]
+  );
+
+  return inserted.rows[0];
+};
+
 const generateUraStornoPDF = (inv, filePath) => {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 40, size: 'A4' });
@@ -1432,32 +1503,46 @@ app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
     const { status } = req.body;
     const id = String(req.params.id).split('-')[0];
     const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
-    let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
+    const currentResult = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
 
-    if (targetStatus === 'ARHIVIRANI') {
-      query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
-    } else if (targetStatus === 'POVRATI') {
-      query = 'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *';
-    }
-
-    const result = await pool.query(query, [targetStatus, id]);
-
-    if (result.rows.length === 0) {
+    if (currentResult.rows.length === 0) {
       return res.status(404).json({ error: 'Račun nije pronađen.' });
     }
 
-    const invData = result.rows[0];
+    const currentInvoice = currentResult.rows[0];
 
-    if (targetStatus === 'POVRATI' && !invData.storno_url) {
-      const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
-      const filePath = path.join(__dirname, 'uploads', fileName);
-      await generateUraStornoPDF(invData, filePath);
-      const uploadResult = await cloudinary.uploader.upload(filePath, { folder: 'kisfaluba_ura', resource_type: 'image' });
-      await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [uploadResult.secure_url, id]);
-      invData.storno_url = uploadResult.secure_url;
+    if (targetStatus === 'POVRATI') {
+      if (currentInvoice.original_invoice_id) {
+        const stornoResult = await pool.query(
+          "UPDATE inbound_invoices SET status = 'POVRATI', archived = false WHERE id = $1 RETURNING *",
+          [id]
+        );
+        return res.json({ success: true, invoice: stornoResult.rows[0] });
+      }
+
+      const stornoUrl = await ensureInboundStornoPdf(currentInvoice);
+      const archivedOriginalResult = await pool.query(
+        "UPDATE inbound_invoices SET storno_url = $1, status = 'ARHIVIRANI', archived = true WHERE id = $2 RETURNING *",
+        [stornoUrl, id]
+      );
+      const archivedOriginal = archivedOriginalResult.rows[0];
+      const stornoInvoice = await createOrRefreshInboundStornoRecord(archivedOriginal, stornoUrl);
+
+      return res.json({
+        success: true,
+        invoice: archivedOriginal,
+        stornoInvoice
+      });
     }
 
-    res.json({ success: true, invoice: invData });
+    let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
+
+    if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA') {
+      query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
+    }
+
+    const result = await pool.query(query, [targetStatus, id]);
+    res.json({ success: true, invoice: result.rows[0] });
   } catch (err) {
     console.error("Greška pri ažuriranju statusa:", err);
     res.status(500).json({ error: 'Greška u bazi.' });
@@ -1505,12 +1590,29 @@ app.post('/api/send-ura-storno', authGuard, async (req, res) => {
     const cleanId = String(id).split('-')[0];
     const result = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [cleanId]);
     if (result.rows.length === 0) return res.status(404).json({error: 'Nema računa'});
-    const inv = result.rows[0];
+    const currentInvoice = result.rows[0];
 
-    const pdfLink = inv.storno_url || inv.file_url;
+    let inv = currentInvoice;
+    if (!currentInvoice.original_invoice_id) {
+      const stornoResult = await pool.query(
+        'SELECT * FROM inbound_invoices WHERE original_invoice_id = $1 ORDER BY id DESC LIMIT 1',
+        [currentInvoice.id]
+      );
+      if (stornoResult.rows.length > 0) {
+        inv = stornoResult.rows[0];
+      }
+    }
+
+    const originalInvoice = inv.original_invoice_id
+      ? (await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [inv.original_invoice_id])).rows[0] || currentInvoice
+      : currentInvoice;
+
+    const pdfLink = inv.file_url || inv.storno_url || originalInvoice.storno_url || originalInvoice.file_url;
     if (!pdfLink) return res.status(400).json({ error: 'Nema PDF dokumenta. Prvo storniraj račun!' });
 
-    const finalEmail = (inv.supplier_email && inv.supplier_email.includes('@')) ? inv.supplier_email : supplierEmail;
+    const finalEmail = (originalInvoice.supplier_email && originalInvoice.supplier_email.includes('@'))
+      ? originalInvoice.supplier_email
+      : ((inv.supplier_email && inv.supplier_email.includes('@')) ? inv.supplier_email : supplierEmail);
 
     if (finalEmail && finalEmail.includes('@')) {
       let siguranBroj = inv.invoice_number ? String(inv.invoice_number).trim() : `URA-${inv.id}`;

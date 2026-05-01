@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const axios = require('axios');
 const rateLimit = require('express-rate-limit');
 require('dotenv').config();
@@ -97,12 +97,7 @@ const initDB = async () => {
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS supplier_email VARCHAR(255)");
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
-    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS original_pdf_url VARCHAR(1024)");
-    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS original_html_url VARCHAR(1024)");
-    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS pdf_preview_url VARCHAR(1024)");
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS image_url VARCHAR(1024)");
-    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS source_type VARCHAR(32)");
-    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS storno_at TIMESTAMP");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount JSONB DEFAULT '{\"amount\": 0}'::jsonb");
@@ -156,105 +151,6 @@ const escapeHtml = (v) => {
   return String(v).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;');
 };
 
-const normalizeInboundStatus = (status) => String(status || 'DOLAZNI').trim().toUpperCase();
-
-const isInboundStornoStatus = (status) =>
-  ['POVRATI', 'STORNO', 'STORNO ARHIVA', 'POVRAT ROBE', 'PONISTENO', 'PONIŠTENO', 'CANCELED', 'CANCELLED', 'OTKAZANO'].includes(normalizeInboundStatus(status));
-
-const getInboundSourceType = (inv = {}) => {
-  const explicitType = String(inv.source_type || '').trim();
-  if (explicitType) return explicitType.toUpperCase();
-  if (inv.original_pdf_url || (inv.file_url && String(inv.file_url).toLowerCase().includes('.pdf'))) return 'PDF';
-  if (inv.original_html_url) return 'HTML';
-  if (inv.image_url) return 'IMAGE';
-  if (inv.pdf_preview_url || inv.file_url) return 'PDF PREVIEW';
-  return 'TEXT';
-};
-
-const htmlDocLink = (url, label) => {
-  if (!url) return '<span style="color:#999;">Nema</span>';
-  const safeUrl = escapeHtml(url);
-  return `<a href="${safeUrl}" style="color:#1a5fb4; font-weight:700;">${escapeHtml(label)}</a>`;
-};
-
-const buildInboundBookkeepingHtml = (invoices = []) => {
-  const activeInvoices = invoices.filter((inv) => {
-    const status = normalizeInboundStatus(inv.status);
-    return !isInboundStornoStatus(status) && !inv.archived && status !== 'ARHIVIRANI';
-  });
-  const stornoInvoices = invoices.filter((inv) => isInboundStornoStatus(inv.status));
-
-  const renderRows = (rows, isStornoSection = false) => {
-    if (!rows.length) {
-      return '<tr><td colspan="11" style="padding:14px; color:#777; text-align:center;">Nema računa u ovoj sekciji.</td></tr>';
-    }
-
-    return rows.map((inv) => {
-      const status = normalizeInboundStatus(inv.status);
-      const sourceType = getInboundSourceType(inv);
-      const originalPdf = inv.original_pdf_url || (sourceType === 'PDF' ? inv.file_url : null);
-      const originalHtml = inv.original_html_url || null;
-      const pdfPreview = inv.pdf_preview_url || (!originalPdf && inv.file_url ? inv.file_url : null);
-      const imageUrl = inv.image_url || (sourceType === 'IMAGE' ? inv.file_url : null);
-      const stornoDate = inv.storno_at ? new Date(inv.storno_at).toLocaleDateString('hr-HR') : '';
-
-      return `
-        <tr>
-          <td>${escapeHtml(inv.id)}</td>
-          <td>${escapeHtml(inv.date || '')}</td>
-          <td>${escapeHtml(isStornoSection ? stornoDate || 'Nije upisano' : '')}</td>
-          <td>${escapeHtml(inv.note || '')}</td>
-          <td>${escapeHtml(inv.supplier || '')}</td>
-          <td>${escapeHtml(sourceType)}</td>
-          <td>${escapeHtml(status)}</td>
-          <td>${htmlDocLink(originalPdf, 'Original PDF')}</td>
-          <td>${htmlDocLink(originalHtml, 'Original HTML')}</td>
-          <td>${htmlDocLink(pdfPreview || imageUrl, imageUrl && !pdfPreview ? 'Slika' : 'PDF preview')}</td>
-          <td>${isStornoSection ? 'Račun je storniran/poništen i nije uključen među aktivne troškove.' : ''}</td>
-        </tr>
-      `;
-    }).join('');
-  };
-
-  return `<!doctype html>
-  <html lang="hr">
-    <head>
-      <meta charset="utf-8" />
-      <title>Izvještaj ulaznih računa</title>
-      <style>
-        body { font-family: Arial, sans-serif; color: #111; padding: 24px; }
-        h1 { font-size: 22px; margin-bottom: 20px; }
-        h2 { font-size: 18px; margin-top: 28px; border-bottom: 2px solid #111; padding-bottom: 8px; }
-        table { border-collapse: collapse; width: 100%; margin-top: 12px; font-size: 12px; }
-        th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
-        th { background: #f5f5f5; text-align: left; }
-        .storno th { background: #fff1f1; }
-      </style>
-    </head>
-    <body>
-      <h1>Izvještaj ulaznih računa - KIŠFALUBA</h1>
-      <h2>AKTIVNI ULAZNI RAČUNI</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>ID</th><th>Datum zaprimanja</th><th>Datum storna</th><th>Subject emaila</th><th>Dobavljač</th><th>Tip izvora</th><th>Status</th><th>Originalni PDF</th><th>Originalni HTML</th><th>PDF preview / slika</th><th>Napomena</th>
-          </tr>
-        </thead>
-        <tbody>${renderRows(activeInvoices, false)}</tbody>
-      </table>
-
-      <h2>STORNO / PONIŠTENI ULAZNI RAČUNI</h2>
-      <table class="storno">
-        <thead>
-          <tr>
-            <th>ID</th><th>Datum zaprimanja</th><th>Datum storna</th><th>Subject emaila</th><th>Dobavljač</th><th>Tip izvora</th><th>Status</th><th>Originalni PDF</th><th>Originalni HTML</th><th>PDF preview / slika</th><th>Napomena</th>
-          </tr>
-        </thead>
-        <tbody>${renderRows(stornoInvoices, true)}</tbody>
-      </table>
-    </body>
-  </html>`;
-};
 
 const normalizeNumberInput = (value) => {
   if (value === null || value === undefined) return '';
@@ -544,12 +440,6 @@ const uploadBufferToCloudinary = (buffer, filename, resourceType = 'auto') => {
   });
 };
 
-const uploadInboundHtmlSnapshot = async (htmlContent, filename) => {
-  if (!htmlContent) return null;
-  const htmlBuffer = Buffer.from(String(htmlContent), 'utf8');
-  const uploadResult = await uploadBufferToCloudinary(htmlBuffer, `${filename}.html`, 'raw');
-  return uploadResult.secure_url;
-};
 
 // --- MAIL TRANSPORTER ---
 const transporter = nodemailer.createTransport({
@@ -1064,107 +954,47 @@ async function fetchInboundInvoicesFromEmail() {
         if (isNaN(extractedAmount)) extractedAmount = 0;
 
         const attachments = mail.attachments || [];
-        const isPdfAttachment = (attr) => {
-          const attachmentName = String(attr.filename || '').toLowerCase();
-          const attachmentType = String(attr.contentType || '').toLowerCase();
-          return attachmentType === 'application/pdf' || attachmentName.endsWith('.pdf');
-        };
-        const isImageAttachment = (attr) => {
-          const attachmentName = String(attr.filename || '').toLowerCase();
-          const attachmentType = String(attr.contentType || '').toLowerCase();
-          return attachmentType.startsWith('image/') || /\.(jpg|jpeg|png)$/i.test(attachmentName);
-        };
-
-        const pdfAttachment = attachments.find(isPdfAttachment);
-        const imageAttachment = attachments.find(isImageAttachment);
-        const hasHtmlBody = Boolean(mail.html && String(mail.html).trim());
-
-        if (pdfAttachment) console.log('Inbound invoice: PDF attachment detected');
-        if (hasHtmlBody) console.log('Inbound invoice: HTML body detected');
-        if (imageAttachment) console.log('Inbound invoice: image attachment detected');
+        const pdfAttachment = attachments.find((attr) => {
+          const contentType = String(attr.contentType || '').toLowerCase();
+          const filename = String(attr.filename || '').toLowerCase();
+          return contentType === 'application/pdf' || filename.endsWith('.pdf');
+        });
+        const htmlAttachment = attachments.find((attr) => {
+          const contentType = String(attr.contentType || '').toLowerCase();
+          const filename = String(attr.filename || '').toLowerCase();
+          return contentType === 'text/html' || contentType === 'application/xhtml+xml' || /\.(html|htm)$/.test(filename);
+        });
+        const imageAttachment = attachments.find((attr) => {
+          const contentType = String(attr.contentType || '').toLowerCase();
+          const filename = String(attr.filename || '').toLowerCase();
+          return contentType.startsWith('image/') || /\.(jpg|jpeg|png|webp)$/i.test(filename);
+        });
+        const htmlBody = typeof mail.html === 'string' && mail.html.trim() ? mail.html : '';
 
         let finalFileUrl = null;
         let finalNote = subject;
-        let originalPdfUrl = null;
-        let originalHtmlUrl = null;
-        let pdfPreviewUrl = null;
-        let imageUrl = null;
-        let sourceType = 'TEXT';
-        let hasValidSource = false;
 
-        if (hasHtmlBody) {
-          try {
-            originalHtmlUrl = await uploadInboundHtmlSnapshot(mail.html, `ura_html_${Date.now()}`);
-          } catch (htmlUploadErr) {
-            console.error('Cloudinary HTML upload greška:', htmlUploadErr);
-          }
-        }
-
-        if (pdfAttachment) {
-          try {
-            const uploadResult = await uploadBufferToCloudinary(pdfAttachment.content, `ura_pdf_${Date.now()}`, 'auto');
+        try {
+          if (pdfAttachment) {
+            const uploadResult = await uploadBufferToCloudinary(pdfAttachment.content, 'ura_pdf_' + Date.now(), 'auto');
             finalFileUrl = uploadResult.secure_url;
-            originalPdfUrl = finalFileUrl;
-            sourceType = originalHtmlUrl ? 'PDF+HTML' : 'PDF';
-            hasValidSource = true;
-            console.log('Inbound invoice: using PDF as primary source');
-          } catch (pdfUploadErr) {
-            console.error('Cloudinary PDF upload greška:', pdfUploadErr);
-          }
-        } else if (imageAttachment) {
-          try {
-            const uploadResult = await uploadBufferToCloudinary(imageAttachment.content, `ura_image_${Date.now()}`, 'image');
+            finalNote = 'PDF račun';
+          } else if (htmlAttachment || htmlBody) {
+            const htmlBuffer = htmlAttachment
+              ? (Buffer.isBuffer(htmlAttachment.content)
+                  ? htmlAttachment.content
+                  : Buffer.from(String(htmlAttachment.content || ''), 'utf8'))
+              : Buffer.from(htmlBody, 'utf8');
+            const uploadResult = await uploadBufferToCloudinary(htmlBuffer, 'ura_html_' + Date.now() + '.html', 'raw');
             finalFileUrl = uploadResult.secure_url;
-            imageUrl = finalFileUrl;
-            sourceType = originalHtmlUrl ? 'IMAGE+HTML' : 'IMAGE';
-            hasValidSource = true;
-          } catch (imageUploadErr) {
-            console.error('Cloudinary image upload greška:', imageUploadErr);
-          }
-        }
-
-        if (!hasValidSource && originalHtmlUrl) {
-          finalFileUrl = originalHtmlUrl;
-          sourceType = 'HTML';
-          hasValidSource = true;
-          console.log('Inbound invoice: using HTML as primary source');
-
-          let browser;
-          try {
-            browser = await puppeteer.launch({
-              headless: true,
-              args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--single-process',
-                '--disable-gpu',
-                '--no-zygote',
-                '--disable-software-rasterizer'
-              ]
-            });
-            const page = await browser.newPage();
-            await page.setContent(mail.html, { waitUntil: 'domcontentloaded', timeout: 20000 });
-            const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
-            const uploadResult = await uploadBufferToCloudinary(pdfBuffer, `ura_html_preview_${Date.now()}`, 'auto');
-            pdfPreviewUrl = uploadResult.secure_url;
-          } catch (puppeteerErr) {
-            console.error('Puppeteer HTML preview greška, originalni HTML ostaje spremljen:', puppeteerErr);
-          } finally {
-            if (browser) {
-              await browser.close().catch((closeErr) => console.error('Puppeteer close greška:', closeErr));
-            }
-          }
-        }
-
-        if (hasValidSource) {
-          console.log('Inbound invoice: fallback skipped because valid source exists');
-        }
-
-        if (!hasValidSource) {
-          console.log('Inbound invoice: plain text fallback used');
-          try {
-            const fName = `ura_tekst_${Date.now()}`;
+            finalNote = 'HTML račun';
+          } else if (imageAttachment) {
+            const uploadResult = await uploadBufferToCloudinary(imageAttachment.content, 'ura_slika_' + Date.now(), 'image');
+            finalFileUrl = uploadResult.secure_url;
+            finalNote = 'Slika računa';
+          } else {
+            console.log('Nema PDF/HTML/slike, spremam tekstualni fallback...');
+            const fName = 'ura_tekst_' + Date.now();
             const doc = new PDFDocument({ margin: 40, size: 'A4' });
             let buffers = [];
             doc.on('data', buffers.push.bind(buffers));
@@ -1174,22 +1004,24 @@ async function fetchInboundInvoicesFromEmail() {
                   let pdfData = Buffer.concat(buffers);
                   const result = await uploadBufferToCloudinary(pdfData, fName, 'auto');
                   resolve(result.secure_url);
-                } catch (err) { reject(err); }
+                } catch (err) {
+                  reject(err);
+                }
               });
             });
-            doc.fontSize(16).text('Sadržaj e-maila (Tekstualni format)', { align: 'center' }).moveDown(2);
-            doc.fontSize(10).text(fixText(mail.text || 'E-mail ne sadrži PDF, HTML ili sliku računa.'));
+            doc.fontSize(16).text('Sadržaj e-maila (Tekstualni fallback)', { align: 'center' }).moveDown(2);
+            doc.fontSize(10).text(fixText(mail.text || subject || 'E-mail nema PDF, HTML ni sliku računa.'));
             doc.end();
             finalFileUrl = await uploadPromise;
-            pdfPreviewUrl = finalFileUrl;
-            sourceType = 'TEXT';
-          } catch (fallbackErr) {
-            console.error('Plain text fallback greška:', fallbackErr);
+            finalNote = 'Tekstualni fallback';
           }
+        } catch (sourceErr) {
+          console.error('Greška pri spremanju izvornog URA računa:', sourceErr);
         }
+
         await pool.query(
-          "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived, original_pdf_url, original_html_url, pdf_preview_url, image_url, source_type) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false, $8, $9, $10, $11, $12)",
-          [supplierName, senderAddress, finalNote === subject ? 'Iz maila' : finalNote, extractedAmount, finalFileUrl, subject, dateStr, originalPdfUrl, originalHtmlUrl, pdfPreviewUrl, imageUrl, sourceType]
+          "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, note, date, status, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DOLAZNI', false)",
+          [supplierName, senderAddress, finalNote === subject ? 'Iz maila' : finalNote, extractedAmount, finalFileUrl, subject, dateStr]
         );
         console.log(`âś… Račun od ${supplierName} (${extractedAmount} EUR) uspješno spremljen.`);
 
@@ -1202,8 +1034,6 @@ async function fetchInboundInvoicesFromEmail() {
     console.error('IMAP Greška:', err.message);
   }
 }
-
-
 
 const generateUraStornoPDF = (inv, filePath) => {
   return new Promise((resolve, reject) => {
@@ -1584,30 +1414,18 @@ app.get('/inbound-invoices', authGuard, async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Greška servera" }); }
 });
 
-app.get('/inbound-invoices/bookkeeping-report', authGuard, async (req, res) => {
-  try {
-    const result = await pool.query("SELECT * FROM inbound_invoices ORDER BY id DESC");
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(buildInboundBookkeepingHtml(result.rows));
-  } catch (err) {
-    console.error("Greška pri izradi HTML izvještaja URA:", err);
-    res.status(500).json({ error: "Greška servera" });
-  }
-});
-
 app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
   try {
     const { status } = req.body;
     const id = String(req.params.id).split('-')[0];
-    const requestedStatus = normalizeInboundStatus(status);
-    const targetStatus = isInboundStornoStatus(requestedStatus) ? 'POVRATI' : requestedStatus;
+    const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
 
     let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
     
     if (targetStatus === 'ARHIVIRANI') {
         query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
-    } else if (isInboundStornoStatus(targetStatus)) {
-        query = 'UPDATE inbound_invoices SET status = $1, archived = false, storno_at = COALESCE(storno_at, NOW()) WHERE id = $2 RETURNING *';
+    } else if (targetStatus === 'POVRATI') {
+        query = 'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *';
     }
  
     const result = await pool.query(query, [targetStatus, id]);
@@ -1655,11 +1473,6 @@ app.post('/inbound-invoices/archive', authGuard, async (req, res) => {
 app.delete('/inbound-invoices/:id', authGuard, async (req, res) => {
   try {
     const id = String(req.params.id).split('-')[0];
-    const existing = await pool.query('SELECT status FROM inbound_invoices WHERE id = $1', [id]);
-    if (existing.rows.length > 0 && isInboundStornoStatus(existing.rows[0].status)) {
-      await pool.query('UPDATE inbound_invoices SET archived = true, storno_at = COALESCE(storno_at, NOW()) WHERE id = $1', [id]);
-      return res.json({ success: true, softDeleted: true, message: 'Storno ulazni račun nije fizički obrisan, samo je arhiviran.' });
-    }
     await pool.query('DELETE FROM inbound_invoices WHERE id = $1', [id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Greška pri brisanju' }); }

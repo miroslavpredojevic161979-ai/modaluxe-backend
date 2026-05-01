@@ -150,7 +150,35 @@ const escapeHtml = (v) => {
   return String(v).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;');
 };
 
-const toNumberSafe = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+const normalizeNumberInput = (value) => {
+  if (value === null || value === undefined) return '';
+  if (typeof value !== 'string') return value;
+
+  let normalized = value.trim().replace(/\s/g, '');
+  if (!normalized) return '';
+
+  const hasComma = normalized.includes(',');
+  const hasDot = normalized.includes('.');
+
+  if (hasComma && hasDot) {
+    normalized =
+      normalized.lastIndexOf(',') > normalized.lastIndexOf('.')
+        ? normalized.replace(/\./g, '').replace(',', '.')
+        : normalized.replace(/,/g, '');
+  } else if (hasComma) {
+    normalized = normalized.replace(',', '.');
+  }
+
+  return normalized;
+};
+
+const toNumberSafe = (v) => {
+  const n = Number(normalizeNumberInput(v));
+  return Number.isFinite(n) ? n : 0;
+};
+
+const formatSoloDecimal = (value, decimals = 2) =>
+  toNumberSafe(value).toFixed(decimals).replace('.', ',');
 
 const normalizeHeroSlides = (slides) => {
   if (!Array.isArray(slides)) return [];
@@ -295,10 +323,13 @@ const buildSoloInvoiceParams = (orderData, isPaid, isStorno = false, paymentMeth
   let popustPostotak = '0';
 
   if (popustObj && popustObj.amount > 0) {
-    let ukupnoArtikli = items.reduce((acc, item) => acc + (Number(item.price || 0) * Number(item.qty || 1)), 0);
+    let ukupnoArtikli = items.reduce(
+      (acc, item) => acc + (toNumberSafe(item.price || 0) * toNumberSafe(item.qty || 1)),
+      0
+    );
     if (ukupnoArtikli > 0) {
-      let izracunatiPostotak = (Number(popustObj.amount) / ukupnoArtikli) * 100;
-      popustPostotak = izracunatiPostotak.toFixed(2);
+      let izracunatiPostotak = (toNumberSafe(popustObj.amount) / ukupnoArtikli) * 100;
+      popustPostotak = formatSoloDecimal(izracunatiPostotak, 4);
     }
   }
 
@@ -307,8 +338,8 @@ const buildSoloInvoiceParams = (orderData, isPaid, isStorno = false, paymentMeth
     let naziv = `${item.brand || ''} ${item.name || ''}`.trim();
     if (!naziv || naziv === 'undefined') naziv = 'Artikl';
 
-    let kolicina = Number(item.qty || 1);
-    let cijena = Number(item.price || 0);
+    let kolicina = toNumberSafe(item.qty || 1);
+    let cijena = toNumberSafe(item.price || 0);
 
     if (isStorno) {
       cijena = -Math.abs(cijena);
@@ -325,7 +356,7 @@ const buildSoloInvoiceParams = (orderData, isPaid, isStorno = false, paymentMeth
     params.append('usluga', String(i));
     params.append(`opis_usluge_${i}`, escapeHtml(naziv).substring(0, 990));
     params.append(`kolicina_${i}`, String(kolicina));
-    params.append(`cijena_${i}`, String(cijena));
+    params.append(`cijena_${i}`, formatSoloDecimal(cijena));
     params.append(`porez_stopa_${i}`, '0');
     params.append(`popust_${i}`, popustPostotak);
   });

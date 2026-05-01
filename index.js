@@ -1079,193 +1079,131 @@ async function fetchInboundInvoicesFromEmail() {
   }
 }
 
-const buildInboundStornoNumber = (invoiceNumber, originalId) => {
-  const safeNumber = String(invoiceNumber || `URA-${originalId}`).trim();
-  return safeNumber.toUpperCase().includes('STORNO') ? safeNumber : `STORNO-${safeNumber}`;
-};
+const generateUraStornoPDF = (inv, filePath) => {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 40, size: 'A4' });
+    const stream = fs.createWriteStream(filePath);
+    doc.pipe(stream);
 
-const ensureInboundStornoPdf = async (originalInvoice) => {
-  const fileName = `ura_storno_${originalInvoice.id}_${Date.now()}.pdf`;
-  const filePath = path.join(__dirname, 'uploads', fileName);
-  await generateUraStornoPDF(originalInvoice, filePath);
+    const d = new Date();
+    const dateStr = d.toLocaleDateString('hr-HR');
+    const timeStr = d.toLocaleTimeString('hr-HR');
 
-  const uploadResult = await cloudinary.uploader.upload(filePath, {
-    folder: 'kisfaluba_ura',
-    resource_type: 'image'
+    const finalRefund = Number(inv.amount) || 0; 
+    const supplierName = inv.supplier || 'Nepoznato';
+    const originalInvoiceNumber = inv.invoice_number || 'N/A';
+    const stornoInvoiceNumber = originalInvoiceNumber.toUpperCase().includes('STORNO') ? originalInvoiceNumber : `STORNO-${originalInvoiceNumber}`;
+
+    doc.fontSize(16).font('Helvetica-Bold').fillColor('#000000').text('KISFALUBA', { align: 'center' });
+    doc.moveDown(2);
+    doc.fontSize(10).font('Helvetica');
+    doc.text(fixText(`Postovani/a ${supplierName},`));
+    doc.moveDown(0.5);
+    doc.text(fixText(`Obavjestavamo Vas o povratu robe vezano za Vas racun br. ${originalInvoiceNumber}.`));
+    doc.moveDown(1.5);
+    doc.font('Helvetica-Bold').fontSize(11).text(fixText('Detalji povrata'));
+    doc.moveDown(0.5);
+
+    let startY = doc.y;
+    const drawTable1Row = (y, col1, col2, col3, isHeader = false) => {
+      const rowHeight = 25;
+      doc.rect(40, y, 510, rowHeight).fillAndStroke(isHeader ? '#fafafa' : '#ffffff', '#dddddd');
+      doc.moveTo(350, y).lineTo(350, y + rowHeight).stroke('#dddddd');
+      doc.moveTo(430, y).lineTo(430, y + rowHeight).stroke('#dddddd');
+      doc.fillColor('#000000').font(isHeader ? 'Helvetica-Bold' : 'Helvetica').fontSize(9);
+      doc.text(col1, 50, y + 8, { width: 290 });
+      doc.text(col2, 350, y + 8, { width: 80, align: 'center' });
+      doc.text(col3, 430, y + 8, { width: 110, align: 'right', lineBreak: false }); 
+      return y + rowHeight;
+    };
+
+    startY = drawTable1Row(startY, 'Opis povrata', fixText('Kolicina'), 'Vrijednost (EUR)', true);
+
+    const itemName = fixText(`Povrat po racunu br. ${originalInvoiceNumber}`);
+    const price = Number(Math.abs(finalRefund)).toFixed(2);
+    startY = drawTable1Row(startY, itemName, `1`, `-${price} EUR`, false);
+
+    doc.y = startY + 10;
+    doc.font('Helvetica-Bold').fontSize(10).fillColor('#e53e3e').text(`UKUPNI STORNO: -${Math.abs(finalRefund).toFixed(2)} EUR`, 300, doc.y, { width: 250, align: 'right' });
+    if (inv.note) {
+        doc.y += 5;
+        doc.font('Helvetica').fontSize(8).fillColor('#666666').text(fixText(`Napomena: ${inv.note}`), 300, doc.y, { width: 250, align: 'right' });
+    }
+    doc.fillColor('#000000');
+    doc.moveDown(2);
+
+    doc.font('Helvetica-Bold').fontSize(11).text(fixText('Podaci dobavljaca'), 40, doc.y);
+    doc.moveTo(40, doc.y + 2).lineTo(550, doc.y + 2).strokeColor('#dddddd').stroke();
+    doc.moveDown(0.5);
+    doc.font('Helvetica').fontSize(9);
+    doc.text(fixText(supplierName));
+    doc.moveDown(3);
+
+    doc.font('Helvetica-Bold').fontSize(14).fillColor('#e53e3e').text(fixText('STORNO RACUN / POVRATNICA'), { align: 'center' });
+    doc.fillColor('#000000');
+    doc.moveDown(1.5);
+
+    let currentY = doc.y;
+    doc.font('Helvetica-Bold').fontSize(9).text('KISFALUBA j.d.o.o.', 40, currentY);
+    doc.font('Helvetica').text('Zagorska ulica 40, 31300 Branjina, Republika Hrvatska');
+    doc.text('OIB: 82125639708 | MBS: 5990572');
+    doc.text('Trgovacki sud u Osijeku');
+    doc.text('Temeljni kapital: 10,00 EUR, uplacen u cijelosti');
+    doc.moveDown(1.5);
+
+    currentY = doc.y;
+    doc.font('Helvetica-Bold').text(fixText('Broj storno racuna:'), 40, currentY);
+    doc.font('Helvetica').text(stornoInvoiceNumber, 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Vezano za racun br:', 40, currentY);
+    doc.font('Helvetica').text(originalInvoiceNumber, 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Datum storna:', 40, currentY);
+    doc.font('Helvetica').text(dateStr, 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Vrijeme storna:', 40, currentY);
+    doc.font('Helvetica').text(timeStr, 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Mjesto izdavanja:', 40, currentY);
+    doc.font('Helvetica').text('Branjina, Republika Hrvatska', 150, currentY);
+    currentY += 15;
+    doc.font('Helvetica-Bold').text('Dobavljac:', 40, currentY);
+    doc.font('Helvetica').text(fixText(supplierName), 150, currentY);
+    doc.moveDown(2);
+
+    let t2Y = doc.y;
+    const drawTable2Row = (y, col1, col2, col3, col4, col5, isHeader = false) => {
+      const h = 25;
+      doc.rect(40, y, 510, h).fillAndStroke(isHeader ? '#fafafa' : '#ffffff', '#dddddd');
+      doc.moveTo(100, y).lineTo(100, y + h).stroke('#dddddd');
+      doc.moveTo(310, y).lineTo(310, y + h).stroke('#dddddd');
+      doc.moveTo(370, y).lineTo(370, y + h).stroke('#dddddd');
+      doc.moveTo(460, y).lineTo(460, y + h).stroke('#dddddd');
+      
+      doc.fillColor('#000000').font(isHeader ? 'Helvetica-Bold' : 'Helvetica').fontSize(9);
+      doc.text(col1, 40, y + 8, { width: 60, align: 'center' });
+      doc.text(col2, 110, y + 8, { width: 190 });
+      doc.text(col3, 310, y + 8, { width: 60, align: 'center' });
+      doc.text(col4, 370, y + 8, { width: 80, align: 'right' }); 
+      doc.text(col5, 460, y + 8, { width: 80, align: 'right' }); 
+      return y + h;
+    };
+
+    t2Y = drawTable2Row(t2Y, 'Redni broj', 'Opis', fixText('Kolicina'), 'Jedinicna cijena (EUR)', 'Ukupno (EUR)', true);
+    t2Y = drawTable2Row(t2Y, '1', itemName, '1', `-${price}`, `-${price}`, false);
+
+    doc.y = t2Y + 10;
+    doc.font('Helvetica-Bold').fontSize(10).fillColor('#e53e3e').text(`Ukupan iznos storna: -${Math.abs(finalRefund).toFixed(2)} EUR`, 300, doc.y, { width: 250, align: 'right' });
+    doc.moveDown(3);
+    
+    doc.font('Helvetica').fontSize(8).fillColor('#666666');
+    doc.text(fixText('Napomena: Ovaj dokument sluzi iskljucivo kao dokaz o fizickom povratu robe dobavljacu.'), { align: 'center' });
+    doc.text(fixText('Ovaj storno racun izdan je u elektronickom obliku i vrijedi bez potpisa i pecata.'), { align: 'center' });
+    doc.end();
+    
+    stream.on('finish', () => resolve(filePath));
+    stream.on('error', reject);
   });
-
-  try { fs.unlinkSync(filePath); } catch (e) { console.error(e); }
-  return uploadResult.secure_url;
-};
-
-const createOrRefreshInboundStornoRecord = async (originalInvoice, stornoUrl, originalAmount) => {
-  const cleanSupplier = cleanInboundUtfText(originalInvoice.supplier);
-  const cleanSupplierEmail = cleanInboundUtfText(originalInvoice.supplier_email || '');
-  const cleanInvoiceNumber = cleanInboundUtfText(originalInvoice.invoice_number || `URA-${originalInvoice.id}`);
-  const stornoNumber = buildInboundStornoNumber(cleanInvoiceNumber, originalInvoice.id);
-  const stornoAmount = -Math.abs(originalAmount);
-  const stornoDate = new Date().toLocaleDateString('hr-HR');
-  const stornoNote = cleanInboundUtfText(originalInvoice.note)
-    ? `STORNO | ${cleanInboundUtfText(originalInvoice.note)}`
-    : `STORNO za račun ${cleanInvoiceNumber}`;
-
-  const existingStorno = await pool.query(
-    'SELECT * FROM inbound_invoices WHERE original_invoice_id = $1 ORDER BY id DESC LIMIT 1',
-    [originalInvoice.id]
-  );
-
-  if (existingStorno.rows.length > 0) {
-    const refreshed = await pool.query(
-      "UPDATE inbound_invoices SET supplier = $1, supplier_email = $2, invoice_number = $3, amount = $4, file_url = $5, storno_url = $6, note = $7, date = $8, status = 'POVRATI', archived = false WHERE id = $9 RETURNING *",
-      [
-        cleanSupplier,
-        cleanSupplierEmail,
-        stornoNumber,
-        stornoAmount,
-        stornoUrl,
-        stornoUrl,
-        stornoNote,
-        stornoDate,
-        existingStorno.rows[0].id
-      ]
-    );
-    return refreshed.rows[0];
-  }
-
-  const inserted = await pool.query(
-    "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, storno_url, note, date, status, archived, original_invoice_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'POVRATI', false, $9) RETURNING *",
-    [
-      cleanSupplier,
-      cleanSupplierEmail,
-      stornoNumber,
-      stornoAmount,
-      stornoUrl,
-      stornoUrl,
-      stornoNote,
-      stornoDate,
-      originalInvoice.id
-    ]
-  );
-
-  return inserted.rows[0];
-};
-
-const renderInboundPdfFromHtml = async (html, filePath) => {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--single-process',
-      '--disable-gpu',
-      '--no-zygote',
-      '--disable-software-rasterizer'
-    ]
-  });
-
-  try {
-    const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await page.pdf({
-      path: filePath,
-      format: 'A4',
-      printBackground: true,
-      margin: { top: '24px', right: '24px', bottom: '24px', left: '24px' }
-    });
-  } finally {
-    await browser.close();
-  }
-};
-
-const generateUraStornoPDF = async (inv, filePath) => {
-  const validAmount = parseInboundInvoiceAmount(inv.amount);
-  if (validAmount === null) {
-    throw new Error('Originalni ulazni račun nema ispravan iznos za storno.');
-  }
-
-  const d = new Date();
-  const dateStr = d.toLocaleDateString('hr-HR');
-  const timeStr = d.toLocaleTimeString('hr-HR');
-  const supplierName = cleanInboundUtfText(inv.supplier || 'Nepoznato');
-  const originalInvoiceNumber = cleanInboundUtfText(inv.invoice_number || 'N/A');
-  const stornoInvoiceNumber = buildInboundStornoNumber(originalInvoiceNumber, inv.id);
-  const note = cleanInboundUtfText(inv.note || '', { preserveWhitespace: true });
-  const price = Math.abs(validAmount).toFixed(2);
-  const negativePrice = `-${price}`;
-
-  const html = `<!DOCTYPE html>
-  <html lang="hr">
-    <head>
-      <meta charset="UTF-8" />
-      <style>
-        body { font-family: Arial, Helvetica, sans-serif; color: #111; font-size: 12px; }
-        .wrap { max-width: 760px; margin: 0 auto; }
-        .title { text-align: center; font-size: 24px; font-weight: 700; margin-bottom: 20px; }
-        .subtitle { text-align: center; font-size: 18px; font-weight: 700; color: #c53030; margin: 24px 0 12px; }
-        .line { border-top: 1px solid #ddd; margin: 12px 0 18px; }
-        .meta { display: table; width: 100%; margin-bottom: 18px; }
-        .meta-row { display: table-row; }
-        .meta-label, .meta-value { display: table-cell; padding: 4px 0; vertical-align: top; }
-        .meta-label { width: 170px; font-weight: 700; }
-        table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-        th, td { border: 1px solid #ddd; padding: 8px; font-size: 12px; }
-        th { background: #f7f7f7; text-align: left; }
-        .right { text-align: right; }
-        .center { text-align: center; }
-        .total { margin-top: 18px; text-align: right; font-size: 18px; font-weight: 700; color: #c53030; }
-        .note { margin-top: 18px; font-size: 11px; color: #666; }
-      </style>
-    </head>
-    <body>
-      <div class="wrap">
-        <div class="title">KISFALUBA j.d.o.o.</div>
-        <p>Poštovani/a ${escapeHtml(supplierName)},</p>
-        <p>Obavještavamo Vas o povratu robe vezano za Vaš račun br. ${escapeHtml(originalInvoiceNumber)}.</p>
-
-        <div class="subtitle">STORNO RAČUN / POVRATNICA</div>
-        <div class="line"></div>
-
-        <div class="meta">
-          <div class="meta-row"><div class="meta-label">Broj storno računa:</div><div class="meta-value">${escapeHtml(stornoInvoiceNumber)}</div></div>
-          <div class="meta-row"><div class="meta-label">Vezano za račun br.:</div><div class="meta-value">${escapeHtml(originalInvoiceNumber)}</div></div>
-          <div class="meta-row"><div class="meta-label">Datum storna:</div><div class="meta-value">${escapeHtml(dateStr)}</div></div>
-          <div class="meta-row"><div class="meta-label">Vrijeme storna:</div><div class="meta-value">${escapeHtml(timeStr)}</div></div>
-          <div class="meta-row"><div class="meta-label">Mjesto izdavanja:</div><div class="meta-value">Branjina, Republika Hrvatska</div></div>
-          <div class="meta-row"><div class="meta-label">Dobavljač:</div><div class="meta-value">${escapeHtml(supplierName)}</div></div>
-        </div>
-
-        <table>
-          <thead>
-            <tr>
-              <th class="center">Redni broj</th>
-              <th>Opis</th>
-              <th class="center">Količina</th>
-              <th class="right">Jedinična cijena (EUR)</th>
-              <th class="right">Ukupno (EUR)</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td class="center">1</td>
-              <td>Povrat po računu br. ${escapeHtml(originalInvoiceNumber)}</td>
-              <td class="center">1</td>
-              <td class="right">${negativePrice}</td>
-              <td class="right">${negativePrice}</td>
-            </tr>
-          </tbody>
-        </table>
-
-        <div class="total">Ukupan iznos storna: ${negativePrice} EUR</div>
-        ${note ? `<div class="note"><strong>Napomena:</strong> ${escapeHtml(note)}</div>` : ''}
-        <div class="note">Ovaj dokument služi isključivo kao dokaz o fizičkom povratu robe dobavljaču.</div>
-        <div class="note">Originalni račun ostaje sačuvan, a ovaj storno račun vrijedi bez potpisa i pečata.</div>
-      </div>
-    </body>
-  </html>`;
-
-  await renderInboundPdfFromHtml(html, filePath);
-  return filePath;
 };
 
 // --- WEBHOOK (STRIPE - KARTICE) ---
@@ -1542,55 +1480,36 @@ app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
     const { status } = req.body;
     const id = String(req.params.id).split('-')[0];
     const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
-    const currentResult = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
-
-    if (currentResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Račun nije pronađen.' });
-    }
-
-    const currentInvoice = currentResult.rows[0];
-
-    if (targetStatus === 'POVRATI') {
-      if (currentInvoice.original_invoice_id) {
-        const stornoResult = await pool.query(
-          "UPDATE inbound_invoices SET status = 'POVRATI', archived = false WHERE id = $1 RETURNING *",
-          [id]
-        );
-        return res.json({ success: true, invoice: stornoResult.rows[0] });
-      }
-
-      const originalAmount = parseInboundInvoiceAmount(currentInvoice.amount);
-      if (originalAmount === null) {
-        return res.status(400).json({ error: 'Originalni ulazni račun nema ispravan iznos za storno. Provjeri amount prije povrata.' });
-      }
-
-      const originalInvoice = { ...currentInvoice, amount: originalAmount };
-      const stornoUrl = await ensureInboundStornoPdf(originalInvoice);
-      const archivedOriginalResult = await pool.query(
-        "UPDATE inbound_invoices SET storno_url = $1, status = 'ARHIVIRANI', archived = true WHERE id = $2 RETURNING *",
-        [stornoUrl, id]
-      );
-      const archivedOriginal = { ...archivedOriginalResult.rows[0], amount: originalAmount };
-      const stornoInvoice = await createOrRefreshInboundStornoRecord(archivedOriginal, stornoUrl, originalAmount);
-
-      return res.json({
-        success: true,
-        invoice: archivedOriginal,
-        stornoInvoice
-      });
-    }
 
     let query = 'UPDATE inbound_invoices SET status = $1 WHERE id = $2 RETURNING *';
-
-    if (targetStatus === 'ARHIVIRANI' || targetStatus === 'STORNO ARHIVA') {
-      query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
+    
+    if (targetStatus === 'ARHIVIRANI') {
+        query = 'UPDATE inbound_invoices SET status = $1, archived = true WHERE id = $2 RETURNING *';
+    } else if (targetStatus === 'POVRATI') {
+        query = 'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *';
     }
 
     const result = await pool.query(query, [targetStatus, id]);
-    res.json({ success: true, invoice: result.rows[0] });
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Račun nije pronađen.' });
+    }
+    
+    const invData = result.rows[0];
+
+    if (targetStatus === 'POVRATI' && !invData.storno_url) {
+      const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
+      const filePath = path.join(__dirname, 'uploads', fileName);
+      await generateUraStornoPDF(invData, filePath); 
+      const uploadResult = await cloudinary.uploader.upload(filePath, { folder: 'kisfaluba_ura', resource_type: 'image' });
+      await pool.query('UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2', [uploadResult.secure_url, id]);
+      invData.storno_url = uploadResult.secure_url;
+    }
+
+    res.json({ success: true, invoice: invData });
   } catch (err) {
     console.error("Greška pri ažuriranju statusa:", err);
-    res.status(500).json({ error: err.message || 'Greška u bazi.' });
+    res.status(500).json({ error: 'Greška u bazi.' });
   }
 });
 
@@ -1635,29 +1554,12 @@ app.post('/api/send-ura-storno', authGuard, async (req, res) => {
     const cleanId = String(id).split('-')[0];
     const result = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [cleanId]);
     if (result.rows.length === 0) return res.status(404).json({error: 'Nema računa'});
-    const currentInvoice = result.rows[0];
+    const inv = result.rows[0];
 
-    let inv = currentInvoice;
-    if (!currentInvoice.original_invoice_id) {
-      const stornoResult = await pool.query(
-        'SELECT * FROM inbound_invoices WHERE original_invoice_id = $1 ORDER BY id DESC LIMIT 1',
-        [currentInvoice.id]
-      );
-      if (stornoResult.rows.length > 0) {
-        inv = stornoResult.rows[0];
-      }
-    }
-
-    const originalInvoice = inv.original_invoice_id
-      ? (await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [inv.original_invoice_id])).rows[0] || currentInvoice
-      : currentInvoice;
-
-    const pdfLink = inv.file_url || inv.storno_url || originalInvoice.storno_url || originalInvoice.file_url;
+    const pdfLink = inv.storno_url || inv.file_url;
     if (!pdfLink) return res.status(400).json({ error: 'Nema PDF dokumenta. Prvo storniraj račun!' });
 
-    const finalEmail = (originalInvoice.supplier_email && originalInvoice.supplier_email.includes('@'))
-      ? originalInvoice.supplier_email
-      : ((inv.supplier_email && inv.supplier_email.includes('@')) ? inv.supplier_email : supplierEmail);
+    const finalEmail = (inv.supplier_email && inv.supplier_email.includes('@')) ? inv.supplier_email : supplierEmail;
 
     if (finalEmail && finalEmail.includes('@')) {
       let siguranBroj = inv.invoice_number ? String(inv.invoice_number).trim() : `URA-${inv.id}`;
@@ -1676,6 +1578,7 @@ app.post('/api/send-ura-storno', authGuard, async (req, res) => {
         ]
       });
     }
+    
     res.json({ success: true, message: 'Storno mail je uspješno poslan dobavljaču s privitkom!', fileUrl: pdfLink });
   } catch (error) { 
     console.error("Greška pri slanju storno maila dobavljaču:", error);

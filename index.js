@@ -355,7 +355,7 @@ const buildSoloInvoiceParams = (orderData, isPaid, isStorno = false, paymentMeth
 
     params.append('usluga', String(i));
     params.append(`opis_usluge_${i}`, escapeHtml(naziv).substring(0, 990));
-    params.append(`kolicina_${i}`, String(kolicina));
+    params.append(`kolicina_${i}`, formatSoloDecimal(kolicina));
     params.append(`cijena_${i}`, formatSoloDecimal(cijena));
     params.append(`porez_stopa_${i}`, '0');
     params.append(`popust_${i}`, popustPostotak);

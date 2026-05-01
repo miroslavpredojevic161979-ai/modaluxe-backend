@@ -1477,23 +1477,11 @@ app.post('/inbound-invoices', async (req, res) => {
 
 app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
   try {
-    const { status } = req.body;
-    const id = parseInt(String(req.params.id).split('-')[0], 10);
+    const { status, supplier, supplier_email, invoice_number, amount, file_url, note, date } = req.body;
+    const id = String(req.params.id).split('-')[0];
+    const targetStatus = (status === 'POVRATI' || status === 'STORNO' || status === 'POVRAT ROBE') ? 'POVRATI' : status;
 
-    if (!Number.isFinite(id)) {
-      return res.status(400).json({ error: 'Neispravan ID računa.' });
-    }
-
-    const requestedStatus = String(status || '').trim().toUpperCase();
-    const targetStatus =
-      requestedStatus === 'STORNO' || requestedStatus === 'POVRAT ROBE'
-        ? 'POVRATI'
-        : requestedStatus;
-
-    const existingResult = await pool.query(
-      'SELECT * FROM inbound_invoices WHERE id = $1 LIMIT 1',
-      [id]
-    );
+    const existingResult = await pool.query('SELECT * FROM inbound_invoices WHERE id = $1', [id]);
 
     if (existingResult.rows.length === 0) {
       return res.status(404).json({ error: 'Račun nije pronađen.' });
@@ -1501,90 +1489,84 @@ app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
 
     const existingInvoice = existingResult.rows[0];
 
-    if (targetStatus === 'POVRATI') {
-      if (existingInvoice.original_invoice_id) {
-        const updatedStornoResult = await pool.query(
-          "UPDATE inbound_invoices SET status = 'POVRATI', archived = false WHERE id = $1 RETURNING *",
-          [id]
-        );
+    const finalSupplier = supplier !== undefined ? cleanInboundUtfText(supplier) : existingInvoice.supplier;
+    const finalSupplierEmail = supplier_email !== undefined ? cleanInboundUtfText(supplier_email || '') : existingInvoice.supplier_email;
+    const finalInvoiceNumber = invoice_number !== undefined ? cleanInboundUtfText(invoice_number) : existingInvoice.invoice_number;
+    const finalAmount = amount !== undefined ? toNumberSafe(amount) : toNumberSafe(existingInvoice.amount);
+    const finalFileUrl = file_url !== undefined ? file_url : existingInvoice.file_url;
+    const finalNote = note !== undefined ? cleanInboundUtfText(note, { preserveWhitespace: true }) : existingInvoice.note;
+    const finalDate = date !== undefined ? date : existingInvoice.date;
 
-        return res.json({
-          success: true,
-          invoice: updatedStornoResult.rows[0]
-        });
+    if (targetStatus === 'POVRATI') {
+      if (!finalAmount || finalAmount <= 0) {
+        return res.status(400).json({ error: 'Storno ne može biti 0. Prvo upiši ispravan iznos ulaznog računa.' });
       }
 
+      const originalUpdateResult = await pool.query(
+        'UPDATE inbound_invoices SET supplier = $1, supplier_email = $2, invoice_number = $3, amount = $4, file_url = $5, note = $6, date = $7, status = $8, archived = true WHERE id = $9 RETURNING *',
+        [finalSupplier, finalSupplierEmail, finalInvoiceNumber, Math.abs(finalAmount), finalFileUrl, finalNote, finalDate, 'ARHIVIRANI', id]
+      );
+
+      const originalInvoice = originalUpdateResult.rows[0];
+
       const existingStornoResult = await pool.query(
-        "SELECT * FROM inbound_invoices WHERE original_invoice_id = $1 ORDER BY id DESC LIMIT 1",
+        "SELECT * FROM inbound_invoices WHERE original_invoice_id = $1 AND status IN ('POVRATI', 'STORNO ARHIVA') ORDER BY id DESC LIMIT 1",
         [id]
       );
 
       if (existingStornoResult.rows.length > 0) {
-        const existingStorno = existingStornoResult.rows[0];
-
-        await pool.query(
-          "UPDATE inbound_invoices SET status = 'ARHIVIRANI', archived = true, storno_url = $1 WHERE id = $2",
-          [existingStorno.storno_url || existingStorno.file_url || existingInvoice.storno_url || '', id]
-        );
-
-        return res.json({
-          success: true,
-          invoice: existingStorno
-        });
+        return res.json({ success: true, invoice: existingStornoResult.rows[0], originalInvoice });
       }
 
       const fileName = `ura_storno_${id}_${Date.now()}.pdf`;
       const filePath = path.join(__dirname, 'uploads', fileName);
 
-      await generateUraStornoPDF(existingInvoice, filePath);
+      await generateUraStornoPDF({ ...originalInvoice, amount: Math.abs(finalAmount) }, filePath);
 
       const uploadResult = await cloudinary.uploader.upload(filePath, {
         folder: 'kisfaluba_ura',
-        resource_type: 'auto'
+        resource_type: 'image'
       });
 
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-
       const stornoUrl = uploadResult.secure_url;
-      const originalInvoiceNumber = existingInvoice.invoice_number || `URA-${existingInvoice.id}`;
-      const stornoInvoiceNumber = String(originalInvoiceNumber).toUpperCase().includes('STORNO')
-        ? String(originalInvoiceNumber)
-        : `STORNO-${originalInvoiceNumber}`;
+      const stornoInvoiceNumber = String(finalInvoiceNumber || `URA-${id}`).toUpperCase().includes('STORNO')
+        ? String(finalInvoiceNumber || `URA-${id}`)
+        : `STORNO-${finalInvoiceNumber || `URA-${id}`}`;
 
-      const negativeAmount = -Math.abs(toNumberSafe(existingInvoice.amount));
-      const stornoDate = new Date().toLocaleDateString('hr-HR');
-      const stornoNote = `STORNO / POVRAT za ulazni račun ${originalInvoiceNumber}`;
+      await pool.query(
+        'UPDATE inbound_invoices SET storno_url = $1 WHERE id = $2',
+        [stornoUrl, id]
+      );
 
       const stornoInsertResult = await pool.query(
-        `INSERT INTO inbound_invoices
-          (supplier, supplier_email, invoice_number, amount, file_url, storno_url, note, date, status, archived, original_invoice_id)
-         VALUES
-          ($1, $2, $3, $4, $5, $6, $7, $8, 'POVRATI', false, $9)
-         RETURNING *`,
+        "INSERT INTO inbound_invoices (supplier, supplier_email, invoice_number, amount, file_url, storno_url, note, date, status, archived, original_invoice_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'POVRATI', false, $9) RETURNING *",
         [
-          existingInvoice.supplier || '',
-          existingInvoice.supplier_email || '',
+          finalSupplier,
+          finalSupplierEmail,
           stornoInvoiceNumber,
-          negativeAmount,
+          -Math.abs(finalAmount),
           stornoUrl,
           stornoUrl,
-          stornoNote,
-          stornoDate,
+          `Storno za ulazni račun ${finalInvoiceNumber || `URA-${id}`}`,
+          new Date().toLocaleDateString('hr-HR'),
           id
         ]
       );
 
-      await pool.query(
-        "UPDATE inbound_invoices SET status = 'ARHIVIRANI', archived = true, storno_url = $1 WHERE id = $2",
-        [stornoUrl, id]
-      );
-
       return res.json({
         success: true,
-        invoice: stornoInsertResult.rows[0]
+        invoice: stornoInsertResult.rows[0],
+        originalInvoice
       });
+    }
+
+    if (targetStatus === 'ARHIVIRANI') {
+      const result = await pool.query(
+        'UPDATE inbound_invoices SET supplier = $1, supplier_email = $2, invoice_number = $3, amount = $4, file_url = $5, note = $6, date = $7, status = $8, archived = true WHERE id = $9 RETURNING *',
+        [finalSupplier, finalSupplierEmail, finalInvoiceNumber, finalAmount, finalFileUrl, finalNote, finalDate, 'ARHIVIRANI', id]
+      );
+
+      return res.json({ success: true, invoice: result.rows[0] });
     }
 
     if (targetStatus === 'STORNO ARHIVA') {
@@ -1593,35 +1575,17 @@ app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
         [id]
       );
 
-      return res.json({
-        success: true,
-        invoice: result.rows[0]
-      });
-    }
-
-    if (targetStatus === 'ARHIVIRANI') {
-      const result = await pool.query(
-        "UPDATE inbound_invoices SET status = 'ARHIVIRANI', archived = true WHERE id = $1 RETURNING *",
-        [id]
-      );
-
-      return res.json({
-        success: true,
-        invoice: result.rows[0]
-      });
+      return res.json({ success: true, invoice: result.rows[0] });
     }
 
     const result = await pool.query(
-      'UPDATE inbound_invoices SET status = $1, archived = false WHERE id = $2 RETURNING *',
-      [targetStatus, id]
+      'UPDATE inbound_invoices SET supplier = $1, supplier_email = $2, invoice_number = $3, amount = $4, file_url = $5, note = $6, date = $7, status = $8, archived = false WHERE id = $9 RETURNING *',
+      [finalSupplier, finalSupplierEmail, finalInvoiceNumber, finalAmount, finalFileUrl, finalNote, finalDate, targetStatus, id]
     );
 
-    return res.json({
-      success: true,
-      invoice: result.rows[0]
-    });
+    return res.json({ success: true, invoice: result.rows[0] });
   } catch (err) {
-    console.error('Greška pri ažuriranju statusa URA:', err);
+    console.error('Greška pri ažuriranju statusa:', err);
     res.status(500).json({ error: 'Greška u bazi.' });
   }
 });

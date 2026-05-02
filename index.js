@@ -444,10 +444,133 @@ const buildCloudinaryPdfPageImageUrl = (fileUrl, page = 1) => {
   return url.replace(marker, `${marker}dn_300,pg_${page},f_jpg/`);
 };
 
-const extractInboundInvoiceAmountFromCloudinaryPdfPages = async (fileUrl) => {
+const cleanInvoiceNumberCandidate = (value = '') => {
+  let candidate = cleanInboundUtfText(value);
+
+  if (!candidate) return '';
+
+  candidate = candidate
+    .replace(/^(?:broj\s+računa|broj\s+racuna|br\.?\s*računa|br\.?\s*racuna|račun\s*br\.?|racun\s*br\.?|invoice\s*(?:no\.?|number|#)?|document\s*(?:no\.?|number)?|račun|racun)\s*[:#\-]?\s*/i, '')
+    .replace(/\s+(?:datum|date|kupac|dobavljač|dobavljac|ukupno|iznos|oib|pdv|iban|za\s+platiti)\b.*$/i, '')
+    .replace(/[;,].*$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^[\s:#\-\/]+|[\s:#\-\/]+$/g, '');
+
+  if (!candidate) return '';
+  if (candidate.length < 2 || candidate.length > 50) return '';
+  if (/(eur|€|ukupno|iznos|pdv|iban|oib|telefon|email|mail)/i.test(candidate)) return '';
+  if (/^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}$/.test(candidate)) return '';
+  if (/^\d{11}$/.test(candidate)) return '';
+
+  return candidate;
+};
+
+const extractInboundInvoiceNumberFromText = (rawText = '') => {
+  const text = cleanInboundUtfText(rawText, { preserveWhitespace: true });
+  if (!text) return '';
+
+  const patterns = [
+    /(?:broj\s+računa|broj\s+racuna|br\.?\s*računa|br\.?\s*racuna|račun\s*br\.?|racun\s*br\.?|invoice\s*(?:no\.?|number|#)?|document\s*(?:no\.?|number)?)[^\n\rA-Za-z0-9ČĆŽŠĐčćžšđ]{0,20}([A-ZČĆŽŠĐ0-9][A-ZČĆŽŠĐ0-9\/.\- ]{1,45})/gi,
+    /(?:račun|racun)\s*[:#\-]?\s*([A-ZČĆŽŠĐ0-9][A-ZČĆŽŠĐ0-9\/.\- ]{1,45})/gi
+  ];
+
+  for (const regex of patterns) {
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      const candidate = cleanInvoiceNumberCandidate(match[1]);
+      if (candidate) return candidate;
+    }
+  }
+
+  return '';
+};
+
+const chooseBestInvoiceAttachment = (attachments = []) => {
+  const validAttachments = (attachments || []).filter((attr) =>
+    attr.contentType === 'application/pdf' ||
+    attr.contentType?.startsWith('image/') ||
+    attr.filename?.toLowerCase().match(/\.(pdf|jpg|jpeg|png|webp)$/)
+  );
+
+  if (validAttachments.length === 0) return null;
+
+  const pdfAttachments = validAttachments.filter((attr) => {
+    const mimeType = getAttachmentMimeType(attr.filename || '', attr.contentType || '');
+    return mimeType === 'application/pdf';
+  });
+
+  const invoiceNamedPdf = pdfAttachments.find((attr) =>
+    String(attr.filename || '').toLowerCase().match(/racun|račun|invoice|faktura|bill/)
+  );
+
+  if (invoiceNamedPdf) return invoiceNamedPdf;
+  if (pdfAttachments.length > 0) return pdfAttachments[0];
+
+  const imageAttachments = validAttachments.filter((attr) => {
+    const mimeType = getAttachmentMimeType(attr.filename || '', attr.contentType || '');
+    return mimeType.startsWith('image/');
+  });
+
+  const invoiceNamedImage = imageAttachments.find((attr) =>
+    String(attr.filename || '').toLowerCase().match(/racun|račun|invoice|faktura|bill/)
+  );
+
+  if (invoiceNamedImage) return invoiceNamedImage;
+
+  return imageAttachments[0] || validAttachments[0];
+};
+
+const mergeInboundInvoiceData = (...items) => {
+  const result = {
+    amount: 0,
+    invoiceNumber: '',
+    text: '',
+    source: ''
+  };
+
+  for (const item of items) {
+    if (!item) continue;
+
+    if (!result.amount && item.amount && item.amount > 0) {
+      result.amount = Number(item.amount.toFixed ? item.amount.toFixed(2) : Number(item.amount).toFixed(2));
+    }
+
+    if (!result.invoiceNumber && item.invoiceNumber) {
+      result.invoiceNumber = item.invoiceNumber;
+    }
+
+    if (!result.text && item.text) {
+      result.text = item.text;
+    }
+
+    if (!result.source && item.source) {
+      result.source = item.source;
+    }
+  }
+
+  return result;
+};
+
+const extractInboundInvoiceDataFromText = (rawText = '', source = 'text') => {
+  const text = cleanInboundUtfText(rawText, { preserveWhitespace: true });
+
+  return {
+    amount: extractInboundInvoiceAmountFromText(text),
+    invoiceNumber: extractInboundInvoiceNumberFromText(text),
+    text,
+    source
+  };
+};
+
+const extractInboundInvoiceDataFromCloudinaryPdfPages = async (fileUrl) => {
+  let bestAmount = 0;
+  let bestInvoiceNumber = '';
+  let bestText = '';
+
   for (let page = 1; page <= 3; page += 1) {
     const pageImageUrl = buildCloudinaryPdfPageImageUrl(fileUrl, page);
-    if (!pageImageUrl) return 0;
+    if (!pageImageUrl) return { amount: bestAmount, invoiceNumber: bestInvoiceNumber, text: bestText, source: 'ocr-pdf-pages' };
 
     try {
       console.log(`[URA POVRAT RESCAN] Pokušavam OCR PDF stranice ${page}:`, pageImageUrl);
@@ -460,24 +583,140 @@ const extractInboundInvoiceAmountFromCloudinaryPdfPages = async (fileUrl) => {
         downloadedPage.contentType || 'image/jpeg'
       );
 
-      if (ocrResult?.amount && ocrResult.amount > 0) {
-        console.log(`[URA POVRAT RESCAN] OCR PDF stranica ${page} pronašla iznos:`, ocrResult.amount);
-        return ocrResult.amount;
+      const ocrText = ocrResult?.text || '';
+      const pageData = extractInboundInvoiceDataFromText(ocrText, `ocr-pdf-page-${page}`);
+
+      if (!bestInvoiceNumber && pageData.invoiceNumber) {
+        bestInvoiceNumber = pageData.invoiceNumber;
+      }
+
+      if (pageData.amount && pageData.amount > 0) {
+        bestAmount = pageData.amount;
+      }
+
+      if (!bestText && ocrText) {
+        bestText = ocrText;
+      }
+
+      if (bestAmount > 0 && bestInvoiceNumber) {
+        return {
+          amount: bestAmount,
+          invoiceNumber: bestInvoiceNumber,
+          text: bestText,
+          source: 'ocr-pdf-pages'
+        };
       }
     } catch (err) {
       console.log(`[URA POVRAT RESCAN] PDF stranica ${page} nije pročitana:`, err.message);
     }
   }
 
-  return 0;
+  return {
+    amount: bestAmount,
+    invoiceNumber: bestInvoiceNumber,
+    text: bestText,
+    source: 'ocr-pdf-pages'
+  };
 };
 
-const rescanInboundInvoiceAmountFromStoredFile = async (invoice) => {
+const extractInboundInvoiceAmountFromCloudinaryPdfPages = async (fileUrl) => {
+  const data = await extractInboundInvoiceDataFromCloudinaryPdfPages(fileUrl);
+  return data.amount || 0;
+};
+
+const extractInboundInvoiceDataFromAttachment = async (attachment, uploadedFileUrl = '') => {
+  if (!attachment || !attachment.content) {
+    return {
+      amount: 0,
+      invoiceNumber: '',
+      text: '',
+      source: 'empty-attachment'
+    };
+  }
+
+  const attachmentMimeType = getAttachmentMimeType(
+    attachment.filename || '',
+    attachment.contentType || ''
+  );
+
+  if (attachmentMimeType === 'application/pdf') {
+    let pdfData = {
+      amount: 0,
+      invoiceNumber: '',
+      text: '',
+      source: 'pdf-parse'
+    };
+
+    try {
+      const parsedPdf = await pdfParse(attachment.content);
+      const pdfText = cleanInboundUtfText(parsedPdf.text || '', { preserveWhitespace: true });
+      pdfData = extractInboundInvoiceDataFromText(pdfText, 'pdf-parse');
+      console.log('[URA PDF TEKST] Prvih 2000 znakova:', pdfText.slice(0, 2000));
+      console.log('[URA PDF DATA]', {
+        amount: pdfData.amount,
+        invoiceNumber: pdfData.invoiceNumber
+      });
+    } catch (pdfErr) {
+      console.error('PDF čitanje iznosa/broja nije uspjelo:', pdfErr.message);
+    }
+
+    let ocrPdfData = {
+      amount: 0,
+      invoiceNumber: '',
+      text: '',
+      source: 'ocr-pdf-pages'
+    };
+
+    if ((!pdfData.amount || !pdfData.invoiceNumber) && uploadedFileUrl) {
+      ocrPdfData = await extractInboundInvoiceDataFromCloudinaryPdfPages(uploadedFileUrl);
+      console.log('[URA PDF OCR DATA]', {
+        amount: ocrPdfData.amount,
+        invoiceNumber: ocrPdfData.invoiceNumber
+      });
+    }
+
+    return mergeInboundInvoiceData(pdfData, ocrPdfData);
+  }
+
+  if (attachmentMimeType.startsWith('image/')) {
+    const ocrResult = await extractInboundInvoiceAmountFromImageWithOcr(
+      attachment.content,
+      attachment.filename || `racun_${Date.now()}.jpg`,
+      attachment.contentType || ''
+    );
+
+    const imageData = extractInboundInvoiceDataFromText(ocrResult?.text || '', 'ocr-image');
+
+    return mergeInboundInvoiceData(
+      {
+        amount: ocrResult?.amount || 0,
+        invoiceNumber: '',
+        text: ocrResult?.text || '',
+        source: 'ocr-image'
+      },
+      imageData
+    );
+  }
+
+  return {
+    amount: 0,
+    invoiceNumber: '',
+    text: '',
+    source: 'unsupported-attachment'
+  };
+};
+
+const rescanInboundInvoiceDataFromStoredFile = async (invoice) => {
   const fileUrl = invoice?.file_url || invoice?.fileUrl || '';
 
   if (!fileUrl || !String(fileUrl).startsWith('http')) {
     console.log('[URA POVRAT RESCAN] Račun nema file_url za ponovno čitanje.');
-    return 0;
+    return {
+      amount: 0,
+      invoiceNumber: '',
+      text: '',
+      source: 'missing-file-url'
+    };
   }
 
   try {
@@ -487,26 +726,44 @@ const rescanInboundInvoiceAmountFromStoredFile = async (invoice) => {
     const mimeType = getAttachmentMimeType(fileUrl, downloaded.contentType);
 
     if (mimeType === 'application/pdf') {
+      let pdfData = {
+        amount: 0,
+        invoiceNumber: '',
+        text: '',
+        source: 'pdf-parse-rescan'
+      };
+
       try {
         const parsedPdf = await pdfParse(downloaded.buffer);
         const pdfText = cleanInboundUtfText(parsedPdf.text || '', { preserveWhitespace: true });
 
         console.log('[URA POVRAT PDF TEKST] Prvih 2000 znakova:', pdfText.slice(0, 2000));
 
-        const pdfAmount = extractInboundInvoiceAmountFromText(pdfText);
-        console.log('[URA POVRAT PDF IZNOS] Pronađeni iznos:', pdfAmount);
+        pdfData = extractInboundInvoiceDataFromText(pdfText, 'pdf-parse-rescan');
 
-        if (pdfAmount && pdfAmount > 0) {
-          return pdfAmount;
-        }
+        console.log('[URA POVRAT PDF DATA]', {
+          amount: pdfData.amount,
+          invoiceNumber: pdfData.invoiceNumber
+        });
       } catch (pdfErr) {
         console.error('[URA POVRAT RESCAN] pdfParse nije uspio:', pdfErr.message);
       }
 
-      const ocrPdfAmount = await extractInboundInvoiceAmountFromCloudinaryPdfPages(fileUrl);
+      let ocrPdfData = {
+        amount: 0,
+        invoiceNumber: '',
+        text: '',
+        source: 'ocr-pdf-pages-rescan'
+      };
 
-      if (ocrPdfAmount && ocrPdfAmount > 0) {
-        return ocrPdfAmount;
+      if (!pdfData.amount || !pdfData.invoiceNumber) {
+        ocrPdfData = await extractInboundInvoiceDataFromCloudinaryPdfPages(fileUrl);
+      }
+
+      const finalData = mergeInboundInvoiceData(pdfData, ocrPdfData);
+
+      if (finalData.amount || finalData.invoiceNumber) {
+        return finalData;
       }
     }
 
@@ -517,17 +774,46 @@ const rescanInboundInvoiceAmountFromStoredFile = async (invoice) => {
         mimeType
       );
 
-      if (ocrResult?.amount && ocrResult.amount > 0) {
-        return ocrResult.amount;
+      const imageData = extractInboundInvoiceDataFromText(ocrResult?.text || '', 'ocr-image-rescan');
+
+      const finalData = mergeInboundInvoiceData(
+        {
+          amount: ocrResult?.amount || 0,
+          invoiceNumber: '',
+          text: ocrResult?.text || '',
+          source: 'ocr-image-rescan'
+        },
+        imageData
+      );
+
+      if (finalData.amount || finalData.invoiceNumber) {
+        return finalData;
       }
     }
 
-    console.log('[URA POVRAT RESCAN] Nije pronađen iznos nakon ponovnog čitanja.');
-    return 0;
+    console.log('[URA POVRAT RESCAN] Nije pronađen iznos/broj nakon ponovnog čitanja.');
+
+    return {
+      amount: 0,
+      invoiceNumber: '',
+      text: '',
+      source: 'not-found'
+    };
   } catch (err) {
     console.error('[URA POVRAT RESCAN] Greška:', err.message);
-    return 0;
+
+    return {
+      amount: 0,
+      invoiceNumber: '',
+      text: '',
+      source: 'error'
+    };
   }
+};
+
+const rescanInboundInvoiceAmountFromStoredFile = async (invoice) => {
+  const data = await rescanInboundInvoiceDataFromStoredFile(invoice);
+  return data.amount || 0;
 };
 
 const invoiceNumberFromOrderId = (orderId) => `${orderId}/${new Date().getFullYear()}/KF`;
@@ -1247,128 +1533,114 @@ async function fetchInboundInvoicesFromEmail() {
         const dateStr = new Date().toLocaleDateString('hr-HR');
         const subject = cleanInboundUtfText(mail.subject || 'Automatski uvoz iz maila');
 
-        let extractedAmount = 0;
-        const cleanMailText = cleanInboundUtfText(mail.text || '', { preserveWhitespace: true });
-        const cleanMailHtml = cleanInboundUtfText(mail.html || '', { preserveWhitespace: true });
-        const textToSearch = cleanMailText + ' ' + cleanMailHtml;
-        const amountRegex = /(?:ukupno|iznos|total|za platiti|iznos racuna|iznos računa)[^\d]*([\d]+[.,]\d{2})/i;
-        const match = textToSearch.match(amountRegex);
+      let extractedAmount = 0;
+const cleanMailText = cleanInboundUtfText(mail.text || '', { preserveWhitespace: true });
+const cleanMailHtml = cleanInboundUtfText(mail.html || '', { preserveWhitespace: true });
+const mailTextForReading = `${cleanMailText}\n${cleanMailHtml}`;
 
-        if (match && match[1]) {
-          extractedAmount = parseFloat(match[1].replace(',', '.'));
-        } else {
-          const eurRegex = /([\d]+[.,]\d{2})\s*(?:eur|€)/gi;
-          let eurMatches = [...textToSearch.matchAll(eurRegex)];
-          if (eurMatches.length > 0) {
-            const lastMatch = eurMatches[eurMatches.length - 1][1];
-            extractedAmount = parseFloat(lastMatch.replace(',', '.'));
-          }
-        }
-        if (isNaN(extractedAmount)) extractedAmount = 0;
-        extractedAmount = extractInboundInvoiceAmountFromText(`${cleanMailText}\n${cleanMailHtml}`);
+const mailData = extractInboundInvoiceDataFromText(mailTextForReading, 'mail-body');
 
-        const validAttachments = (mail.attachments || []).filter(attr =>
-          attr.contentType === 'application/pdf' ||
-          attr.contentType?.startsWith('image/') ||
-          attr.filename?.toLowerCase().match(/\.(pdf|jpg|jpeg|png)$/)
-        );
+if (mailData.amount && mailData.amount > 0) {
+  extractedAmount = mailData.amount;
+}
 
-        let finalFileUrl = null;
-        let finalNote = subject;
+let extractedInvoiceNumber = mailData.invoiceNumber || '';
 
-        if (validAttachments.length > 0) {
+const validAttachments = (mail.attachments || []).filter(attr =>
+  attr.contentType === 'application/pdf' ||
+  attr.contentType?.startsWith('image/') ||
+  attr.filename?.toLowerCase().match(/\.(pdf|jpg|jpeg|png|webp)$/)
+);
+
+const invoiceAttachment = chooseBestInvoiceAttachment(validAttachments);
+
+let finalFileUrl = null;
+let finalNote = subject;
+
+if (invoiceAttachment) {
+  try {
+    const attachment = invoiceAttachment;
+    const attachmentMimeType = getAttachmentMimeType(
+      attachment.filename || '',
+      attachment.contentType || ''
+    );
+    const isPdfAttachment = attachmentMimeType === 'application/pdf';
+
+    const fName = `ura_doc_${Date.now()}`;
+    const uploadResourceType = isPdfAttachment ? 'image' : 'auto';
+    const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, uploadResourceType);
+    finalFileUrl = uploadResult.secure_url;
+
+    const attachmentData = await extractInboundInvoiceDataFromAttachment(attachment, finalFileUrl);
+
+    if (attachmentData.amount && attachmentData.amount > 0) {
+      extractedAmount = attachmentData.amount;
+    }
+
+    if (attachmentData.invoiceNumber) {
+      extractedInvoiceNumber = attachmentData.invoiceNumber;
+    }
+
+    console.log('[URA MAIL DATA]', {
+      file: attachment.filename || '',
+      amount: extractedAmount,
+      invoiceNumber: extractedInvoiceNumber,
+      fileUrl: finalFileUrl
+    });
+  } catch (e) {
+    console.error('Cloudinary/PDF/OCR obrada greska:', e.message);
+  }
+} else {
+  try {
+    console.log('Uslikavam HTML mail...');
+    const htmlContent = cleanMailHtml || `<div style="font-family: Arial; padding: 20px; white-space: pre-wrap;">${escapeHtml(cleanMailText || subject)}</div>`;
+    const browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--single-process',
+        '--disable-gpu',
+        '--no-zygote',
+        '--disable-software-rasterizer'
+      ]
+    });
+    const page = await browser.newPage();
+    await page.setContent(htmlContent, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+    const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
+    await browser.close();
+
+    const fName = `ura_sken_${Date.now()}`;
+    const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image');
+    finalFileUrl = uploadResult.secure_url;
+    finalNote = 'Iz maila (Skenirano)';
+  } catch (puppeteerErr) {
+    console.error('Puppeteer greska, spasavam kao obican tekst:', puppeteerErr);
+    try {
+      const fName = `ura_tekst_${Date.now()}`;
+      const doc = new PDFDocument({ margin: 40, size: 'A4' });
+      let buffers = [];
+      doc.on('data', buffers.push.bind(buffers));
+      const uploadPromise = new Promise((resolve, reject) => {
+        doc.on('end', async () => {
           try {
-            const attachment = validAttachments[0];
-            const attachmentMimeType = getAttachmentMimeType(
-              attachment.filename || '',
-              attachment.contentType || ''
-            );
-            const isPdfAttachment = attachmentMimeType === 'application/pdf';
+            let pdfData = Buffer.concat(buffers);
+            const result = await uploadBufferToCloudinary(pdfData, fName, 'image');
+            resolve(result.secure_url);
+          } catch (err) { reject(err); }
+        });
+      });
+      doc.fontSize(16).text('Sadrzaj e-maila (Tekstualni format)', { align: 'center' }).moveDown(2);
+      doc.fontSize(10).text(fixText(cleanMailText || 'E-mail ne sadrzi HTML ili se slike nisu mogle ucitati.'));
+      doc.end();
+      finalFileUrl = await uploadPromise;
+    } catch (fallbackErr) { console.error(fallbackErr); }
+  }
+}
 
-            if (isPdfAttachment && attachment.content) {
-              try {
-                const parsedPdf = await pdfParse(attachment.content);
-                const pdfText = cleanInboundUtfText(parsedPdf.text || '', { preserveWhitespace: true });
-                const pdfAmount = extractInboundInvoiceAmountFromText(pdfText);
-
-                if (pdfAmount && pdfAmount > 0) {
-                  extractedAmount = pdfAmount;
-                }
-              } catch (pdfErr) {
-                console.error('PDF čitanje iznosa nije uspjelo:', pdfErr.message);
-              }
-            }
-
-            if (attachmentMimeType.startsWith('image/')) {
-              const ocrResult = await extractInboundInvoiceAmountFromImageWithOcr(
-                attachment.content,
-                attachment.filename || `racun_${Date.now()}.jpg`,
-                attachment.contentType || ''
-              );
-
-              if (ocrResult?.amount && ocrResult.amount > 0) {
-                extractedAmount = ocrResult.amount;
-              }
-            }
-
-            const fName = `ura_doc_${Date.now()}`;
-            const uploadResourceType = isPdfAttachment ? 'image' : 'auto';
-            const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, uploadResourceType);
-            finalFileUrl = uploadResult.secure_url;
-          } catch (e) {
-            console.error('Cloudinary upload greska:', e);
-          }
-        } else {
-          try {
-            console.log('Uslikavam HTML mail...');
-            const htmlContent = cleanMailHtml || `<div style="font-family: Arial; padding: 20px; white-space: pre-wrap;">${escapeHtml(cleanMailText || subject)}</div>`;
-            const browser = await puppeteer.launch({
-              headless: true,
-              args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--single-process',
-                '--disable-gpu',
-                '--no-zygote',
-                '--disable-software-rasterizer'
-              ]
-            });
-            const page = await browser.newPage();
-            await page.setContent(htmlContent, { waitUntil: 'domcontentloaded', timeout: 20000 });
-
-            const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
-            await browser.close();
-
-            const fName = `ura_sken_${Date.now()}`;
-            const uploadResult = await uploadBufferToCloudinary(pdfBuffer, fName, 'image');
-            finalFileUrl = uploadResult.secure_url;
-            finalNote = 'Iz maila (Skenirano)';
-          } catch (puppeteerErr) {
-            console.error('Puppeteer greska, spasavam kao obican tekst:', puppeteerErr);
-            try {
-              const fName = `ura_tekst_${Date.now()}`;
-              const doc = new PDFDocument({ margin: 40, size: 'A4' });
-              let buffers = [];
-              doc.on('data', buffers.push.bind(buffers));
-              const uploadPromise = new Promise((resolve, reject) => {
-                doc.on('end', async () => {
-                  try {
-                    let pdfData = Buffer.concat(buffers);
-                    const result = await uploadBufferToCloudinary(pdfData, fName, 'image');
-                    resolve(result.secure_url);
-                  } catch (err) { reject(err); }
-                });
-              });
-              doc.fontSize(16).text('Sadrzaj e-maila (Tekstualni format)', { align: 'center' }).moveDown(2);
-              doc.fontSize(10).text(fixText(cleanMailText || 'E-mail ne sadrzi HTML ili se slike nisu mogle ucitati.'));
-              doc.end();
-              finalFileUrl = await uploadPromise;
-            } catch (fallbackErr) { console.error(fallbackErr); }
-          }
-        }
-
-        const cleanInvoiceNumber = cleanInboundUtfText(finalNote === subject ? 'Iz maila' : finalNote);
+       const cleanInvoiceNumber = cleanInboundUtfText(extractedInvoiceNumber || (finalNote === subject ? 'Iz maila' : finalNote));
         const cleanNote = cleanInboundUtfText(subject, { preserveWhitespace: true });
 
         await pool.query(
@@ -1826,26 +2098,46 @@ app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
         });
       }
 
-      let originalInvoice = selectedInvoice;
-      let originalAmount = toNumberSafe(originalInvoice.amount);
+    let originalInvoice = selectedInvoice;
+let originalAmount = toNumberSafe(originalInvoice.amount);
+let originalInvoiceNumberForCheck = cleanInboundUtfText(originalInvoice.invoice_number || '');
 
-      if (originalAmount <= 0) {
-        const rescannedAmount = await rescanInboundInvoiceAmountFromStoredFile(originalInvoice);
+const originalInvoiceNumberMissing =
+  !originalInvoiceNumberForCheck ||
+  originalInvoiceNumberForCheck.toLowerCase() === 'iz maila' ||
+  originalInvoiceNumberForCheck.toUpperCase().startsWith('URA-');
 
-        if (rescannedAmount && rescannedAmount > 0) {
-          originalAmount = Number(rescannedAmount.toFixed(2));
+if (originalAmount <= 0 || originalInvoiceNumberMissing) {
+  const rescannedData = await rescanInboundInvoiceDataFromStoredFile(originalInvoice);
 
-          const updatedOriginalAmountResult = await pool.query(
-            'UPDATE inbound_invoices SET amount = $1 WHERE id = $2 RETURNING *',
-            [originalAmount, id]
-          );
+  const updates = [];
+  const values = [];
 
-          originalInvoice = updatedOriginalAmountResult.rows[0] || {
-            ...originalInvoice,
-            amount: originalAmount
-          };
-        }
-      }
+  if (originalAmount <= 0 && rescannedData.amount && rescannedData.amount > 0) {
+    originalAmount = Number(rescannedData.amount.toFixed(2));
+    values.push(originalAmount);
+    updates.push(`amount = $${values.length}`);
+  }
+
+  if (originalInvoiceNumberMissing && rescannedData.invoiceNumber) {
+    originalInvoiceNumberForCheck = rescannedData.invoiceNumber;
+    values.push(rescannedData.invoiceNumber);
+    updates.push(`invoice_number = $${values.length}`);
+  }
+
+  if (updates.length > 0) {
+    const updatedOriginalDataResult = await pool.query(
+      `UPDATE inbound_invoices SET ${updates.join(', ')} WHERE id = $${values.length + 1} RETURNING *`,
+      [...values, id]
+    );
+
+    originalInvoice = updatedOriginalDataResult.rows[0] || {
+      ...originalInvoice,
+      amount: originalAmount,
+      invoice_number: originalInvoiceNumberForCheck
+    };
+  }
+}
 
       if (originalAmount <= 0) {
         return res.status(400).json({

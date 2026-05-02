@@ -103,6 +103,7 @@ const initDB = async () => {
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS image_url VARCHAR(1024)");
     await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS original_invoice_id INTEGER");
+    await pool.query("ALTER TABLE inbound_invoices ADD COLUMN IF NOT EXISTS bookkeeping_sent_at TIMESTAMP");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS storno_url VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount JSONB DEFAULT '{\"amount\": 0}'::jsonb");
@@ -2292,6 +2293,36 @@ app.post('/inbound-invoices/archive', authGuard, async (req, res) => {
   } catch (err) { 
     console.error("Greška pri arhiviranju URA:", err);
     res.status(500).json({ error: 'Greška u bazi.' }); 
+  }
+});
+
+app.post('/inbound-invoices/bookkeeping-sent', authGuard, async (req, res) => {
+  try {
+    const { invoiceIds } = req.body;
+    if (!invoiceIds || !Array.isArray(invoiceIds) || invoiceIds.length === 0) {
+      return res.json({ success: true, message: 'Nema računa za označavanje.' });
+    }
+
+    const cleanIds = invoiceIds
+      .map((id) => parseInt(String(id).split('-')[0], 10))
+      .filter((id) => !isNaN(id));
+
+    if (cleanIds.length === 0) {
+      return res.json({ success: true, message: 'Nema valjanih računa.' });
+    }
+
+    await pool.query(
+      `UPDATE inbound_invoices
+       SET bookkeeping_sent_at = COALESCE(bookkeeping_sent_at, NOW())
+       WHERE id = ANY($1::int[])
+         AND original_invoice_id IS NULL`,
+      [cleanIds]
+    );
+
+    res.json({ success: true, message: 'Računi su označeni kao poslani knjigovođi.' });
+  } catch (err) {
+    console.error('Greška pri označavanju URA za knjigovođu:', err);
+    res.status(500).json({ error: 'Greška u bazi.' });
   }
 });
 

@@ -15,6 +15,7 @@ const pool = require('./db');
 const nodemailer = require('nodemailer');
 const imaps = require('imap-simple');
 const simpleParser = require('mailparser').simpleParser;
+const pdfParse = require('pdf-parse');
 const cron = require('node-cron');
 const puppeteer = require('puppeteer'); // PAMETNI SKENER
 const cloudinary = require('cloudinary').v2;
@@ -254,6 +255,46 @@ const parseInboundInvoiceAmount = (value) => {
 
   const rounded = Number(amount.toFixed(2));
   return rounded > 0 ? rounded : null;
+};
+
+const extractInboundInvoiceAmountFromText = (rawText = '') => {
+  const text = cleanInboundUtfText(rawText, { preserveWhitespace: true });
+  if (!text) return 0;
+
+  const candidates = [];
+
+  const addCandidate = (value) => {
+    const amount = parseInboundInvoiceAmount(value);
+    if (amount && amount > 0 && amount < 1000000) {
+      candidates.push(amount);
+    }
+  };
+
+  const keywordRegexes = [
+    /(?:ukupno\s*za\s*platiti|za\s*platiti|sveukupno|ukupno|iznos\s*računa|iznos\s*racuna|iznos|total|amount\s*due)[^\d]{0,120}(\d{1,3}(?:[.\s]\d{3})*(?:[,.]\d{1,2})|\d+(?:[,.]\d{1,2})?)/gi,
+  ];
+
+  for (const regex of keywordRegexes) {
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      addCandidate(match[1]);
+    }
+  }
+
+  if (candidates.length > 0) {
+    return candidates[candidates.length - 1];
+  }
+
+  const eurRegex = /(\d{1,3}(?:[.\s]\d{3})*(?:[,.]\d{1,2})|\d+(?:[,.]\d{1,2})?)\s*(?:eur|€)/gi;
+  let match;
+
+  while ((match = eurRegex.exec(text)) !== null) {
+    addCandidate(match[1]);
+  }
+
+  if (candidates.length === 0) return 0;
+
+  return Number(Math.max(...candidates).toFixed(2));
 };
 
 const invoiceNumberFromOrderId = (orderId) => `${orderId}/${new Date().getFullYear()}/KF`;
@@ -991,6 +1032,7 @@ async function fetchInboundInvoicesFromEmail() {
           }
         }
         if (isNaN(extractedAmount)) extractedAmount = 0;
+        extractedAmount = extractInboundInvoiceAmountFromText(`${cleanMailText}\n${cleanMailHtml}`);
 
         const validAttachments = (mail.attachments || []).filter(attr =>
           attr.contentType === 'application/pdf' ||
@@ -1004,6 +1046,24 @@ async function fetchInboundInvoicesFromEmail() {
         if (validAttachments.length > 0) {
           try {
             const attachment = validAttachments[0];
+            const isPdfAttachment =
+              attachment.contentType === 'application/pdf' ||
+              String(attachment.filename || '').toLowerCase().endsWith('.pdf');
+
+            if (isPdfAttachment && attachment.content) {
+              try {
+                const parsedPdf = await pdfParse(attachment.content);
+                const pdfText = cleanInboundUtfText(parsedPdf.text || '', { preserveWhitespace: true });
+                const pdfAmount = extractInboundInvoiceAmountFromText(pdfText);
+
+                if (pdfAmount && pdfAmount > 0) {
+                  extractedAmount = pdfAmount;
+                }
+              } catch (pdfErr) {
+                console.error('PDF čitanje iznosa nije uspjelo:', pdfErr.message);
+              }
+            }
+
             const fName = `ura_doc_${Date.now()}`;
             const uploadResult = await uploadBufferToCloudinary(attachment.content, fName, 'auto');
             finalFileUrl = uploadResult.secure_url;
@@ -1502,6 +1562,14 @@ app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
     const existingInvoice = existingResult.rows[0];
 
     if (targetStatus === 'POVRATI') {
+      const originalAmount = toNumberSafe(existingInvoice.amount);
+
+      if (!existingInvoice.original_invoice_id && originalAmount <= 0) {
+        return res.status(400).json({
+          error: 'Ne mogu napraviti povratnicu jer je iznos originalnog računa 0. Prvo ručno upiši ispravan iznos računa.'
+        });
+      }
+
       if (existingInvoice.original_invoice_id) {
         const updatedStornoResult = await pool.query(
           "UPDATE inbound_invoices SET status = 'POVRATI', archived = false WHERE id = $1 RETURNING *",
@@ -1648,6 +1716,14 @@ app.patch('/inbound-invoices/:id/status', authGuard, async (req, res) => {
       }
 
       const originalInvoice = originalResult.rows[0];
+
+      const originalAmount = toNumberSafe(originalInvoice.amount);
+
+      if (!originalInvoice.original_invoice_id && originalAmount <= 0) {
+        return res.status(400).json({
+          error: 'Ne mogu napraviti povratnicu jer je iznos originalnog računa 0. Prvo ručno upiši ispravan iznos računa.'
+        });
+      }
 
       if (originalInvoice.original_invoice_id) {
         const updatedStornoResult = await pool.query(

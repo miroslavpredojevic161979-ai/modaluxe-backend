@@ -16,6 +16,7 @@ const nodemailer = require('nodemailer');
 const imaps = require('imap-simple');
 const simpleParser = require('mailparser').simpleParser;
 const pdfParse = require('pdf-parse');
+const Tesseract = require('tesseract.js');
 const cron = require('node-cron');
 const puppeteer = require('puppeteer'); // PAMETNI SKENER
 const cloudinary = require('cloudinary').v2;
@@ -80,6 +81,8 @@ const PAYMENT_CANCEL_WEB_URL = process.env.PAYMENT_CANCEL_WEB_URL || STOREFRONT_
 const PAYMENT_SUCCESS_APP_URL = process.env.PAYMENT_SUCCESS_APP_URL || 'modaluxe://payment-success';
 const PAYMENT_CANCEL_APP_URL = process.env.PAYMENT_CANCEL_APP_URL || 'modaluxe://payment-cancel';
 const SOLO_DEFAULT_KPD = (process.env.SOLO_DEFAULT_KPD || '').trim();
+const URA_OCR_ENABLED = process.env.URA_OCR_ENABLED !== 'false';
+const URA_OCR_LANGS = process.env.URA_OCR_LANGS || 'hrv+eng';
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -262,6 +265,22 @@ const extractInboundInvoiceAmountFromText = (rawText = '') => {
   if (!text) return 0;
 
   const candidates = [];
+  const strongKeywords = [
+    'ukupan iznos naplate',
+    'iznos naplate',
+    'ukupno za naplatu',
+    'ukupno za platiti',
+    'ukupno za uplatu',
+    'za platiti',
+    'sveukupno',
+    'ukupno',
+    'iznos računa',
+    'iznos racuna',
+    'iznos',
+    'total',
+    'amount due',
+  ];
+  const amountPattern = '(\\d{1,3}(?:[.\\s]\\d{3})*(?:[,.]\\d{1,2})|\\d+(?:[,.]\\d{1,2})?)';
 
   const addCandidate = (value) => {
     const amount = parseInboundInvoiceAmount(value);
@@ -270,7 +289,12 @@ const extractInboundInvoiceAmountFromText = (rawText = '') => {
     }
   };
 
+  const strongKeywordRegexes = strongKeywords.map(
+    (keyword) => new RegExp(`${keyword.replace(/\s+/g, '\\s*')}[^\\d]{0,120}${amountPattern}`, 'gi')
+  );
+
   const keywordRegexes = [
+    ...strongKeywordRegexes,
     /(?:ukupno\s*za\s*platiti|za\s*platiti|sveukupno|ukupno|iznos\s*računa|iznos\s*racuna|iznos|total|amount\s*due)[^\d]{0,120}(\d{1,3}(?:[.\s]\d{3})*(?:[,.]\d{1,2})|\d+(?:[,.]\d{1,2})?)/gi,
   ];
 
@@ -295,6 +319,104 @@ const extractInboundInvoiceAmountFromText = (rawText = '') => {
   if (candidates.length === 0) return 0;
 
   return Number(Math.max(...candidates).toFixed(2));
+};
+
+const getAttachmentMimeType = (filename = '', contentType = '') => {
+  const lowerName = String(filename || '').toLowerCase();
+  const lowerType = String(contentType || '').toLowerCase();
+
+  if (lowerType.includes('pdf') || lowerName.endsWith('.pdf')) return 'application/pdf';
+  if (lowerType.includes('png') || lowerName.endsWith('.png')) return 'image/png';
+  if (lowerType.includes('webp') || lowerName.endsWith('.webp')) return 'image/webp';
+  if (
+    lowerType.includes('jpeg') ||
+    lowerType.includes('jpg') ||
+    lowerName.endsWith('.jpg') ||
+    lowerName.endsWith('.jpeg')
+  ) {
+    return 'image/jpeg';
+  }
+
+  return lowerType || 'application/octet-stream';
+};
+
+const getOcrTempExtension = (mimeType = '', filename = '') => {
+  const lowerName = String(filename || '').toLowerCase();
+  const lowerType = String(mimeType || '').toLowerCase();
+
+  if (lowerType.includes('png') || lowerName.endsWith('.png')) return 'png';
+  if (lowerType.includes('webp') || lowerName.endsWith('.webp')) return 'webp';
+  if (
+    lowerType.includes('jpeg') ||
+    lowerType.includes('jpg') ||
+    lowerName.endsWith('.jpg') ||
+    lowerName.endsWith('.jpeg')
+  ) {
+    return 'jpg';
+  }
+
+  return 'jpg';
+};
+
+const extractInboundInvoiceAmountFromImageWithOcr = async (
+  buffer,
+  filename = 'racun.jpg',
+  contentType = ''
+) => {
+  if (!URA_OCR_ENABLED) return null;
+  if (!buffer || !Buffer.isBuffer(buffer)) return null;
+
+  const mimeType = getAttachmentMimeType(filename, contentType);
+
+  if (!mimeType.startsWith('image/')) {
+    return null;
+  }
+
+  const extension = getOcrTempExtension(mimeType, filename);
+  const tempFileName = `ura_ocr_${Date.now()}_${Math.random().toString(36).slice(2)}.${extension}`;
+  const tempFilePath = path.join(__dirname, 'uploads', tempFileName);
+
+  try {
+    fs.writeFileSync(tempFilePath, buffer);
+
+    const result = await Tesseract.recognize(tempFilePath, URA_OCR_LANGS, {
+      logger: (m) => {
+        if (m?.status === 'recognizing text') {
+          console.log(`[URA OCR] ${Math.round((m.progress || 0) * 100)}%`);
+        }
+      },
+    });
+
+    const ocrText = cleanInboundUtfText(result?.data?.text || '', { preserveWhitespace: true });
+    console.log('[URA OCR TEKST] Prvih 2000 znakova:', ocrText.slice(0, 2000));
+
+    const ocrAmount = extractInboundInvoiceAmountFromText(ocrText);
+
+    if (ocrAmount && ocrAmount > 0) {
+      console.log('[URA OCR] Pronađen iznos:', ocrAmount);
+      return {
+        amount: ocrAmount,
+        text: ocrText,
+        source: 'ocr-image',
+      };
+    }
+
+    console.log('[URA OCR] Iznos nije pronađen.');
+    return {
+      amount: 0,
+      text: ocrText,
+      source: 'ocr-image',
+    };
+  } catch (err) {
+    console.error('[URA OCR] Greška:', err.message);
+    return null;
+  } finally {
+    try {
+      if (fs.existsSync(tempFilePath)) {
+        fs.unlinkSync(tempFilePath);
+      }
+    } catch (cleanupErr) {}
+  }
 };
 
 const invoiceNumberFromOrderId = (orderId) => `${orderId}/${new Date().getFullYear()}/KF`;
@@ -1046,9 +1168,11 @@ async function fetchInboundInvoicesFromEmail() {
         if (validAttachments.length > 0) {
           try {
             const attachment = validAttachments[0];
-            const isPdfAttachment =
-              attachment.contentType === 'application/pdf' ||
-              String(attachment.filename || '').toLowerCase().endsWith('.pdf');
+            const attachmentMimeType = getAttachmentMimeType(
+              attachment.filename || '',
+              attachment.contentType || ''
+            );
+            const isPdfAttachment = attachmentMimeType === 'application/pdf';
 
             if (isPdfAttachment && attachment.content) {
               try {
@@ -1061,6 +1185,18 @@ async function fetchInboundInvoicesFromEmail() {
                 }
               } catch (pdfErr) {
                 console.error('PDF čitanje iznosa nije uspjelo:', pdfErr.message);
+              }
+            }
+
+            if (attachmentMimeType.startsWith('image/')) {
+              const ocrResult = await extractInboundInvoiceAmountFromImageWithOcr(
+                attachment.content,
+                attachment.filename || `racun_${Date.now()}.jpg`,
+                attachment.contentType || ''
+              );
+
+              if (ocrResult?.amount && ocrResult.amount > 0) {
+                extractedAmount = ocrResult.amount;
               }
             }
 

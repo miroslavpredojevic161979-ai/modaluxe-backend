@@ -81,6 +81,7 @@ const PAYMENT_CANCEL_WEB_URL = process.env.PAYMENT_CANCEL_WEB_URL || STOREFRONT_
 const PAYMENT_SUCCESS_APP_URL = process.env.PAYMENT_SUCCESS_APP_URL || 'modaluxe://payment-success';
 const PAYMENT_CANCEL_APP_URL = process.env.PAYMENT_CANCEL_APP_URL || 'modaluxe://payment-cancel';
 const SOLO_DEFAULT_KPD = (process.env.SOLO_DEFAULT_KPD || '').trim();
+const FREE_SHIPPING_THRESHOLD = 500;
 const URA_OCR_ENABLED = process.env.URA_OCR_ENABLED !== 'false';
 const URA_OCR_LANGS = process.env.URA_OCR_LANGS || 'hrv+eng';
 
@@ -112,6 +113,7 @@ const initDB = async () => {
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS company_name VARCHAR(255)");
     await pool.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS company_oib VARCHAR(64)");
     await pool.query("ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS coupons JSONB DEFAULT '[]'::jsonb");
+    await pool.query("ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS free_shipping_threshold NUMERIC(10,2) DEFAULT 500");
     await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS fit_info TEXT");
     await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS material_info TEXT");
     await pool.query("ALTER TABLE products ADD COLUMN IF NOT EXISTS manufacturer_info TEXT");
@@ -137,6 +139,18 @@ const initDB = async () => {
         admin_note TEXT
       );
     `);
+
+await pool.query(`
+      CREATE TABLE IF NOT EXISTS coupon_usages (
+        id SERIAL PRIMARY KEY,
+        coupon_code VARCHAR(100) NOT NULL,
+        customer_email VARCHAR(255) NOT NULL,
+        order_id INTEGER,
+        used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (coupon_code, customer_email)
+      );
+    `);
+
     console.log("Baza podataka (kolone i tablice) uspješno sinkronizirana.");
   } catch (err) {
     console.error("Greška pri sinkronizaciji baze:", err.message);
@@ -846,6 +860,117 @@ const getSoloCustomerData = (orderData = {}) => {
   const isB2B = Boolean(companyName && oib);
 
   return { companyName, oib, name, address, isB2B };
+};
+
+const normalizeCouponCode = (code = '') => normalizeText(code).toUpperCase();
+const normalizeEmail = (email = '') => normalizeText(email).toLowerCase();
+
+const isEmailLike = (email = '') => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email).trim());
+
+const getSavedCoupons = async () => {
+  const result = await pool.query('SELECT coupons FROM shop_settings LIMIT 1');
+  return parseJsonSafe(result.rows[0]?.coupons, []);
+};
+
+const findCouponByCode = async (code) => {
+  const couponCode = normalizeCouponCode(code);
+  if (!couponCode) return null;
+
+  const coupons = await getSavedCoupons();
+
+  return coupons.find((coupon) => normalizeCouponCode(coupon?.code) === couponCode) || null;
+};
+
+const hasCouponAlreadyBeenUsed = async (code, email) => {
+  const couponCode = normalizeCouponCode(code);
+  const customerEmail = normalizeEmail(email);
+
+  if (!couponCode || !customerEmail) return false;
+
+  const result = await pool.query(
+    'SELECT id FROM coupon_usages WHERE coupon_code = $1 AND customer_email = $2 LIMIT 1',
+    [couponCode, customerEmail]
+  );
+
+  return result.rows.length > 0;
+};
+
+const registerCouponUsage = async (code, email, orderId) => {
+  const couponCode = normalizeCouponCode(code);
+  const customerEmail = normalizeEmail(email);
+
+  if (!couponCode || !customerEmail || !isEmailLike(customerEmail)) return;
+
+  await pool.query(
+    `INSERT INTO coupon_usages (coupon_code, customer_email, order_id)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (coupon_code, customer_email) DO NOTHING`,
+    [couponCode, customerEmail, orderId || null]
+  );
+};
+
+const calculateCouponDiscount = (coupon, subtotal) => {
+  if (!coupon) return 0;
+
+  const type = normalizeText(coupon.type).toUpperCase();
+  const value = toNumberSafe(coupon.value);
+  const safeSubtotal = Math.max(0, toNumberSafe(subtotal));
+
+  if (value <= 0 || safeSubtotal <= 0) return 0;
+
+  if (type === 'PERCENT') {
+    return Number(Math.min(safeSubtotal, (safeSubtotal * value) / 100).toFixed(2));
+  }
+
+  if (type === 'FIX') {
+    return Number(Math.min(safeSubtotal, value).toFixed(2));
+  }
+
+  return 0;
+};
+
+const resolveOrderDiscount = async ({ requestedDiscount, subtotal, customerEmail }) => {
+  const code = normalizeCouponCode(requestedDiscount?.code);
+
+  if (!code) {
+    return { code: undefined, amount: 0 };
+  }
+
+  const email = normalizeEmail(customerEmail);
+
+  if (!email || !isEmailLike(email)) {
+    throw new Error('Za korištenje kupona potrebna je ispravna e-mail adresa.');
+  }
+
+  const coupon = await findCouponByCode(code);
+
+  if (!coupon) {
+    throw new Error('Kupon nije važeći.');
+  }
+
+  const alreadyUsed = await hasCouponAlreadyBeenUsed(code, email);
+
+  if (alreadyUsed) {
+    throw new Error('Ovaj kupon je već iskorišten za ovu e-mail adresu.');
+  }
+
+  const amount = calculateCouponDiscount(coupon, subtotal);
+
+  if (amount <= 0) {
+    throw new Error('Kupon trenutno ne može biti primijenjen.');
+  }
+
+  return {
+    code,
+    type: normalizeText(coupon.type).toUpperCase(),
+    value: toNumberSafe(coupon.value),
+    amount
+  };
+};
+
+const getShippingAfterDiscount = (subtotal, discountAmount, requestedShippingPrice) => {
+  const subtotalAfterDiscount = Math.max(0, toNumberSafe(subtotal) - toNumberSafe(discountAmount));
+  return subtotalAfterDiscount >= FREE_SHIPPING_THRESHOLD ? 0 : Math.max(0, toNumberSafe(requestedShippingPrice));
 };
 
 const buildBlagajnaOrderData = (body = {}) => {
@@ -1833,7 +1958,9 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
         const isFirstPaidTransition = existingOrder.status !== 'PAID';
         const shouldFinalizeOrder = isFirstPaidTransition || !existingOrder.invoice_url;
 
-        if (updatedOrder && isFirstPaidTransition) {
+       if (updatedOrder && isFirstPaidTransition) {
+          const savedDiscount = parseJsonSafe(updatedOrder.discount, { amount: 0 });
+          await registerCouponUsage(savedDiscount?.code, updatedOrder.email, updatedOrder.id);
           await deductStock(parseJsonSafe(updatedOrder.items, []));
         }
 
@@ -1857,6 +1984,45 @@ const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, 
   max: 5, 
   message: { error: 'Previše neuspješnih pokušaja prijave. Zbog sigurnosti, pokušajte ponovno za 15 minuta.' }
+});
+
+app.post('/coupons/validate', async (req, res) => {
+  try {
+    const code = normalizeCouponCode(req.body?.code);
+    const email = normalizeEmail(req.body?.email);
+
+    if (!code) {
+      return res.status(400).json({ valid: false, error: 'Unesite promo kod.' });
+    }
+
+    if (!email || !isEmailLike(email)) {
+      return res.status(400).json({ valid: false, error: 'Prvo upišite ispravnu e-mail adresu.' });
+    }
+
+    const coupon = await findCouponByCode(code);
+
+    if (!coupon) {
+      return res.status(404).json({ valid: false, error: 'Neispravan promo kod.' });
+    }
+
+    const alreadyUsed = await hasCouponAlreadyBeenUsed(code, email);
+
+    if (alreadyUsed) {
+      return res.status(409).json({ valid: false, error: 'Ovaj kupon je već iskorišten za ovu e-mail adresu.' });
+    }
+
+    res.json({
+      valid: true,
+      coupon: {
+        code,
+        type: coupon.type,
+        value: coupon.value
+      }
+    });
+  } catch (err) {
+    console.error('Kupon validacija greška:', err);
+    res.status(500).json({ valid: false, error: 'Greška pri provjeri kupona.' });
+  }
 });
 
 app.post('/api/login', loginLimiter, async (req, res) => {
@@ -2778,7 +2944,7 @@ app.get('/orders/:id/invoice', async (req, res) => {
 app.get('/settings', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM shop_settings LIMIT 1');
-    const settings = result.rows[0] || { cod_enabled: true };
+   const settings = result.rows[0] || { cod_enabled: true, free_shipping_threshold: 500 };
     let heroSlides = [];
 
     try {
@@ -2789,9 +2955,10 @@ app.get('/settings', async (req, res) => {
     }
 
     res.json({
-      ...settings,
-      hero_slides: heroSlides,
-    });
+  ...settings,
+  free_shipping_threshold: settings.free_shipping_threshold ?? 500,
+  hero_slides: heroSlides,
+});
   } catch (err) { res.status(500).json({ error: 'Greška postavki' }); }
 });
 
@@ -2815,6 +2982,38 @@ app.post('/settings/hero', authGuard, async (req, res) => {
     }
     res.json({ message: 'Ažurirano!', hero_slides: heroSlides });
   } catch (err) { res.status(500).json({ error: 'Greška.' }); }
+});
+
+app.post('/settings/free-shipping', authGuard, async (req, res) => {
+  try {
+    const threshold = toNumberSafe(req.body.free_shipping_threshold);
+
+    if (threshold < 0) {
+      return res.status(400).json({ error: 'Limit besplatne dostave ne može biti manji od 0.' });
+    }
+
+    const check = await pool.query('SELECT * FROM shop_settings LIMIT 1');
+
+    if (check.rows.length === 0) {
+      await pool.query(
+        'INSERT INTO shop_settings (cod_enabled, free_shipping_threshold) VALUES (true, $1)',
+        [threshold]
+      );
+    } else {
+      await pool.query(
+        'UPDATE shop_settings SET free_shipping_threshold = $1',
+        [threshold]
+      );
+    }
+
+    res.json({
+      success: true,
+      free_shipping_threshold: threshold
+    });
+  } catch (err) {
+    console.error('Greška pri spremanju limita besplatne dostave:', err);
+    res.status(500).json({ error: 'Greška pri spremanju limita besplatne dostave.' });
+  }
 });
 
 app.post('/settings/coupons', authGuard, async (req, res) => {

@@ -81,7 +81,7 @@ const PAYMENT_CANCEL_WEB_URL = process.env.PAYMENT_CANCEL_WEB_URL || STOREFRONT_
 const PAYMENT_SUCCESS_APP_URL = process.env.PAYMENT_SUCCESS_APP_URL || 'modaluxe://payment-success';
 const PAYMENT_CANCEL_APP_URL = process.env.PAYMENT_CANCEL_APP_URL || 'modaluxe://payment-cancel';
 const SOLO_DEFAULT_KPD = (process.env.SOLO_DEFAULT_KPD || '').trim();
-const FREE_SHIPPING_THRESHOLD = 500;
+const DEFAULT_FREE_SHIPPING_THRESHOLD = 500;
 const URA_OCR_ENABLED = process.env.URA_OCR_ENABLED !== 'false';
 const URA_OCR_LANGS = process.env.URA_OCR_LANGS || 'hrv+eng';
 
@@ -968,9 +968,30 @@ const resolveOrderDiscount = async ({ requestedDiscount, subtotal, customerEmail
   };
 };
 
-const getShippingAfterDiscount = (subtotal, discountAmount, requestedShippingPrice) => {
+const getCurrentFreeShippingThreshold = async () => {
+  try {
+    await pool.query(
+      "ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS free_shipping_threshold NUMERIC(10,2) DEFAULT 500"
+    );
+
+    const result = await pool.query(
+      'SELECT free_shipping_threshold FROM shop_settings LIMIT 1'
+    );
+
+    const threshold = toNumberSafe(result.rows[0]?.free_shipping_threshold);
+
+    return threshold >= 0 ? threshold : DEFAULT_FREE_SHIPPING_THRESHOLD;
+  } catch (err) {
+    console.error('Greška dohvaćanja limita besplatne dostave:', err);
+    return DEFAULT_FREE_SHIPPING_THRESHOLD;
+  }
+};
+
+const getShippingAfterDiscount = async (subtotal, discountAmount, requestedShippingPrice) => {
+  const threshold = await getCurrentFreeShippingThreshold();
   const subtotalAfterDiscount = Math.max(0, toNumberSafe(subtotal) - toNumberSafe(discountAmount));
-  return subtotalAfterDiscount >= FREE_SHIPPING_THRESHOLD ? 0 : Math.max(0, toNumberSafe(requestedShippingPrice));
+
+  return subtotalAfterDiscount >= threshold ? 0 : Math.max(0, toNumberSafe(requestedShippingPrice));
 };
 
 const buildBlagajnaOrderData = (body = {}) => {
@@ -2128,10 +2149,10 @@ app.post('/create-checkout-session', async (req, res) => {
       return { ...item, price: realPrice, qty };
     });
 
-    const safeShipping = toNumberSafe(shippingPrice || 0); 
     const safeDiscount = discount && discount.amount ? toNumberSafe(discount.amount) : 0;
+const safeShipping = await getShippingAfterDiscount(safeSubtotal, safeDiscount, shippingPrice);
 
-    let totalAmount = safeSubtotal + safeShipping - safeDiscount;
+let totalAmount = safeSubtotal + safeShipping - safeDiscount;
     if (totalAmount < 0) totalAmount = 0;
 
     const totalInCents = Math.round(totalAmount * 100);
@@ -2746,9 +2767,48 @@ app.get('/orders/:id/payment-status', async (req, res) => {
 // --- POUZEĆE ---
 app.post('/orders', async (req, res) => {
   try {
-    const { name, address, phone, total, items, email, discount, companyName, oib } = req.body; 
-    const normalizedItems = parseJsonSafe(items, []);
-    const totalAmount = Number((Number.isFinite(Number(total)) ? Number(total) : calcTotals(normalizedItems)).toFixed(2));
+ const { name, address, phone, items, email, discount, shippingPrice, companyName, oib } = req.body;
+const normalizedItems = parseJsonSafe(items, []);
+
+if (normalizedItems.length === 0) {
+  return res.status(400).json({ error: 'Košarica je prazna.' });
+}
+
+const itemIds = normalizedItems.map(item => String(item.id));JSON.stringify(validatedItems)
+const dbProductsResult = await pool.query(
+  'SELECT id, price FROM products WHERE id = ANY($1)',
+  [itemIds]
+);
+
+const dbPrices = {};
+dbProductsResult.rows.forEach(row => {
+  dbPrices[row.id] = Number(row.price);
+});
+
+let safeSubtotal = 0;
+
+const validatedItems = normalizedItems.map(item => {
+  const realPrice = dbPrices[item.id] || 0;
+  const qty = toNumberSafe(item.qty || item.quantity || 1);
+  safeSubtotal += realPrice * qty;
+  return { ...item, price: realPrice, qty };
+});
+
+const resolvedDiscount = await resolveOrderDiscount({
+  requestedDiscount: discount,
+  subtotal: safeSubtotal,
+  customerEmail: email
+});
+
+const safeShipping = await getShippingAfterDiscount(
+  safeSubtotal,
+  resolvedDiscount.amount,
+  shippingPrice
+);
+
+const totalAmount = Number(
+  Math.max(0, safeSubtotal + safeShipping - resolvedDiscount.amount).toFixed(2)
+);
 
     if (companyName && oib && !SOLO_DEFAULT_KPD) {
       return res.status(400).json({ error: 'R1/B2B račun traži SOLO_DEFAULT_KPD u backend .env postavkama.' });
@@ -2756,12 +2816,12 @@ app.post('/orders', async (req, res) => {
     
     const newOrder = await pool.query(
       'INSERT INTO orders (name, address, phone, email, total, items, status, discount, company_name, company_oib) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *',
-      [name || 'Nepoznat', address || '', phone || '', email || '', totalAmount, JSON.stringify(normalizedItems), 'NEW', JSON.stringify(discount || { amount: 0 }), companyName || '', oib || '']
+      [name || 'Nepoznat', address || '', phone || '', email || '', totalAmount,JSON.stringify(validatedItems), 'NEW', JSON.stringify(discount || { amount: 0 }), companyName || '', oib || '']
     );
     
     const orderData = newOrder.rows[0];
     const orderId = orderData.id;
-    await deductStock(normalizedItems);
+    await deductStock(validatedItems);
     
     const soloRacun = await createSoloInvoice({ ...orderData, companyName, oib }, false);
     const invoiceUrl = soloRacun ? soloRacun.pdf : null;
@@ -2943,8 +3003,23 @@ app.get('/orders/:id/invoice', async (req, res) => {
 // --- RUTE ZA POSTAVKE I KATEGORIJE ---
 app.get('/settings', async (req, res) => {
   try {
+    await pool.query(
+      "ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS free_shipping_threshold NUMERIC(10,2) DEFAULT 500"
+    );
+
     const result = await pool.query('SELECT * FROM shop_settings LIMIT 1');
-   const settings = result.rows[0] || { cod_enabled: true, free_shipping_threshold: 500 };
+
+    let settings = result.rows[0];
+
+    if (!settings) {
+      const inserted = await pool.query(
+        'INSERT INTO shop_settings (cod_enabled, free_shipping_threshold, coupons, hero_img) VALUES (true, 500, $1, $2) RETURNING *',
+        [JSON.stringify([]), JSON.stringify([])]
+      );
+
+      settings = inserted.rows[0];
+    }
+
     let heroSlides = [];
 
     try {
@@ -2955,11 +3030,15 @@ app.get('/settings', async (req, res) => {
     }
 
     res.json({
-  ...settings,
-  free_shipping_threshold: settings.free_shipping_threshold ?? 500,
-  hero_slides: heroSlides,
-});
-  } catch (err) { res.status(500).json({ error: 'Greška postavki' }); }
+      ...settings,
+      coupons: parseJsonSafe(settings.coupons, []),
+      free_shipping_threshold: Number(settings.free_shipping_threshold ?? 500),
+      hero_slides: heroSlides,
+    });
+  } catch (err) {
+    console.error('Greška postavki:', err);
+    res.status(500).json({ error: 'Greška postavki' });
+  }
 });
 
 app.post('/settings/cod', authGuard, async (req, res) => {
@@ -2986,33 +3065,47 @@ app.post('/settings/hero', authGuard, async (req, res) => {
 
 app.post('/settings/free-shipping', authGuard, async (req, res) => {
   try {
+    await pool.query(
+      "ALTER TABLE shop_settings ADD COLUMN IF NOT EXISTS free_shipping_threshold NUMERIC(10,2) DEFAULT 500"
+    );
+
     const threshold = toNumberSafe(req.body.free_shipping_threshold);
 
-    if (threshold < 0) {
-      return res.status(400).json({ error: 'Limit besplatne dostave ne može biti manji od 0.' });
+    if (!Number.isFinite(threshold) || threshold < 0) {
+      return res.status(400).json({
+        error: 'Limit besplatne dostave mora biti ispravan broj veći ili jednak 0.'
+      });
     }
 
     const check = await pool.query('SELECT * FROM shop_settings LIMIT 1');
 
+    let settings;
+
     if (check.rows.length === 0) {
-      await pool.query(
-        'INSERT INTO shop_settings (cod_enabled, free_shipping_threshold) VALUES (true, $1)',
-        [threshold]
+      const inserted = await pool.query(
+        'INSERT INTO shop_settings (cod_enabled, free_shipping_threshold, coupons, hero_img) VALUES (true, $1, $2, $3) RETURNING *',
+        [threshold, JSON.stringify([]), JSON.stringify([])]
       );
+
+      settings = inserted.rows[0];
     } else {
-      await pool.query(
-        'UPDATE shop_settings SET free_shipping_threshold = $1',
+      const updated = await pool.query(
+        'UPDATE shop_settings SET free_shipping_threshold = $1 RETURNING *',
         [threshold]
       );
+
+      settings = updated.rows[0];
     }
 
     res.json({
       success: true,
-      free_shipping_threshold: threshold
+      free_shipping_threshold: Number(settings.free_shipping_threshold ?? threshold)
     });
   } catch (err) {
     console.error('Greška pri spremanju limita besplatne dostave:', err);
-    res.status(500).json({ error: 'Greška pri spremanju limita besplatne dostave.' });
+    res.status(500).json({
+      error: 'Greška pri spremanju limita besplatne dostave.'
+    });
   }
 });
 

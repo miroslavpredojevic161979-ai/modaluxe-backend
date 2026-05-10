@@ -84,6 +84,9 @@ const SOLO_DEFAULT_KPD = (process.env.SOLO_DEFAULT_KPD || '').trim();
 const DEFAULT_FREE_SHIPPING_THRESHOLD = 500;
 const URA_OCR_ENABLED = process.env.URA_OCR_ENABLED !== 'false';
 const URA_OCR_LANGS = process.env.URA_OCR_LANGS || 'hrv+eng';
+const RECAPTCHA_SECRET_KEY = String(process.env.RECAPTCHA_SECRET_KEY || '').trim();
+const RECAPTCHA_MIN_SCORE_RAW = Number(process.env.RECAPTCHA_MIN_SCORE || 0.5);
+const RECAPTCHA_MIN_SCORE = Number.isFinite(RECAPTCHA_MIN_SCORE_RAW) ? RECAPTCHA_MIN_SCORE_RAW : 0.5;
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -201,6 +204,77 @@ const toNumberSafe = (v) => {
 
 const formatSoloDecimal = (value, decimals = 2) =>
   toNumberSafe(value).toFixed(decimals).replace('.', ',');
+const verifyRecaptchaToken = async (token, expectedAction = '') => {
+  if (!RECAPTCHA_SECRET_KEY) return true;
+  if (!token || typeof token !== 'string') return false;
+
+  try {
+    const params = new URLSearchParams();
+    params.append('secret', RECAPTCHA_SECRET_KEY);
+    params.append('response', token);
+
+    const response = await axios.post(
+      'https://www.google.com/recaptcha/api/siteverify',
+      params.toString(),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        timeout: 10000
+      }
+    );
+
+    const data = response.data || {};
+
+    if (!data.success) return false;
+
+    if (typeof data.score === 'number' && data.score < RECAPTCHA_MIN_SCORE) {
+      return false;
+    }
+
+    if (expectedAction && data.action !== expectedAction) {
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.error('reCAPTCHA provjera greška:', err.message);
+    return false;
+  }
+};
+
+const isWebStorefrontRequest = (req) => {
+  const source = String(req.headers.origin || req.headers.referer || '').toLowerCase();
+
+  return (
+    source.includes('kisfaluba.hr') ||
+    source.includes('moda-luxe-trgovina.vercel.app') ||
+    source.includes('localhost') ||
+    source.includes('127.0.0.1')
+  );
+};
+
+const requireRecaptcha = (expectedAction) => {
+  return async (req, res, next) => {
+    if (!RECAPTCHA_SECRET_KEY) return next();
+
+    const token = req.body?.recaptchaToken;
+
+    if (!isWebStorefrontRequest(req) && !token) {
+      return next();
+    }
+
+    const ok = await verifyRecaptchaToken(token, expectedAction);
+
+    if (!ok) {
+      return res.status(403).json({
+        error: 'Sigurnosna provjera nije prošla. Pokušajte ponovno.'
+      });
+    }
+
+    next();
+  };
+};
 
 const normalizeHeroSlides = (slides) => {
   if (!Array.isArray(slides)) return [];
@@ -2765,7 +2839,7 @@ app.get('/orders/:id/payment-status', async (req, res) => {
 });
 
 // --- POUZEĆE ---
-app.post('/orders', async (req, res) => {
+app.post('/orders', requireRecaptcha('order_create'), async (req, res) => {
   try {
  const { name, address, phone, items, email, discount, shippingPrice, companyName, oib } = req.body;
 const normalizedItems = parseJsonSafe(items, []);
@@ -2774,7 +2848,7 @@ if (normalizedItems.length === 0) {
   return res.status(400).json({ error: 'Košarica je prazna.' });
 }
 
-const itemIds = normalizedItems.map(item => String(item.id));JSON.stringify(validatedItems)
+const itemIds = normalizedItems.map(item => String(item.id));
 const dbProductsResult = await pool.query(
   'SELECT id, price FROM products WHERE id = ANY($1)',
   [itemIds]
@@ -3193,7 +3267,7 @@ app.get('/api/complaints', authGuard, async (req, res) => {
   }
 });
 
-app.post('/api/complaints', async (req, res) => {
+app.post('/api/complaints', requireRecaptcha('complaint_submit'), async (req, res) => {
   const { id, fullName, email, phone, orderId, message } = req.body;
   try {
     await pool.query(

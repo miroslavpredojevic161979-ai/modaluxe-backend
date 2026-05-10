@@ -276,6 +276,23 @@ const requireRecaptcha = (expectedAction) => {
   };
 };
 
+const requireRecaptchaStrict = (expectedAction) => {
+  return async (req, res, next) => {
+    if (!RECAPTCHA_SECRET_KEY) return next();
+
+    const token = req.body?.recaptchaToken;
+    const ok = await verifyRecaptchaToken(token, expectedAction);
+
+    if (!ok) {
+      return res.status(403).json({
+        error: 'Sigurnosna provjera nije prošla. Pokušajte ponovno.'
+      });
+    }
+
+    next();
+  };
+};
+
 const normalizeHeroSlides = (slides) => {
   if (!Array.isArray(slides)) return [];
 
@@ -2120,7 +2137,7 @@ app.post('/coupons/validate', async (req, res) => {
   }
 });
 
-app.post('/api/login', loginLimiter, async (req, res) => {
+app.post('/api/login', loginLimiter, requireRecaptchaStrict('admin_login'), async (req, res) => {
   const { password } = req.body;
   const isMatch = await bcrypt.compare(password, process.env.ADMIN_HASH);
 
@@ -2300,7 +2317,7 @@ app.get('/inbound-invoices', authGuard, async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Greška servera" }); }
 });
 
-app.post('/inbound-invoices', async (req, res) => {
+app.post('/inbound-invoices', authGuard, async (req, res) => {
   const { supplier, supplier_email, invoice_number, amount, file_url, note, date } = req.body;
   try {
     const cleanSupplier = cleanInboundUtfText(supplier);
@@ -3060,7 +3077,7 @@ app.patch('/orders/:id/invoice', authGuard, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Greška.' }); }
 });
 
-app.get('/orders/:id/invoice', async (req, res) => {
+app.get('/orders/:id/invoice', authGuard, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).send('Nije pronađeno.');
@@ -3320,16 +3337,7 @@ server.listen(PORT, '0.0.0.0', () => {
     console.error('[SOLO RECOVERY] Neuspješan startup recovery:', error);
   });
 });
-// PRIVREMENA METLA ZA BRISANJE SVEGA
-app.get('/brisanje-baze', async (req, res) => {
-  try {
-    await pool.query('DELETE FROM orders');
-    await pool.query('DELETE FROM inbound_invoices');
-    res.send('<h1>Sve narudžbe i ulazni računi su uspješno obrisani! 🧹</h1><p>Sada se vrati u VS Code, OBRISI ovaj kod i ponovno stisni Sync Changes kako ti nitko drugi ne bi mogao obrisati bazu.</p>');
-  } catch (err) { 
-    res.status(500).send('Greška pri brisanju: ' + err.message); 
-  }
-});
+
 
 
 

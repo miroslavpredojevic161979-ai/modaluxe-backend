@@ -3079,60 +3079,16 @@ app.patch('/orders/:id/invoice', authGuard, async (req, res) => {
 
 app.get('/orders/:id/invoice', authGuard, async (req, res) => {
   try {
-    const orderId = String(req.params.id).split('-')[0];
-
-    const result = await pool.query(
-      'SELECT invoice_url FROM orders WHERE id = $1 LIMIT 1',
-      [orderId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).send('Račun nije pronađen.');
+    const result = await pool.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).send('Nije pronađeno.');
+    const orderData = result.rows[0];
+    
+    if (orderData.invoice_url && orderData.invoice_url.startsWith('http')) {
+        return res.redirect(orderData.invoice_url);
     }
-
-    const invoiceUrl = String(result.rows[0].invoice_url || '').trim();
-
-    if (!invoiceUrl || !invoiceUrl.startsWith('http')) {
-      return res
-        .status(404)
-        .send('<h1 style="text-align:center; margin-top:50px;">Račun se još generira...</h1>');
-    }
-
-    const parsedUrl = new URL(invoiceUrl);
-
-    const allowedHosts = [
-      'api.solo.com.hr',
-      'solo.com.hr',
-      'www.solo.com.hr',
-      'res.cloudinary.com'
-    ];
-
-    const isAllowed = allowedHosts.some(
-      (host) => parsedUrl.hostname === host || parsedUrl.hostname.endsWith(`.${host}`)
-    );
-
-    if (!isAllowed) {
-      return res.status(403).send('Nedozvoljen link računa.');
-    }
-
-    const response = await axios.get(invoiceUrl, {
-      responseType: 'arraybuffer',
-      timeout: 90000,
-      headers: {
-        Accept: 'application/pdf,*/*',
-        'User-Agent': 'Kisfaluba-Admin-Invoice-Preview/1.0'
-      }
-    });
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'inline; filename="kisfaluba-racun.pdf"');
-    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
-
-    return res.send(Buffer.from(response.data));
-  } catch (err) {
-    console.error('Greška otvaranja računa:', err.message);
-    return res.status(500).send('Račun se ne može otvoriti.');
-  }
+    
+    res.send('<h1 style="text-align:center; margin-top:50px;">Račun se generira...</h1><p style="text-align:center;">Molimo osvježite stranicu za nekoliko trenutaka.</p>');
+  } catch (err) { res.status(500).send('Greška.'); }
 });
 
 // --- RUTE ZA POSTAVKE I KATEGORIJE ---

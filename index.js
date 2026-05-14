@@ -2822,6 +2822,33 @@ app.get('/all-orders', authGuard, async (req, res) => {
     })));
   } catch (err) { res.status(500).json({ error: 'Greška servera' }); }
 });
+app.get('/orders/invoice-preview', async (req, res) => {
+  try {
+    const rawUrl = String(req.query.url || '').trim();
+
+    if (!rawUrl || !rawUrl.startsWith('https://solo.com.hr/download/')) {
+      return res.status(400).send('Neispravan link računa.');
+    }
+
+    const response = await fetch(rawUrl);
+
+    if (!response.ok) {
+      return res.status(response.status).send('Solo račun nije dostupan.');
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="kisfaluba-racun.pdf"');
+    res.setHeader('Cache-Control', 'private, max-age=300');
+
+    return res.send(buffer);
+  } catch (err) {
+    console.error('Greška invoice preview:', err);
+    return res.status(500).send('Greška kod otvaranja računa.');
+  }
+});
 
 app.get('/orders', authGuard, async (req, res) => {
   try {
